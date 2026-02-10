@@ -1,0 +1,14 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: artemis
+      POSTGRES_PASSWORD: artemis
+      POSTGRES_DB: artemis
+    ports:
+      - "5432:5432"
+    volumes:
+      - artemis_pgdata:/var/lib/postgresql/data
+
+volumes:
+  artemis_pgdata:
