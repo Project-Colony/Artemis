@@ -3,8 +3,6 @@ mod net;
 mod theme;
 mod views;
 
-use std::sync::Arc;
-
 use iced::widget::{container, row};
 use iced::{Element, Length, Task as IcedTask};
 use futures::SinkExt;
@@ -15,10 +13,18 @@ use artemis_core::models::message::Message;
 use artemis_core::models::user::{ServerMember, User, UserStatus};
 use artemis_core::protocol::{ClientEvent, ServerEvent, ServerPayload};
 
+use artemis_p2p::protocol::PeerProfile;
+
 use views::{
-    channel_sidebar, chat_area, login_screen, member_list, server_list, ChannelSidebarMsg,
-    ChatAreaMsg, LoginMsg, MemberListMsg, ServerListMsg,
+    channel_sidebar, chat_area, friend_list, login_screen, member_list, server_list,
+    ChannelSidebarMsg, ChatAreaMsg, FriendListMsg, LoginMsg, LoginState, MemberListMsg,
+    ServerListMsg,
 };
+
+/// GitHub OAuth App Client ID.
+/// For development: create one at https://github.com/settings/applications/new
+/// Enable "Device Flow" in the app settings.
+const GITHUB_CLIENT_ID: &str = "Ov23liYMgdGLfkOKDQya";
 
 fn main() -> iced::Result {
     tracing_subscriber::fmt::init();
@@ -38,13 +44,21 @@ struct Artemis {
     screen: AppScreen,
 
     // Login state
-    server_url: String,
-    auth_token: String,
-    login_error: Option<String>,
-    connecting: bool,
+    login_state: LoginState,
 
-    // Connection
+    // Connection (legacy WebSocket — kept for server mode)
     client_tx: Option<mpsc::UnboundedSender<ClientEvent>>,
+
+    // P2P identity
+    github_username: String,
+    github_token: String,
+    avatar_url: Option<String>,
+
+    // Friend list
+    friends: Vec<PeerProfile>,
+    active_friend: Option<String>,
+    add_friend_input: String,
+    show_add_friend: bool,
 
     // Chat state
     user_id: Option<Uuid>,
@@ -56,17 +70,45 @@ struct Artemis {
     members: Vec<ServerMember>,
     message_input: String,
     show_member_list: bool,
+
+    // Mode
+    is_mock: bool,
 }
 
 #[derive(Debug, Clone)]
 enum AppMessage {
     Login(LoginMsg),
+    FriendList(FriendListMsg),
     ServerList(ServerListMsg),
     ChannelSidebar(ChannelSidebarMsg),
     ChatArea(ChatAreaMsg),
     MemberList(MemberListMsg),
 
-    // Network
+    // GitHub Device Flow
+    DeviceCodeReceived {
+        device_code: String,
+        user_code: String,
+        verification_uri: String,
+        interval: u64,
+    },
+    DeviceFlowError(String),
+    GitHubTokenReceived(String),
+    GitHubUserFetched {
+        username: String,
+        avatar_url: Option<String>,
+        token: String,
+    },
+    P2PInitialized,
+
+    // Friend operations
+    FriendLookupResult {
+        username: String,
+        found: bool,
+        public_key: Option<String>,
+        signaling_gist_id: Option<String>,
+    },
+
+    // Network (legacy)
     Connected(mpsc::UnboundedSender<ClientEvent>),
     ConnectionFailed(String),
     ServerEventReceived(ServerEvent),
@@ -74,18 +116,18 @@ enum AppMessage {
 
 impl Artemis {
     fn new() -> (Self, IcedTask<AppMessage>) {
-        let saved_token = std::env::var("ARTEMIS_TOKEN").unwrap_or_default();
-        let server_url = std::env::var("ARTEMIS_SERVER")
-            .unwrap_or_else(|_| "http://localhost:3000".to_string());
-
         (
             Self {
                 screen: AppScreen::Login,
-                server_url,
-                auth_token: saved_token,
-                login_error: None,
-                connecting: false,
+                login_state: LoginState::Idle,
                 client_tx: None,
+                github_username: String::new(),
+                github_token: String::new(),
+                avatar_url: None,
+                friends: Vec::new(),
+                active_friend: None,
+                add_friend_input: String::new(),
+                show_add_friend: false,
                 user_id: None,
                 username: String::new(),
                 servers: Vec::new(),
@@ -95,6 +137,7 @@ impl Artemis {
                 members: Vec::new(),
                 message_input: String::new(),
                 show_member_list: true,
+                is_mock: false,
             },
             IcedTask::none(),
         )
@@ -103,49 +146,155 @@ impl Artemis {
     fn update(&mut self, message: AppMessage) -> IcedTask<AppMessage> {
         match message {
             // ── Login ──
-            AppMessage::Login(LoginMsg::ServerUrlChanged(url)) => {
-                self.server_url = url;
-            }
-            AppMessage::Login(LoginMsg::TokenChanged(token)) => {
-                self.auth_token = token;
-            }
-            AppMessage::Login(LoginMsg::Connect) => {
-                if self.auth_token.trim().is_empty() {
-                    self.login_error = Some("Token is required".to_string());
-                    return IcedTask::none();
-                }
-                self.connecting = true;
-                self.login_error = None;
+            AppMessage::Login(LoginMsg::SignInWithGitHub) => {
+                self.login_state = LoginState::Polling;
 
-                let server_url = self.server_url.clone();
-                let token = self.auth_token.clone();
+                let client_id = GITHUB_CLIENT_ID.to_string();
+
+                return IcedTask::perform(
+                    async move { artemis_auth::request_device_code(&client_id).await },
+                    |result| match result {
+                        Ok(resp) => AppMessage::DeviceCodeReceived {
+                            device_code: resp.device_code,
+                            user_code: resp.user_code,
+                            verification_uri: resp.verification_uri,
+                            interval: resp.interval,
+                        },
+                        Err(e) => AppMessage::DeviceFlowError(e.to_string()),
+                    },
+                );
+            }
+
+            AppMessage::DeviceCodeReceived {
+                device_code,
+                user_code,
+                verification_uri,
+                interval,
+            } => {
+                self.login_state = LoginState::WaitingForCode {
+                    user_code: user_code.clone(),
+                    verification_uri: verification_uri.clone(),
+                };
+
+                // Open browser for user
+                let _ = open::that(&verification_uri);
+
+                // Start polling for token
+                let client_id = GITHUB_CLIENT_ID.to_string();
+                let dc = device_code.clone();
 
                 return IcedTask::run(
-                    iced::stream::channel(64, move |mut output| async move {
-                        match net::connect(&server_url, token).await {
-                            Ok((tx, mut rx)) => {
-                                // Send the client sender back to the app
-                                let _ = output.send(AppMessage::Connected(tx)).await;
-
-                                // Forward all server events
-                                while let Some(event) = rx.recv().await {
-                                    let _ = output
-                                        .send(AppMessage::ServerEventReceived(event))
-                                        .await;
+                    iced::stream::channel(8, move |mut output| async move {
+                        let poll_interval = std::time::Duration::from_secs(interval.max(5));
+                        loop {
+                            tokio::time::sleep(poll_interval).await;
+                            match artemis_auth::poll_device_token(&client_id, &dc).await {
+                                Ok(resp) => {
+                                    if let Some(token) = resp.access_token {
+                                        let _ = output
+                                            .send(AppMessage::GitHubTokenReceived(token))
+                                            .await;
+                                        return;
+                                    }
+                                    if let Some(error) = &resp.error {
+                                        match error.as_str() {
+                                            "authorization_pending" => continue,
+                                            "slow_down" => {
+                                                tokio::time::sleep(
+                                                    std::time::Duration::from_secs(5),
+                                                )
+                                                .await;
+                                                continue;
+                                            }
+                                            "expired_token" => {
+                                                let _ = output
+                                                    .send(AppMessage::DeviceFlowError(
+                                                        "Code expired, please try again"
+                                                            .to_string(),
+                                                    ))
+                                                    .await;
+                                                return;
+                                            }
+                                            "access_denied" => {
+                                                let _ = output
+                                                    .send(AppMessage::DeviceFlowError(
+                                                        "Access denied by user".to_string(),
+                                                    ))
+                                                    .await;
+                                                return;
+                                            }
+                                            other => {
+                                                let desc = resp
+                                                    .error_description
+                                                    .unwrap_or_else(|| other.to_string());
+                                                let _ = output
+                                                    .send(AppMessage::DeviceFlowError(desc))
+                                                    .await;
+                                                return;
+                                            }
+                                        }
+                                    }
                                 }
-                            }
-                            Err(e) => {
-                                let _ = output
-                                    .send(AppMessage::ConnectionFailed(e.to_string()))
-                                    .await;
+                                Err(e) => {
+                                    let _ = output
+                                        .send(AppMessage::DeviceFlowError(e.to_string()))
+                                        .await;
+                                    return;
+                                }
                             }
                         }
                     }),
                     |msg| msg,
                 );
             }
+
+            AppMessage::GitHubTokenReceived(token) => {
+                self.login_state = LoginState::Initializing;
+                let t = token.clone();
+
+                return IcedTask::perform(
+                    async move { artemis_auth::GitHubOAuth::fetch_user(&t).await },
+                    move |result| match result {
+                        Ok(user) => AppMessage::GitHubUserFetched {
+                            username: user.login,
+                            avatar_url: user.avatar_url,
+                            token: token.clone(),
+                        },
+                        Err(e) => AppMessage::DeviceFlowError(format!(
+                            "Failed to fetch GitHub profile: {}",
+                            e
+                        )),
+                    },
+                );
+            }
+
+            AppMessage::GitHubUserFetched {
+                username,
+                avatar_url,
+                token,
+            } => {
+                self.github_username = username.clone();
+                self.github_token = token;
+                self.avatar_url = avatar_url;
+                self.username = username;
+                self.user_id = Some(Uuid::new_v4());
+                self.login_state = LoginState::Idle;
+                self.screen = AppScreen::Chat;
+
+                tracing::info!("Authenticated as @{}", self.github_username);
+            }
+
+            AppMessage::P2PInitialized => {
+                tracing::info!("P2P stack initialized");
+            }
+
+            AppMessage::DeviceFlowError(err) => {
+                self.login_state = LoginState::Error(err);
+            }
+
             AppMessage::Login(LoginMsg::UseMockData) => {
                 let (servers, messages, members) = mock::sample_data();
+                self.is_mock = true;
                 self.servers = servers
                     .iter()
                     .map(|s| ServerPayload {
@@ -193,23 +342,109 @@ impl Artemis {
                     .map(|ch| ch.id);
                 self.user_id = Some(Uuid::nil());
                 self.username = "You".to_string();
+                self.github_username = "demo-user".to_string();
+
+                // Add some mock friends
+                self.friends = vec![
+                    PeerProfile {
+                        github_username: "alice-dev".to_string(),
+                        display_name: Some("Alice".to_string()),
+                        avatar_url: None,
+                        public_key: String::new(),
+                        signaling_gist_id: None,
+                        status: UserStatus::Online,
+                        added_at: chrono::Utc::now(),
+                    },
+                    PeerProfile {
+                        github_username: "bob-coder".to_string(),
+                        display_name: Some("Bob".to_string()),
+                        avatar_url: None,
+                        public_key: String::new(),
+                        signaling_gist_id: None,
+                        status: UserStatus::Online,
+                        added_at: chrono::Utc::now(),
+                    },
+                    PeerProfile {
+                        github_username: "charlie-rust".to_string(),
+                        display_name: Some("Charlie".to_string()),
+                        avatar_url: None,
+                        public_key: String::new(),
+                        signaling_gist_id: None,
+                        status: UserStatus::Offline,
+                        added_at: chrono::Utc::now(),
+                    },
+                ];
+
                 self.screen = AppScreen::Chat;
             }
 
+            // ── Friend list ──
+            AppMessage::FriendList(FriendListMsg::SelectFriend(username)) => {
+                self.active_friend = Some(username);
+            }
+            AppMessage::FriendList(FriendListMsg::AddFriendInputChanged(val)) => {
+                self.add_friend_input = val;
+            }
+            AppMessage::FriendList(FriendListMsg::ToggleAddFriend) => {
+                self.show_add_friend = !self.show_add_friend;
+            }
+            AppMessage::FriendList(FriendListMsg::AddFriend) => {
+                let username = self.add_friend_input.trim().to_string();
+                if username.is_empty() {
+                    return IcedTask::none();
+                }
+
+                if !self.friends.iter().any(|f| f.github_username == username) {
+                    self.friends.push(PeerProfile {
+                        github_username: username.clone(),
+                        display_name: None,
+                        avatar_url: None,
+                        public_key: String::new(),
+                        signaling_gist_id: None,
+                        status: UserStatus::Offline,
+                        added_at: chrono::Utc::now(),
+                    });
+                }
+                self.add_friend_input.clear();
+                self.show_add_friend = false;
+
+                tracing::info!("Added friend: @{}", username);
+            }
+
+            AppMessage::FriendLookupResult {
+                username,
+                found,
+                public_key,
+                signaling_gist_id,
+            } => {
+                if found {
+                    if let Some(friend) = self
+                        .friends
+                        .iter_mut()
+                        .find(|f| f.github_username == username)
+                    {
+                        if let Some(pk) = public_key {
+                            friend.public_key = pk;
+                        }
+                        friend.signaling_gist_id = signaling_gist_id;
+                    }
+                    tracing::info!("Found peer profile for @{}", username);
+                } else {
+                    tracing::warn!("No Artemis profile found for @{}", username);
+                }
+            }
+
+            // ── Legacy server interactions (kept for mock/server mode) ──
             AppMessage::Connected(tx) => {
-                self.connecting = false;
                 self.client_tx = Some(tx);
             }
             AppMessage::ConnectionFailed(e) => {
-                self.connecting = false;
-                self.login_error = Some(format!("Connection failed: {}", e));
+                self.login_state = LoginState::Error(format!("Connection failed: {}", e));
             }
-
             AppMessage::ServerEventReceived(event) => {
                 self.handle_server_event(event);
             }
 
-            // ── Chat interactions ──
             AppMessage::ServerList(ServerListMsg::SelectServer(idx)) => {
                 self.active_server_idx = idx;
                 if let Some(server) = self.servers.get(idx) {
@@ -219,7 +454,6 @@ impl Artemis {
                         .and_then(|c| c.channels.first())
                         .map(|ch| ch.id);
 
-                    // Update members for new server
                     self.members = server
                         .members
                         .iter()
@@ -260,9 +494,8 @@ impl Artemis {
                     });
                 }
             }
-            AppMessage::ChannelSidebar(ChannelSidebarMsg::ToggleCategory(_cat_id)) => {
-                // Category collapse state would need local UI tracking
-            }
+            AppMessage::ChannelSidebar(ChannelSidebarMsg::ToggleCategory(_cat_id)) => {}
+
             AppMessage::ChatArea(ChatAreaMsg::InputChanged(val)) => {
                 self.message_input = val;
             }
@@ -276,7 +509,6 @@ impl Artemis {
                             });
                             self.message_input.clear();
                         } else {
-                            // Mock mode
                             let msg = Message {
                                 id: Uuid::new_v4(),
                                 channel_id,
@@ -357,7 +589,9 @@ impl Artemis {
 
                 self.screen = AppScreen::Chat;
 
-                if let (Some(channel_id), Some(tx)) = (self.active_channel_id, &self.client_tx) {
+                if let (Some(channel_id), Some(tx)) =
+                    (self.active_channel_id, &self.client_tx)
+                {
                     let _ = tx.send(ClientEvent::FetchMessages {
                         channel_id,
                         before: None,
@@ -366,7 +600,7 @@ impl Artemis {
                 }
             }
             ServerEvent::AuthError { reason } => {
-                self.login_error = Some(reason);
+                self.login_state = LoginState::Error(reason);
                 self.screen = AppScreen::Login;
             }
             ServerEvent::MessageReceived { message } => {
@@ -440,20 +674,27 @@ impl Artemis {
 
     fn view(&self) -> Element<'_, AppMessage> {
         match &self.screen {
-            AppScreen::Login => login_screen::view(
-                &self.server_url,
-                &self.auth_token,
-                self.login_error.as_deref(),
-                self.connecting,
-            )
-            .map(AppMessage::Login),
+            AppScreen::Login => login_screen::view(&self.login_state).map(AppMessage::Login),
 
             AppScreen::Chat => {
                 let active_server = self.servers.get(self.active_server_idx);
 
-                let server_list_view =
-                    server_list::view_from_payloads(&self.servers, self.active_server_idx)
-                        .map(AppMessage::ServerList);
+                let friend_list_view = friend_list::view(
+                    &self.friends,
+                    self.active_friend.as_deref(),
+                    &self.add_friend_input,
+                    self.show_add_friend,
+                )
+                .map(AppMessage::FriendList);
+
+                let server_list_view = if !self.servers.is_empty() {
+                    Some(
+                        server_list::view_from_payloads(&self.servers, self.active_server_idx)
+                            .map(AppMessage::ServerList),
+                    )
+                } else {
+                    None
+                };
 
                 let channel_sidebar_view =
                     channel_sidebar::view_from_payload(active_server, self.active_channel_id)
@@ -474,7 +715,14 @@ impl Artemis {
                 )
                 .map(AppMessage::ChatArea);
 
-                let mut main_row = row![server_list_view, channel_sidebar_view, chat_view,];
+                let mut main_row = row![friend_list_view];
+
+                if let Some(sl) = server_list_view {
+                    main_row = main_row.push(sl);
+                }
+
+                main_row = main_row.push(channel_sidebar_view);
+                main_row = main_row.push(chat_view);
 
                 if self.show_member_list {
                     let member_view =

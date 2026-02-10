@@ -5,6 +5,7 @@ members = [
     "crates/artemis-core",
     "crates/artemis-server",
     "crates/artemis-auth",
+    "crates/artemis-p2p",
 ]
 
 [workspace.package]
@@ -24,6 +25,8 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = "0.3"
+rand = "0.8"
+base64 = "0.22"
 
 # GUI
 iced = { version = "0.13", features = ["tokio", "svg", "image"] }
@@ -32,7 +35,22 @@ iced = { version = "0.13", features = ["tokio", "svg", "image"] }
 oauth2 = "4"
 reqwest = { version = "0.12", features = ["json"] }
 
-# Server
+# P2P / QUIC
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+
+# Crypto
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+
+# Local storage
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Desktop utilities
+open = "5"
+
+# Server (kept as optional relay)
 axum = { version = "0.8", features = ["ws"] }
 axum-extra = { version = "0.10", features = ["typed-header"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }

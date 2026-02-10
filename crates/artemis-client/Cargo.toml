@@ -1,6 +1,6 @@
 [package]
 name = "artemis-client"
-description = "Desktop GUI client for Artemis (iced-based)"
+description = "Desktop GUI client for Artemis (iced-based, P2P)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,6 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 artemis-core = { path = "../artemis-core" }
+artemis-auth = { path = "../artemis-auth" }
+artemis-p2p = { path = "../artemis-p2p" }
 iced = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -19,6 +21,7 @@ chrono = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-tokio-tungstenite = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true }
+open = { workspace = true }
+tokio-tungstenite = { workspace = true }

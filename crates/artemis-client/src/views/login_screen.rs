@@ -1,133 +1,215 @@
 use iced::alignment::{Horizontal, Vertical};
-use iced::widget::{button, column, container, text, text_input, Space};
+use iced::widget::{button, column, container, text, Space};
 use iced::{Border, Element, Length, Padding};
 
 use crate::theme::colors;
 
 #[derive(Debug, Clone)]
 pub enum LoginMsg {
-    ServerUrlChanged(String),
-    TokenChanged(String),
-    Connect,
+    SignInWithGitHub,
     UseMockData,
 }
 
-pub fn view<'a>(
-    server_url: &'a str,
-    token: &'a str,
-    error: Option<&'a str>,
-    connecting: bool,
-) -> Element<'a, LoginMsg> {
-    let title = text("Artemis")
-        .size(40)
-        .color(colors::ACCENT);
+#[derive(Debug, Clone, PartialEq)]
+pub enum LoginState {
+    Idle,
+    WaitingForCode {
+        user_code: String,
+        verification_uri: String,
+    },
+    Polling,
+    Initializing,
+    Error(String),
+}
 
-    let subtitle = text("Connect to your server")
+pub fn view(state: &LoginState) -> Element<'_, LoginMsg> {
+    let title = text("Artemis").size(40).color(colors::ACCENT);
+
+    let subtitle = text("Peer-to-peer messaging via GitHub")
         .size(14)
         .color(colors::TEXT_MUTED);
 
-    let server_input = text_input("Server URL (e.g. http://localhost:3000)", server_url)
-        .on_input(LoginMsg::ServerUrlChanged)
-        .padding(Padding::from([10, 12]))
-        .size(14);
+    let mut form = column![title, Space::with_height(4), subtitle, Space::with_height(32),]
+        .align_x(Horizontal::Center)
+        .width(400);
 
-    let token_input = text_input("Auth token (from GitHub OAuth)", token)
-        .on_input(LoginMsg::TokenChanged)
-        .padding(Padding::from([10, 12]))
-        .size(14);
-
-    let connect_label = if connecting { "Connecting..." } else { "Connect" };
-
-    let mut connect_btn = button(
-        container(
-            text(connect_label)
-                .size(14)
-                .color(colors::TEXT_PRIMARY)
+    match state {
+        LoginState::Idle => {
+            let github_btn = button(
+                container(
+                    text("Sign in with GitHub")
+                        .size(15)
+                        .color(colors::TEXT_PRIMARY)
+                        .align_x(Horizontal::Center),
+                )
+                .width(Length::Fill)
                 .align_x(Horizontal::Center),
-        )
-        .width(Length::Fill)
-        .align_x(Horizontal::Center),
-    )
-    .padding(Padding::from([10, 20]))
-    .width(Length::Fill)
-    .style(|_theme, _status| button::Style {
-        background: Some(iced::Background::Color(colors::ACCENT)),
-        text_color: colors::TEXT_PRIMARY,
-        border: Border {
-            radius: 6.0.into(),
-            ..Border::default()
-        },
-        ..button::Style::default()
-    });
+            )
+            .on_press(LoginMsg::SignInWithGitHub)
+            .padding(Padding::from([12, 24]))
+            .width(Length::Fill)
+            .style(|_theme, status| {
+                let bg = match status {
+                    button::Status::Hovered | button::Status::Pressed => {
+                        iced::Color::from_rgb(0.15, 0.15, 0.15)
+                    }
+                    _ => iced::Color::from_rgb(0.1, 0.1, 0.1),
+                };
+                button::Style {
+                    background: Some(iced::Background::Color(bg)),
+                    text_color: colors::TEXT_PRIMARY,
+                    border: Border {
+                        radius: 8.0.into(),
+                        width: 1.0,
+                        color: iced::Color::from_rgb(0.3, 0.3, 0.3),
+                    },
+                    ..button::Style::default()
+                }
+            });
 
-    if !connecting {
-        connect_btn = connect_btn.on_press(LoginMsg::Connect);
-    }
+            form = form.push(github_btn);
+            form = form.push(Space::with_height(12));
 
-    let mock_btn = button(
-        container(
-            text("Demo Mode (no server)")
-                .size(13)
-                .color(colors::TEXT_MUTED)
+            let mock_btn = button(
+                container(
+                    text("Demo Mode (no connection)")
+                        .size(13)
+                        .color(colors::TEXT_MUTED)
+                        .align_x(Horizontal::Center),
+                )
+                .width(Length::Fill)
                 .align_x(Horizontal::Center),
-        )
-        .width(Length::Fill)
-        .align_x(Horizontal::Center),
-    )
-    .on_press(LoginMsg::UseMockData)
-    .padding(Padding::from([8, 16]))
-    .width(Length::Fill)
-    .style(|_theme, status| {
-        let bg = match status {
-            button::Status::Hovered | button::Status::Pressed => colors::BG_HOVER,
-            _ => colors::BG_INPUT,
-        };
-        button::Style {
-            background: Some(iced::Background::Color(bg)),
-            text_color: colors::TEXT_MUTED,
-            border: Border {
-                radius: 6.0.into(),
-                ..Border::default()
-            },
-            ..button::Style::default()
+            )
+            .on_press(LoginMsg::UseMockData)
+            .padding(Padding::from([10, 20]))
+            .width(Length::Fill)
+            .style(|_theme, status| {
+                let bg = match status {
+                    button::Status::Hovered | button::Status::Pressed => colors::BG_HOVER,
+                    _ => colors::BG_INPUT,
+                };
+                button::Style {
+                    background: Some(iced::Background::Color(bg)),
+                    text_color: colors::TEXT_MUTED,
+                    border: Border {
+                        radius: 6.0.into(),
+                        ..Border::default()
+                    },
+                    ..button::Style::default()
+                }
+            });
+
+            form = form.push(mock_btn);
+
+            form = form.push(Space::with_height(20));
+            form = form.push(
+                text("No server needed \u{2014} connect directly with friends")
+                    .size(11)
+                    .color(colors::TEXT_TIMESTAMP),
+            );
         }
-    });
 
-    let mut form = column![
-        title,
-        Space::with_height(4),
-        subtitle,
-        Space::with_height(24),
-        text("Server URL").size(12).color(colors::TEXT_MUTED),
-        Space::with_height(4),
-        server_input,
-        Space::with_height(16),
-        text("Auth Token").size(12).color(colors::TEXT_MUTED),
-        Space::with_height(4),
-        token_input,
-        Space::with_height(24),
-        connect_btn,
-        Space::with_height(8),
-        mock_btn,
-    ]
-    .align_x(Horizontal::Center)
-    .width(360);
+        LoginState::WaitingForCode {
+            user_code,
+            verification_uri,
+        } => {
+            form = form.push(
+                text("Enter this code on GitHub:")
+                    .size(14)
+                    .color(colors::TEXT_MUTED),
+            );
+            form = form.push(Space::with_height(16));
+            form = form.push(
+                container(
+                    text(user_code)
+                        .size(32)
+                        .color(colors::TEXT_PRIMARY)
+                        .align_x(Horizontal::Center),
+                )
+                .width(Length::Fill)
+                .padding(Padding::from([16, 24]))
+                .align_x(Horizontal::Center)
+                .style(|_| container::Style {
+                    background: Some(iced::Background::Color(colors::BG_INPUT)),
+                    border: Border {
+                        radius: 8.0.into(),
+                        ..Border::default()
+                    },
+                    ..container::Style::default()
+                }),
+            );
+            form = form.push(Space::with_height(12));
+            form = form.push(
+                text(format!("Go to: {}", verification_uri))
+                    .size(12)
+                    .color(colors::ACCENT),
+            );
+            form = form.push(Space::with_height(8));
+            form = form.push(
+                text("Your browser should open automatically...")
+                    .size(11)
+                    .color(colors::TEXT_TIMESTAMP),
+            );
+            form = form.push(Space::with_height(16));
+            form = form.push(
+                text("Waiting for authorization...")
+                    .size(13)
+                    .color(colors::TEXT_MUTED),
+            );
+        }
 
-    if let Some(err) = error {
-        form = form.push(Space::with_height(12));
-        form = form.push(
-            text(err)
-                .size(13)
-                .color(iced::color!(0xEF, 0x44, 0x44)),
-        );
+        LoginState::Polling => {
+            form = form.push(
+                text("Verifying with GitHub...")
+                    .size(14)
+                    .color(colors::TEXT_MUTED),
+            );
+        }
+
+        LoginState::Initializing => {
+            form = form.push(
+                text("Setting up P2P identity...")
+                    .size(14)
+                    .color(colors::ACCENT),
+            );
+            form = form.push(Space::with_height(8));
+            form = form.push(
+                text("Generating keys & configuring signaling")
+                    .size(12)
+                    .color(colors::TEXT_MUTED),
+            );
+        }
+
+        LoginState::Error(err) => {
+            form = form.push(text(err).size(13).color(iced::color!(0xEF, 0x44, 0x44)));
+            form = form.push(Space::with_height(16));
+
+            let retry_btn = button(
+                container(
+                    text("Try Again")
+                        .size(14)
+                        .color(colors::TEXT_PRIMARY)
+                        .align_x(Horizontal::Center),
+                )
+                .width(Length::Fill)
+                .align_x(Horizontal::Center),
+            )
+            .on_press(LoginMsg::SignInWithGitHub)
+            .padding(Padding::from([10, 20]))
+            .width(Length::Fill)
+            .style(|_theme, _status| button::Style {
+                background: Some(iced::Background::Color(colors::ACCENT)),
+                text_color: colors::TEXT_PRIMARY,
+                border: Border {
+                    radius: 6.0.into(),
+                    ..Border::default()
+                },
+                ..button::Style::default()
+            });
+
+            form = form.push(retry_btn);
+        }
     }
-
-    let hint = text("Go to /auth/github on your server to get a token")
-        .size(11)
-        .color(colors::TEXT_TIMESTAMP);
-
-    form = form.push(Space::with_height(16));
-    form = form.push(hint);
 
     container(
         container(form)
