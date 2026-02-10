@@ -1,0 +1,16 @@
+[package]
+name = "artemis-auth"
+description = "GitHub OAuth authentication for Artemis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+artemis-core = { path = "../artemis-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+oauth2 = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

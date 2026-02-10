@@ -1,0 +1,23 @@
+[package]
+name = "artemis-server"
+description = "Backend API and WebSocket server for Artemis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "artemis-server"
+path = "src/main.rs"
+
+[dependencies]
+artemis-core = { path = "../artemis-core" }
+artemis-auth = { path = "../artemis-auth" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
