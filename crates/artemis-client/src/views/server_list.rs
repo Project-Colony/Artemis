@@ -20,14 +20,14 @@ const HOME_COLOR: iced::Color = iced::Color::from_rgb(
 
 fn home_button<'a>(is_home: bool) -> Element<'a, ServerListMsg> {
     let label = text("\u{263D}") // ☽ crescent moon — Artemis
-        .size(22)
+        .size(24)
         .color(colors::TEXT_PRIMARY)
         .align_x(Horizontal::Center);
 
     let btn = button(
         container(label)
-            .width(40)
-            .height(40)
+            .width(48)
+            .height(48)
             .align_x(Horizontal::Center)
             .align_y(Vertical::Center),
     )
@@ -41,7 +41,7 @@ fn home_button<'a>(is_home: bool) -> Element<'a, ServerListMsg> {
                 _ => colors::BG_DARK,
             }
         };
-        let radius = if is_home { 12.0 } else { 20.0 };
+        let radius = if is_home { 14.0 } else { 24.0 };
         button::Style {
             background: Some(iced::Background::Color(bg)),
             text_color: colors::TEXT_PRIMARY,
@@ -53,13 +53,13 @@ fn home_button<'a>(is_home: bool) -> Element<'a, ServerListMsg> {
         }
     });
 
-    container(btn).align_x(Horizontal::Center).width(56).into()
+    container(btn).align_x(Horizontal::Center).width(72).into()
 }
 
 fn separator<'a>() -> Element<'a, ServerListMsg> {
     container(
         container(Space::with_height(0))
-            .width(32)
+            .width(40)
             .height(2)
             .style(|_| container::Style {
                 background: Some(iced::Background::Color(colors::BG_HOVER)),
@@ -70,7 +70,7 @@ fn separator<'a>() -> Element<'a, ServerListMsg> {
                 ..container::Style::default()
             }),
     )
-    .width(56)
+    .width(72)
     .align_x(Horizontal::Center)
     .padding(Padding::from([4, 0]))
     .into()
@@ -82,14 +82,14 @@ fn server_button<'a>(
     is_active: bool,
 ) -> Element<'a, ServerListMsg> {
     let label = text(label_text)
-        .size(16)
+        .size(18)
         .color(colors::TEXT_PRIMARY)
         .align_x(Horizontal::Center);
 
     let btn = button(
         container(label)
-            .width(40)
-            .height(40)
+            .width(48)
+            .height(48)
             .align_x(Horizontal::Center)
             .align_y(Vertical::Center),
     )
@@ -103,7 +103,7 @@ fn server_button<'a>(
                 _ => colors::BG_DARK,
             }
         };
-        let radius = if is_active { 12.0 } else { 20.0 };
+        let radius = if is_active { 14.0 } else { 24.0 };
         button::Style {
             background: Some(iced::Background::Color(bg)),
             text_color: colors::TEXT_PRIMARY,
@@ -115,19 +115,19 @@ fn server_button<'a>(
         }
     });
 
-    container(btn).align_x(Horizontal::Center).width(56).into()
+    container(btn).align_x(Horizontal::Center).width(72).into()
 }
 
 fn add_server_button<'a>() -> Element<'a, ServerListMsg> {
     let btn = button(
         container(
             text("+")
-                .size(20)
+                .size(22)
                 .color(colors::STATUS_ONLINE)
                 .align_x(Horizontal::Center),
         )
-        .width(40)
-        .height(40)
+        .width(48)
+        .height(48)
         .align_x(Horizontal::Center)
         .align_y(Vertical::Center),
     )
@@ -140,14 +140,14 @@ fn add_server_button<'a>() -> Element<'a, ServerListMsg> {
             background: Some(iced::Background::Color(bg)),
             text_color: colors::STATUS_ONLINE,
             border: Border {
-                radius: 20.0.into(),
+                radius: 24.0.into(),
                 ..Border::default()
             },
             ..button::Style::default()
         }
     });
 
-    container(btn).align_x(Horizontal::Center).width(56).into()
+    container(btn).align_x(Horizontal::Center).width(72).into()
 }
 
 pub fn view<'a>(
@@ -182,7 +182,7 @@ pub fn view<'a>(
     let content = scrollable(items).height(Length::Fill);
 
     container(content)
-        .width(56)
+        .width(72)
         .height(Length::Fill)
         .style(|_theme| container::Style {
             background: Some(iced::Background::Color(colors::BG_DARKEST)),
@@ -224,7 +224,7 @@ pub fn view_from_payloads<'a>(
     let content = scrollable(items).height(Length::Fill);
 
     container(content)
-        .width(56)
+        .width(72)
         .height(Length::Fill)
         .style(|_theme| container::Style {
             background: Some(iced::Background::Color(colors::BG_DARKEST)),
