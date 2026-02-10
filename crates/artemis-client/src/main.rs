@@ -71,6 +71,9 @@ struct Artemis {
     message_input: String,
     show_member_list: bool,
 
+    // Navigation: home (friends) vs server
+    is_home: bool,
+
     // Mode
     is_mock: bool,
 }
@@ -137,6 +140,7 @@ impl Artemis {
                 members: Vec::new(),
                 message_input: String::new(),
                 show_member_list: true,
+                is_home: true,
                 is_mock: false,
             },
             IcedTask::none(),
@@ -445,7 +449,12 @@ impl Artemis {
                 self.handle_server_event(event);
             }
 
+            AppMessage::ServerList(ServerListMsg::GoHome) => {
+                self.is_home = true;
+            }
+
             AppMessage::ServerList(ServerListMsg::SelectServer(idx)) => {
+                self.is_home = false;
                 self.active_server_idx = idx;
                 if let Some(server) = self.servers.get(idx) {
                     self.active_channel_id = server
@@ -679,55 +688,70 @@ impl Artemis {
             AppScreen::Chat => {
                 let active_server = self.servers.get(self.active_server_idx);
 
-                let friend_list_view = friend_list::view(
-                    &self.friends,
-                    self.active_friend.as_deref(),
-                    &self.add_friend_input,
-                    self.show_add_friend,
-                )
-                .map(AppMessage::FriendList);
-
-                let server_list_view = if !self.servers.is_empty() {
-                    Some(
-                        server_list::view_from_payloads(&self.servers, self.active_server_idx)
-                            .map(AppMessage::ServerList),
-                    )
-                } else {
+                // Server strip (always visible, far left — like Discord)
+                let active_srv_idx = if self.is_home {
                     None
+                } else {
+                    Some(self.active_server_idx)
                 };
-
-                let channel_sidebar_view =
-                    channel_sidebar::view_from_payload(active_server, self.active_channel_id)
-                        .map(AppMessage::ChannelSidebar);
-
-                let active_channel_payload = active_server.and_then(|s| {
-                    s.categories
-                        .iter()
-                        .flat_map(|c| &c.channels)
-                        .find(|ch| Some(ch.id) == self.active_channel_id)
-                });
-
-                let chat_view = chat_area::view_with_payload(
-                    active_channel_payload,
-                    &self.messages,
-                    &self.message_input,
-                    self.active_channel_id,
+                let server_strip = server_list::view_from_payloads(
+                    &self.servers,
+                    active_srv_idx,
+                    self.is_home,
                 )
-                .map(AppMessage::ChatArea);
+                .map(AppMessage::ServerList);
 
-                let mut main_row = row![friend_list_view];
+                let mut main_row = row![server_strip];
 
-                if let Some(sl) = server_list_view {
-                    main_row = main_row.push(sl);
-                }
+                if self.is_home {
+                    // Home mode: show friend list + DM chat
+                    let friend_list_view = friend_list::view(
+                        &self.friends,
+                        self.active_friend.as_deref(),
+                        &self.add_friend_input,
+                        self.show_add_friend,
+                    )
+                    .map(AppMessage::FriendList);
 
-                main_row = main_row.push(channel_sidebar_view);
-                main_row = main_row.push(chat_view);
+                    let chat_view = chat_area::view_with_payload(
+                        None,
+                        &self.messages,
+                        &self.message_input,
+                        self.active_channel_id,
+                    )
+                    .map(AppMessage::ChatArea);
 
-                if self.show_member_list {
-                    let member_view =
-                        member_list::view(&self.members).map(AppMessage::MemberList);
-                    main_row = main_row.push(member_view);
+                    main_row = main_row.push(friend_list_view);
+                    main_row = main_row.push(chat_view);
+                } else {
+                    // Server mode: show channels + chat + members
+                    let channel_sidebar_view =
+                        channel_sidebar::view_from_payload(active_server, self.active_channel_id)
+                            .map(AppMessage::ChannelSidebar);
+
+                    let active_channel_payload = active_server.and_then(|s| {
+                        s.categories
+                            .iter()
+                            .flat_map(|c| &c.channels)
+                            .find(|ch| Some(ch.id) == self.active_channel_id)
+                    });
+
+                    let chat_view = chat_area::view_with_payload(
+                        active_channel_payload,
+                        &self.messages,
+                        &self.message_input,
+                        self.active_channel_id,
+                    )
+                    .map(AppMessage::ChatArea);
+
+                    main_row = main_row.push(channel_sidebar_view);
+                    main_row = main_row.push(chat_view);
+
+                    if self.show_member_list {
+                        let member_view =
+                            member_list::view(&self.members).map(AppMessage::MemberList);
+                        main_row = main_row.push(member_view);
+                    }
                 }
 
                 container(main_row)
