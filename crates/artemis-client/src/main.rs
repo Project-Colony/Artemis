@@ -11,9 +11,11 @@ use uuid::Uuid;
 
 use artemis_core::models::message::Message;
 use artemis_core::models::user::{ServerMember, User, UserStatus};
-use artemis_core::protocol::{ClientEvent, ServerEvent, ServerPayload};
+use artemis_core::protocol::{
+    ClientEvent, FriendPayload, FriendRequestPayload, ServerEvent, ServerPayload,
+};
 
-use artemis_p2p::protocol::PeerProfile;
+use artemis_p2p::crypto::Identity;
 
 use views::{
     channel_sidebar, chat_area, friend_list, login_screen, member_list, server_list,
@@ -22,9 +24,10 @@ use views::{
 };
 
 /// GitHub OAuth App Client ID.
-/// For development: create one at https://github.com/settings/applications/new
-/// Enable "Device Flow" in the app settings.
 const GITHUB_CLIENT_ID: &str = "Ov23liYMgdGLfkOKDQya";
+
+/// Default server URL (can be overridden later).
+const DEFAULT_SERVER_URL: &str = "http://localhost:3000";
 
 fn main() -> iced::Result {
     tracing_subscriber::fmt::init();
@@ -46,16 +49,18 @@ struct Artemis {
     // Login state
     login_state: LoginState,
 
-    // Connection (legacy WebSocket — kept for server mode)
+    // Server connection
     client_tx: Option<mpsc::UnboundedSender<ClientEvent>>,
 
-    // P2P identity
+    // Identity
     github_username: String,
     github_token: String,
     avatar_url: Option<String>,
+    identity: Option<Identity>,
 
-    // Friend list
-    friends: Vec<PeerProfile>,
+    // Friend list (from server)
+    friends: Vec<FriendPayload>,
+    pending_requests: Vec<FriendRequestPayload>,
     active_friend: Option<String>,
     add_friend_input: String,
     show_add_friend: bool,
@@ -101,17 +106,8 @@ enum AppMessage {
         avatar_url: Option<String>,
         token: String,
     },
-    P2PInitialized,
 
-    // Friend operations
-    FriendLookupResult {
-        username: String,
-        found: bool,
-        public_key: Option<String>,
-        signaling_gist_id: Option<String>,
-    },
-
-    // Network (legacy)
+    // Server connection
     Connected(mpsc::UnboundedSender<ClientEvent>),
     ConnectionFailed(String),
     ServerEventReceived(ServerEvent),
@@ -127,7 +123,9 @@ impl Artemis {
                 github_username: String::new(),
                 github_token: String::new(),
                 avatar_url: None,
+                identity: None,
                 friends: Vec::new(),
+                pending_requests: Vec::new(),
                 active_friend: None,
                 add_friend_input: String::new(),
                 show_add_friend: false,
@@ -180,10 +178,8 @@ impl Artemis {
                     verification_uri: verification_uri.clone(),
                 };
 
-                // Open browser for user
                 let _ = open::that(&verification_uri);
 
-                // Start polling for token
                 let client_id = GITHUB_CLIENT_ID.to_string();
                 let dc = device_code.clone();
 
@@ -278,18 +274,68 @@ impl Artemis {
                 token,
             } => {
                 self.github_username = username.clone();
-                self.github_token = token;
+                self.github_token = token.clone();
                 self.avatar_url = avatar_url;
                 self.username = username;
-                self.user_id = Some(Uuid::new_v4());
                 self.login_state = LoginState::Idle;
-                self.screen = AppScreen::Chat;
 
-                tracing::info!("Authenticated as @{}", self.github_username);
+                // Generate E2E identity
+                let identity = Identity::generate();
+                let public_key = identity.public_key_b64();
+                self.identity = Some(identity);
+                tracing::info!("E2E identity generated, public key: {}...", &public_key[..8]);
+
+                // Connect to server relay
+                let server_url = DEFAULT_SERVER_URL.to_string();
+                let tk = token;
+                let pk = public_key;
+
+                return IcedTask::run(
+                    iced::stream::channel(64, move |mut output| async move {
+                        match net::connect(&server_url, tk).await {
+                            Ok((tx, mut rx)) => {
+                                // Publish public key
+                                let _ = tx.send(ClientEvent::PublishPublicKey {
+                                    public_key: pk,
+                                });
+                                // Fetch friends and requests
+                                let _ = tx.send(ClientEvent::FetchFriends);
+                                let _ = tx.send(ClientEvent::FetchFriendRequests);
+
+                                // Send connection handle
+                                let _ = output.send(AppMessage::Connected(tx)).await;
+
+                                // Forward all server events to the UI
+                                while let Some(event) = rx.recv().await {
+                                    if output
+                                        .send(AppMessage::ServerEventReceived(event))
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = output
+                                    .send(AppMessage::ConnectionFailed(e.to_string()))
+                                    .await;
+                            }
+                        }
+                    }),
+                    |msg| msg,
+                );
             }
 
-            AppMessage::P2PInitialized => {
-                tracing::info!("P2P stack initialized");
+            AppMessage::Connected(tx) => {
+                tracing::info!("Connected to relay server");
+                self.client_tx = Some(tx);
+                self.screen = AppScreen::Chat;
+            }
+
+            AppMessage::ConnectionFailed(e) => {
+                tracing::warn!("Server connection failed: {} — using offline mode", e);
+                self.screen = AppScreen::Chat;
             }
 
             AppMessage::DeviceFlowError(err) => {
@@ -348,34 +394,31 @@ impl Artemis {
                 self.username = "You".to_string();
                 self.github_username = "demo-user".to_string();
 
-                // Add some mock friends
+                // Mock friends
                 self.friends = vec![
-                    PeerProfile {
-                        github_username: "alice-dev".to_string(),
+                    FriendPayload {
+                        user_id: Uuid::new_v4(),
+                        username: "alice-dev".to_string(),
                         display_name: Some("Alice".to_string()),
                         avatar_url: None,
-                        public_key: String::new(),
-                        signaling_gist_id: None,
+                        public_key: None,
                         status: UserStatus::Online,
-                        added_at: chrono::Utc::now(),
                     },
-                    PeerProfile {
-                        github_username: "bob-coder".to_string(),
+                    FriendPayload {
+                        user_id: Uuid::new_v4(),
+                        username: "bob-coder".to_string(),
                         display_name: Some("Bob".to_string()),
                         avatar_url: None,
-                        public_key: String::new(),
-                        signaling_gist_id: None,
+                        public_key: None,
                         status: UserStatus::Online,
-                        added_at: chrono::Utc::now(),
                     },
-                    PeerProfile {
-                        github_username: "charlie-rust".to_string(),
+                    FriendPayload {
+                        user_id: Uuid::new_v4(),
+                        username: "charlie-rust".to_string(),
                         display_name: Some("Charlie".to_string()),
                         avatar_url: None,
-                        public_key: String::new(),
-                        signaling_gist_id: None,
+                        public_key: None,
                         status: UserStatus::Offline,
-                        added_at: chrono::Utc::now(),
                     },
                 ];
 
@@ -398,53 +441,33 @@ impl Artemis {
                     return IcedTask::none();
                 }
 
-                if !self.friends.iter().any(|f| f.github_username == username) {
-                    self.friends.push(PeerProfile {
-                        github_username: username.clone(),
-                        display_name: None,
-                        avatar_url: None,
-                        public_key: String::new(),
-                        signaling_gist_id: None,
-                        status: UserStatus::Offline,
-                        added_at: chrono::Utc::now(),
+                // Send friend request through server
+                if let Some(tx) = &self.client_tx {
+                    let _ = tx.send(ClientEvent::SendFriendRequest {
+                        target_username: username.clone(),
                     });
+                    tracing::info!("Friend request sent to @{}", username);
                 }
+
                 self.add_friend_input.clear();
                 self.show_add_friend = false;
-
-                tracing::info!("Added friend: @{}", username);
             }
-
-            AppMessage::FriendLookupResult {
-                username,
-                found,
-                public_key,
-                signaling_gist_id,
-            } => {
-                if found {
-                    if let Some(friend) = self
-                        .friends
-                        .iter_mut()
-                        .find(|f| f.github_username == username)
-                    {
-                        if let Some(pk) = public_key {
-                            friend.public_key = pk;
-                        }
-                        friend.signaling_gist_id = signaling_gist_id;
-                    }
-                    tracing::info!("Found peer profile for @{}", username);
-                } else {
-                    tracing::warn!("No Artemis profile found for @{}", username);
+            AppMessage::FriendList(FriendListMsg::AcceptRequest(from_user_id)) => {
+                if let Some(tx) = &self.client_tx {
+                    let _ = tx.send(ClientEvent::AcceptFriendRequest { from_user_id });
                 }
+                self.pending_requests
+                    .retain(|r| r.from_user_id != from_user_id);
+            }
+            AppMessage::FriendList(FriendListMsg::DeclineRequest(from_user_id)) => {
+                if let Some(tx) = &self.client_tx {
+                    let _ = tx.send(ClientEvent::DeclineFriendRequest { from_user_id });
+                }
+                self.pending_requests
+                    .retain(|r| r.from_user_id != from_user_id);
             }
 
-            // ── Legacy server interactions (kept for mock/server mode) ──
-            AppMessage::Connected(tx) => {
-                self.client_tx = Some(tx);
-            }
-            AppMessage::ConnectionFailed(e) => {
-                self.login_state = LoginState::Error(format!("Connection failed: {}", e));
-            }
+            // ── Server events ──
             AppMessage::ServerEventReceived(event) => {
                 self.handle_server_event(event);
             }
@@ -473,6 +496,7 @@ impl Artemis {
                                 display_name: Some(m.username.clone()),
                                 avatar_url: m.avatar_url.clone(),
                                 github_id: None,
+                                public_key: None,
                                 status: m.status,
                                 custom_status: m.custom_status.clone(),
                                 created_at: chrono::Utc::now(),
@@ -510,7 +534,11 @@ impl Artemis {
             }
             AppMessage::ChatArea(ChatAreaMsg::SendMessage) => {
                 if !self.message_input.trim().is_empty() {
-                    if let Some(channel_id) = self.active_channel_id {
+                    if self.is_home {
+                        // DM mode: send E2E encrypted message through server relay
+                        self.send_dm();
+                    } else if let Some(channel_id) = self.active_channel_id {
+                        // Server channel mode
                         if let Some(tx) = &self.client_tx {
                             let _ = tx.send(ClientEvent::SendMessage {
                                 channel_id,
@@ -518,6 +546,7 @@ impl Artemis {
                             });
                             self.message_input.clear();
                         } else {
+                            // Offline/mock
                             let msg = Message {
                                 id: Uuid::new_v4(),
                                 channel_id,
@@ -559,6 +588,72 @@ impl Artemis {
         IcedTask::none()
     }
 
+    /// Send an E2E encrypted DM to the active friend via server relay.
+    fn send_dm(&mut self) {
+        let Some(active_username) = &self.active_friend else {
+            return;
+        };
+        let Some(friend) = self.friends.iter().find(|f| &f.username == active_username) else {
+            return;
+        };
+        let Some(identity) = &self.identity else {
+            tracing::error!("No identity available for E2E encryption");
+            return;
+        };
+        let Some(tx) = &self.client_tx else {
+            return;
+        };
+
+        let content = self.message_input.clone();
+        let recipient_id = friend.user_id;
+
+        // Encrypt message if friend has a public key
+        let encrypted_content = if let Some(ref pk) = friend.public_key {
+            match identity.encrypt_for_b64(pk, content.as_bytes()) {
+                Ok(enc) => enc,
+                Err(e) => {
+                    tracing::error!("E2E encryption failed: {}", e);
+                    return;
+                }
+            }
+        } else {
+            tracing::warn!("Friend has no public key, sending unencrypted");
+            content.clone()
+        };
+
+        let _ = tx.send(ClientEvent::SendDirectMessage {
+            recipient_id,
+            encrypted_content,
+        });
+
+        // Optimistic local display
+        let dm_channel_id = self.dm_channel_id(recipient_id);
+        let msg = Message {
+            id: Uuid::new_v4(),
+            channel_id: dm_channel_id,
+            author_id: self.user_id.unwrap_or(Uuid::nil()),
+            author_name: self.username.clone(),
+            author_avatar: self.avatar_url.clone(),
+            content,
+            attachments: vec![],
+            timestamp: chrono::Utc::now(),
+            edited_at: None,
+        };
+        self.messages.push(msg);
+        self.message_input.clear();
+    }
+
+    /// Derive a deterministic DM channel ID from two user IDs.
+    fn dm_channel_id(&self, other_user_id: Uuid) -> Uuid {
+        let my_id = self.user_id.unwrap_or(Uuid::nil());
+        let (a, b) = if my_id < other_user_id {
+            (my_id, other_user_id)
+        } else {
+            (other_user_id, my_id)
+        };
+        Uuid::new_v5(&Uuid::NAMESPACE_OID, format!("dm:{}:{}", a, b).as_bytes())
+    }
+
     fn handle_server_event(&mut self, event: ServerEvent) {
         match event {
             ServerEvent::Authenticated {
@@ -586,6 +681,7 @@ impl Artemis {
                                 display_name: Some(m.username.clone()),
                                 avatar_url: m.avatar_url.clone(),
                                 github_id: None,
+                                public_key: None,
                                 status: m.status,
                                 custom_status: m.custom_status.clone(),
                                 created_at: chrono::Utc::now(),
@@ -662,6 +758,7 @@ impl Artemis {
                             display_name: None,
                             avatar_url,
                             github_id: None,
+                            public_key: None,
                             status: UserStatus::Online,
                             custom_status: None,
                             created_at: chrono::Utc::now(),
@@ -678,6 +775,126 @@ impl Artemis {
             ServerEvent::Error { message } => {
                 tracing::error!("Server error: {}", message);
             }
+
+            // ── Friend / DM events ──
+
+            ServerEvent::PublicKeyAcknowledged => {
+                tracing::info!("Public key registered on server");
+            }
+
+            ServerEvent::FriendRequestReceived {
+                from_user_id,
+                from_username,
+                from_avatar_url,
+            } => {
+                tracing::info!("Friend request from @{}", from_username);
+                if !self
+                    .pending_requests
+                    .iter()
+                    .any(|r| r.from_user_id == from_user_id)
+                {
+                    self.pending_requests.push(FriendRequestPayload {
+                        from_user_id,
+                        from_username,
+                        from_avatar_url,
+                        created_at: chrono::Utc::now(),
+                    });
+                }
+            }
+
+            ServerEvent::FriendRequestAccepted {
+                user_id,
+                username,
+                avatar_url,
+                public_key,
+            } => {
+                tracing::info!("Now friends with @{}", username);
+                if !self.friends.iter().any(|f| f.user_id == user_id) {
+                    self.friends.push(FriendPayload {
+                        user_id,
+                        username,
+                        display_name: None,
+                        avatar_url,
+                        public_key,
+                        status: UserStatus::Online,
+                    });
+                }
+            }
+
+            ServerEvent::FriendRequestDeclined { by_user_id } => {
+                tracing::info!("Friend request declined by {}", by_user_id);
+            }
+
+            ServerEvent::FriendList { friends } => {
+                self.friends = friends;
+                tracing::info!("Friend list loaded: {} friends", self.friends.len());
+            }
+
+            ServerEvent::PendingFriendRequests { requests } => {
+                self.pending_requests = requests;
+                tracing::info!(
+                    "Pending friend requests: {}",
+                    self.pending_requests.len()
+                );
+            }
+
+            ServerEvent::DirectMessageReceived {
+                from_user_id,
+                from_username,
+                encrypted_content,
+                timestamp,
+                message_id,
+            } => {
+                if self.messages.iter().any(|m| m.id == message_id) {
+                    return;
+                }
+
+                let dm_channel_id = self.dm_channel_id(from_user_id);
+
+                // Try to decrypt
+                let content = if from_user_id == self.user_id.unwrap_or(Uuid::nil()) {
+                    // Our own echoed message — skip (already added optimistically)
+                    return;
+                } else if let Some(identity) = &self.identity {
+                    let sender_pk = self
+                        .friends
+                        .iter()
+                        .find(|f| f.user_id == from_user_id)
+                        .and_then(|f| f.public_key.as_ref());
+
+                    if let Some(pk) = sender_pk {
+                        match identity.decrypt_from_b64(pk, &encrypted_content) {
+                            Ok(plaintext) => {
+                                String::from_utf8(plaintext).unwrap_or(encrypted_content)
+                            }
+                            Err(_) => encrypted_content,
+                        }
+                    } else {
+                        encrypted_content
+                    }
+                } else {
+                    encrypted_content
+                };
+
+                let msg = Message {
+                    id: message_id,
+                    channel_id: dm_channel_id,
+                    author_id: from_user_id,
+                    author_name: from_username,
+                    author_avatar: None,
+                    content,
+                    attachments: vec![],
+                    timestamp,
+                    edited_at: None,
+                };
+                self.messages.push(msg);
+            }
+
+            ServerEvent::FriendPresenceUpdate { user_id, status } => {
+                if let Some(friend) = self.friends.iter_mut().find(|f| f.user_id == user_id) {
+                    friend.status = status;
+                }
+            }
         }
     }
 
@@ -688,7 +905,6 @@ impl Artemis {
             AppScreen::Chat => {
                 let active_server = self.servers.get(self.active_server_idx);
 
-                // Server strip (always visible, far left — like Discord)
                 let active_srv_idx = if self.is_home {
                     None
                 } else {
@@ -704,27 +920,32 @@ impl Artemis {
                 let mut main_row = row![server_strip];
 
                 if self.is_home {
-                    // Home mode: show friend list + DM chat
                     let friend_list_view = friend_list::view(
                         &self.friends,
+                        &self.pending_requests,
                         self.active_friend.as_deref(),
                         &self.add_friend_input,
                         self.show_add_friend,
                     )
                     .map(AppMessage::FriendList);
 
+                    // Show DM messages for active friend
+                    let dm_channel = self.active_friend.as_ref().and_then(|uname| {
+                        let friend = self.friends.iter().find(|f| &f.username == uname)?;
+                        Some(self.dm_channel_id(friend.user_id))
+                    });
+
                     let chat_view = chat_area::view_with_payload(
                         None,
                         &self.messages,
                         &self.message_input,
-                        self.active_channel_id,
+                        dm_channel,
                     )
                     .map(AppMessage::ChatArea);
 
                     main_row = main_row.push(friend_list_view);
                     main_row = main_row.push(chat_view);
                 } else {
-                    // Server mode: show channels + chat + members
                     let channel_sidebar_view =
                         channel_sidebar::view_from_payload(active_server, self.active_channel_id)
                             .map(AppMessage::ChannelSidebar);

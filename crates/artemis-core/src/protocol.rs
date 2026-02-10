@@ -49,6 +49,32 @@ pub enum ClientEvent {
         name: String,
         category_id: Option<Uuid>,
     },
+
+    // ── Friend / DM / E2E relay ──
+
+    /// Publish own public key to the server.
+    PublishPublicKey { public_key: String },
+
+    /// Send a friend request by GitHub username.
+    SendFriendRequest { target_username: String },
+
+    /// Accept a pending friend request.
+    AcceptFriendRequest { from_user_id: Uuid },
+
+    /// Decline a pending friend request.
+    DeclineFriendRequest { from_user_id: Uuid },
+
+    /// Send an E2E encrypted DM relayed through the server.
+    SendDirectMessage {
+        recipient_id: Uuid,
+        encrypted_content: String,
+    },
+
+    /// Fetch own friend list.
+    FetchFriends,
+
+    /// Fetch pending incoming friend requests.
+    FetchFriendRequests,
 }
 
 /// Events sent FROM server TO client.
@@ -115,6 +141,50 @@ pub enum ServerEvent {
 
     /// Server error.
     Error { message: String },
+
+    // ── Friend / DM / E2E relay ──
+
+    /// Own public key was saved.
+    PublicKeyAcknowledged,
+
+    /// Someone sent us a friend request.
+    FriendRequestReceived {
+        from_user_id: Uuid,
+        from_username: String,
+        from_avatar_url: Option<String>,
+    },
+
+    /// A friend request we sent was accepted.
+    FriendRequestAccepted {
+        user_id: Uuid,
+        username: String,
+        avatar_url: Option<String>,
+        public_key: Option<String>,
+    },
+
+    /// A friend request was declined.
+    FriendRequestDeclined { by_user_id: Uuid },
+
+    /// Full friend list response.
+    FriendList { friends: Vec<FriendPayload> },
+
+    /// Pending friend requests list.
+    PendingFriendRequests { requests: Vec<FriendRequestPayload> },
+
+    /// An E2E encrypted DM relayed to us.
+    DirectMessageReceived {
+        from_user_id: Uuid,
+        from_username: String,
+        encrypted_content: String,
+        timestamp: DateTime<Utc>,
+        message_id: Uuid,
+    },
+
+    /// A friend's presence changed.
+    FriendPresenceUpdate {
+        user_id: Uuid,
+        status: UserStatus,
+    },
 }
 
 /// Compact server info sent on auth.
@@ -150,4 +220,24 @@ pub struct MemberPayload {
     pub role: MemberRole,
     pub status: UserStatus,
     pub custom_status: Option<String>,
+}
+
+/// A friend in the friend list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FriendPayload {
+    pub user_id: Uuid,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
+    pub public_key: Option<String>,
+    pub status: UserStatus,
+}
+
+/// A pending friend request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FriendRequestPayload {
+    pub from_user_id: Uuid,
+    pub from_username: String,
+    pub from_avatar_url: Option<String>,
+    pub created_at: DateTime<Utc>,
 }

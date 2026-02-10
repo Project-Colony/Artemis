@@ -3,7 +3,7 @@ use iced::widget::{button, column, container, row, scrollable, text, text_input,
 use iced::{Border, Element, Length, Padding};
 
 use artemis_core::models::user::UserStatus;
-use artemis_p2p::protocol::PeerProfile;
+use artemis_core::protocol::{FriendPayload, FriendRequestPayload};
 use crate::theme::colors;
 
 #[derive(Debug, Clone)]
@@ -12,10 +12,13 @@ pub enum FriendListMsg {
     AddFriendInputChanged(String),
     AddFriend,
     ToggleAddFriend,
+    AcceptRequest(uuid::Uuid),
+    DeclineRequest(uuid::Uuid),
 }
 
 pub fn view<'a>(
-    friends: &'a [PeerProfile],
+    friends: &'a [FriendPayload],
+    pending_requests: &'a [FriendRequestPayload],
     active_friend: Option<&'a str>,
     add_friend_input: &'a str,
     show_add_form: bool,
@@ -93,6 +96,24 @@ pub fn view<'a>(
 
     content = content.push(Space::with_height(4));
 
+    // Pending friend requests
+    if !pending_requests.is_empty() {
+        content = content.push(
+            container(
+                text(format!("PENDING \u{2014} {}", pending_requests.len()))
+                    .size(11)
+                    .color(colors::STATUS_IDLE),
+            )
+            .padding(Padding::from([6, 16])),
+        );
+
+        for req in pending_requests {
+            content = content.push(friend_request_entry(req));
+        }
+
+        content = content.push(Space::with_height(8));
+    }
+
     // Online friends
     let online: Vec<_> = friends
         .iter()
@@ -114,7 +135,7 @@ pub fn view<'a>(
         );
 
         for friend in &online {
-            let is_active = active_friend == Some(friend.github_username.as_str());
+            let is_active = active_friend == Some(friend.username.as_str());
             content = content.push(friend_entry(friend, is_active));
         }
 
@@ -132,12 +153,12 @@ pub fn view<'a>(
         );
 
         for friend in &offline {
-            let is_active = active_friend == Some(friend.github_username.as_str());
+            let is_active = active_friend == Some(friend.username.as_str());
             content = content.push(friend_entry(friend, is_active));
         }
     }
 
-    if friends.is_empty() {
+    if friends.is_empty() && pending_requests.is_empty() {
         content = content.push(Space::with_height(20));
         content = content.push(
             container(
@@ -172,12 +193,12 @@ pub fn view<'a>(
         .into()
 }
 
-fn friend_entry<'a>(friend: &PeerProfile, is_active: bool) -> Element<'a, FriendListMsg> {
-    let username = friend.github_username.clone();
+fn friend_entry<'a>(friend: &FriendPayload, is_active: bool) -> Element<'a, FriendListMsg> {
+    let username = friend.username.clone();
     let display = friend
         .display_name
         .clone()
-        .unwrap_or_else(|| friend.github_username.clone());
+        .unwrap_or_else(|| friend.username.clone());
 
     let status_color = match friend.status {
         UserStatus::Online => colors::STATUS_ONLINE,
@@ -230,7 +251,7 @@ fn friend_entry<'a>(friend: &PeerProfile, is_active: bool) -> Element<'a, Friend
         } else {
             colors::TEXT_MUTED
         }),
-        text(format!("@{}", friend.github_username))
+        text(format!("@{}", friend.username))
             .size(10)
             .color(colors::TEXT_TIMESTAMP),
     ]
@@ -272,4 +293,93 @@ fn friend_entry<'a>(friend: &PeerProfile, is_active: bool) -> Element<'a, Friend
         });
 
     container(btn).padding(Padding::from([0, 4])).into()
+}
+
+fn friend_request_entry<'a>(req: &FriendRequestPayload) -> Element<'a, FriendListMsg> {
+    let from_id = req.from_user_id;
+    let display = req.from_username.clone();
+
+    let avatar_initial = display
+        .chars()
+        .next()
+        .unwrap_or('?')
+        .to_uppercase()
+        .to_string();
+
+    let avatar = container(
+        text(avatar_initial)
+            .size(12)
+            .color(colors::TEXT_PRIMARY)
+            .align_x(Horizontal::Center),
+    )
+    .width(32)
+    .height(32)
+    .align_x(Horizontal::Center)
+    .align_y(Vertical::Center)
+    .style(move |_| container::Style {
+        background: Some(iced::Background::Color(colors::STATUS_IDLE)),
+        border: Border {
+            radius: 16.0.into(),
+            ..Border::default()
+        },
+        ..container::Style::default()
+    });
+
+    let name_col = column![
+        text(display).size(13).color(colors::TEXT_PRIMARY),
+        text("wants to be friends")
+            .size(10)
+            .color(colors::TEXT_TIMESTAMP),
+    ]
+    .spacing(1);
+
+    let accept_btn = button(text("\u{2713}").size(14).color(colors::STATUS_ONLINE))
+        .on_press(FriendListMsg::AcceptRequest(from_id))
+        .padding(Padding::from([4, 8]))
+        .style(|_theme, _status| button::Style {
+            background: Some(iced::Background::Color(colors::BG_HOVER)),
+            text_color: colors::STATUS_ONLINE,
+            border: Border {
+                radius: 4.0.into(),
+                ..Border::default()
+            },
+            ..button::Style::default()
+        });
+
+    let decline_btn = button(text("\u{2717}").size(14).color(iced::color!(0xEF, 0x44, 0x44)))
+        .on_press(FriendListMsg::DeclineRequest(from_id))
+        .padding(Padding::from([4, 8]))
+        .style(|_theme, _status| button::Style {
+            background: Some(iced::Background::Color(colors::BG_HOVER)),
+            text_color: iced::color!(0xEF, 0x44, 0x44),
+            border: Border {
+                radius: 4.0.into(),
+                ..Border::default()
+            },
+            ..button::Style::default()
+        });
+
+    let entry_row = row![
+        avatar,
+        Space::with_width(8),
+        name_col,
+        Space::with_width(Length::Fill),
+        accept_btn,
+        Space::with_width(4),
+        decline_btn,
+    ]
+    .align_y(Vertical::Center);
+
+    container(entry_row)
+        .padding(Padding::from([6, 12]))
+        .width(Length::Fill)
+        .style(|_| container::Style {
+            background: Some(iced::Background::Color(iced::color!(0x35, 0x3A, 0x20))),
+            border: Border {
+                radius: 4.0.into(),
+                ..Border::default()
+            },
+            ..container::Style::default()
+        })
+        .into()
 }

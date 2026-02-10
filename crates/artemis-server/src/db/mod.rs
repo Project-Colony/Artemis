@@ -18,6 +18,8 @@ pub async fn connect(database_url: &str) -> Result<DbPool, sqlx::Error> {
 pub async fn run_migrations(pool: &DbPool) -> Result<(), sqlx::Error> {
     let migration = include_str!("../../migrations/001_init.sql");
     sqlx::raw_sql(migration).execute(pool).await?;
+    let migration2 = include_str!("../../migrations/002_friends_and_dms.sql");
+    sqlx::raw_sql(migration2).execute(pool).await?;
     tracing::info!("Database migrations applied");
     Ok(())
 }
@@ -26,7 +28,7 @@ pub async fn run_migrations(pool: &DbPool) -> Result<(), sqlx::Error> {
 
 pub async fn find_user_by_github_id(pool: &DbPool, github_id: i64) -> Result<Option<UserRow>, sqlx::Error> {
     sqlx::query_as::<_, UserRow>(
-        "SELECT id, username, display_name, avatar_url, github_id, status, custom_status, auth_token, created_at FROM users WHERE github_id = $1"
+        "SELECT id, username, display_name, avatar_url, github_id, status, custom_status, auth_token, public_key, created_at FROM users WHERE github_id = $1"
     )
     .bind(github_id)
     .fetch_optional(pool)
@@ -35,9 +37,18 @@ pub async fn find_user_by_github_id(pool: &DbPool, github_id: i64) -> Result<Opt
 
 pub async fn find_user_by_token(pool: &DbPool, token: &str) -> Result<Option<UserRow>, sqlx::Error> {
     sqlx::query_as::<_, UserRow>(
-        "SELECT id, username, display_name, avatar_url, github_id, status, custom_status, auth_token, created_at FROM users WHERE auth_token = $1"
+        "SELECT id, username, display_name, avatar_url, github_id, status, custom_status, auth_token, public_key, created_at FROM users WHERE auth_token = $1"
     )
     .bind(token)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn find_user_by_username(pool: &DbPool, username: &str) -> Result<Option<UserRow>, sqlx::Error> {
+    sqlx::query_as::<_, UserRow>(
+        "SELECT id, username, display_name, avatar_url, github_id, status, custom_status, auth_token, public_key, created_at FROM users WHERE username = $1"
+    )
+    .bind(username)
     .fetch_optional(pool)
     .await
 }
@@ -397,6 +408,34 @@ pub struct UserRow {
     pub status: String,
     pub custom_status: Option<String>,
     pub auth_token: Option<String>,
+    pub public_key: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+pub struct FriendRequestRow {
+    pub id: Uuid,
+    pub from_user_id: Uuid,
+    pub to_user_id: Uuid,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+pub struct FriendRow {
+    pub user_id: Uuid,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
+    pub public_key: Option<String>,
+    pub status: String,
+}
+
+#[derive(sqlx::FromRow)]
+pub struct FriendRequestDetailRow {
+    pub from_user_id: Uuid,
+    pub from_username: String,
+    pub from_avatar_url: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -441,6 +480,131 @@ struct MessageRow {
     edited_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
 }
+
+// ── Public key ──
+
+pub async fn save_public_key(pool: &DbPool, user_id: Uuid, public_key: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE users SET public_key = $1 WHERE id = $2")
+        .bind(public_key)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+// ── Friend requests ──
+
+pub async fn send_friend_request(pool: &DbPool, from_id: Uuid, to_id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO friend_requests (from_user_id, to_user_id, status)
+         VALUES ($1, $2, 'pending')
+         ON CONFLICT (from_user_id, to_user_id) DO NOTHING"
+    )
+    .bind(from_id)
+    .bind(to_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn accept_friend_request(pool: &DbPool, from_id: Uuid, to_id: Uuid) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE friend_requests SET status = 'accepted'
+         WHERE from_user_id = $1 AND to_user_id = $2 AND status = 'pending'"
+    )
+    .bind(from_id)
+    .bind(to_id)
+    .execute(pool)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Ok(false);
+    }
+
+    // Create bidirectional friendship (smaller UUID first)
+    let (a, b) = if from_id < to_id { (from_id, to_id) } else { (to_id, from_id) };
+    sqlx::query(
+        "INSERT INTO friendships (user_a, user_b) VALUES ($1, $2) ON CONFLICT DO NOTHING"
+    )
+    .bind(a)
+    .bind(b)
+    .execute(pool)
+    .await?;
+
+    Ok(true)
+}
+
+pub async fn decline_friend_request(pool: &DbPool, from_id: Uuid, to_id: Uuid) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE friend_requests SET status = 'declined'
+         WHERE from_user_id = $1 AND to_user_id = $2 AND status = 'pending'"
+    )
+    .bind(from_id)
+    .bind(to_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn get_pending_friend_requests(pool: &DbPool, user_id: Uuid) -> Result<Vec<FriendRequestDetailRow>, sqlx::Error> {
+    sqlx::query_as::<_, FriendRequestDetailRow>(
+        "SELECT fr.from_user_id, u.username AS from_username, u.avatar_url AS from_avatar_url, fr.created_at
+         FROM friend_requests fr
+         JOIN users u ON u.id = fr.from_user_id
+         WHERE fr.to_user_id = $1 AND fr.status = 'pending'
+         ORDER BY fr.created_at DESC"
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn are_friends(pool: &DbPool, user_a: Uuid, user_b: Uuid) -> Result<bool, sqlx::Error> {
+    let (a, b) = if user_a < user_b { (user_a, user_b) } else { (user_b, user_a) };
+    let row = sqlx::query_as::<_, (i64,)>(
+        "SELECT COUNT(*) FROM friendships WHERE user_a = $1 AND user_b = $2"
+    )
+    .bind(a)
+    .bind(b)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0 > 0)
+}
+
+pub async fn get_friends(pool: &DbPool, user_id: Uuid) -> Result<Vec<FriendRow>, sqlx::Error> {
+    sqlx::query_as::<_, FriendRow>(
+        "SELECT u.id AS user_id, u.username, u.display_name, u.avatar_url, u.public_key, u.status
+         FROM friendships f
+         JOIN users u ON u.id = CASE WHEN f.user_a = $1 THEN f.user_b ELSE f.user_a END
+         WHERE f.user_a = $1 OR f.user_b = $1
+         ORDER BY u.username"
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+}
+
+// ── Direct messages ──
+
+pub async fn store_direct_message(
+    pool: &DbPool,
+    sender_id: Uuid,
+    recipient_id: Uuid,
+    encrypted_content: &str,
+) -> Result<(Uuid, DateTime<Utc>), sqlx::Error> {
+    let row = sqlx::query_as::<_, (Uuid, DateTime<Utc>)>(
+        "INSERT INTO direct_messages (sender_id, recipient_id, encrypted_content)
+         VALUES ($1, $2, $3) RETURNING id, created_at"
+    )
+    .bind(sender_id)
+    .bind(recipient_id)
+    .bind(encrypted_content)
+    .fetch_one(pool)
+    .await?;
+    Ok(row)
+}
+
+// ── Parse helpers ──
 
 fn parse_role(s: &str) -> MemberRole {
     match s {

@@ -9,6 +9,7 @@ pub struct User {
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
     pub github_id: Option<i64>,
+    pub public_key: Option<String>,
     pub status: UserStatus,
     pub custom_status: Option<String>,
     pub created_at: DateTime<Utc>,
