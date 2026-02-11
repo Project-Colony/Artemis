@@ -124,3 +124,84 @@ pub enum CryptoError {
     #[error("invalid ciphertext")]
     InvalidCiphertext,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_generation_produces_valid_keys() {
+        let id = Identity::generate();
+        let pub_b64 = id.public_key_b64();
+        let sec_b64 = id.secret_key_b64();
+        // X25519 keys are 32 bytes, base64 encoded = 44 chars
+        assert_eq!(pub_b64.len(), 44);
+        assert_eq!(sec_b64.len(), 44);
+    }
+
+    #[test]
+    fn identity_restore_from_secret() {
+        let id = Identity::generate();
+        let sec_b64 = id.secret_key_b64();
+        let pub_b64 = id.public_key_b64();
+
+        let restored = Identity::from_secret_b64(&sec_b64).unwrap();
+        assert_eq!(restored.public_key_b64(), pub_b64);
+    }
+
+    #[test]
+    fn encrypt_decrypt_roundtrip() {
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+
+        let plaintext = b"Hello, Bob!";
+        let ciphertext = alice.encrypt_for(bob.public_key(), plaintext).unwrap();
+
+        let decrypted = bob.decrypt_from(alice.public_key(), &ciphertext).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn encrypt_decrypt_b64_roundtrip() {
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+
+        let plaintext = b"Secret message";
+        let encrypted = alice
+            .encrypt_for_b64(&bob.public_key_b64(), plaintext)
+            .unwrap();
+
+        let decrypted = bob
+            .decrypt_from_b64(&alice.public_key_b64(), &encrypted)
+            .unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn decrypt_with_wrong_key_fails() {
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let eve = Identity::generate();
+
+        let ciphertext = alice.encrypt_for(bob.public_key(), b"secret").unwrap();
+
+        // Eve should not be able to decrypt
+        let result = eve.decrypt_from(alice.public_key(), &ciphertext);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn invalid_secret_key_rejected() {
+        assert!(Identity::from_secret_b64("not-valid-base64!!!").is_err());
+        // Valid base64 but wrong length
+        assert!(Identity::from_secret_b64("AQID").is_err());
+    }
+
+    #[test]
+    fn short_ciphertext_rejected() {
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let result = bob.decrypt_from(alice.public_key(), &[0u8; 5]);
+        assert!(result.is_err());
+    }
+}

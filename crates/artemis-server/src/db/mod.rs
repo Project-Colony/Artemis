@@ -97,7 +97,7 @@ pub async fn update_user_status(pool: &DbPool, user_id: Uuid, status: &str) -> R
 
 pub async fn get_user_servers(pool: &DbPool, user_id: Uuid) -> Result<Vec<ServerPayload>, sqlx::Error> {
     let server_rows = sqlx::query_as::<_, ServerRow>(
-        "SELECT s.id, s.name, s.icon_url, s.owner_id
+        "SELECT s.id, s.name, s.icon_url
          FROM servers s
          JOIN server_members sm ON sm.server_id = s.id
          WHERE sm.user_id = $1
@@ -399,6 +399,7 @@ pub async fn create_channel(
 // ── Row types ──
 
 #[derive(sqlx::FromRow)]
+#[allow(dead_code)]
 pub struct UserRow {
     pub id: Uuid,
     pub username: String,
@@ -413,6 +414,7 @@ pub struct UserRow {
 }
 
 #[derive(sqlx::FromRow)]
+#[allow(dead_code)]
 pub struct FriendRequestRow {
     pub id: Uuid,
     pub from_user_id: Uuid,
@@ -444,7 +446,6 @@ struct ServerRow {
     id: Uuid,
     name: String,
     icon_url: Option<String>,
-    owner_id: Uuid,
 }
 
 #[derive(sqlx::FromRow)]

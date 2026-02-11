@@ -48,11 +48,13 @@ struct GistFileContent {
 }
 
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 struct UpdateGistRequest {
     files: std::collections::HashMap<String, GistFileContent>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 struct GistComment {
     id: u64,
     body: String,
@@ -61,6 +63,7 @@ struct GistComment {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 struct GistCommentUser {
     login: String,
 }

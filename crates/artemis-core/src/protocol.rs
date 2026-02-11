@@ -241,3 +241,66 @@ pub struct FriendRequestPayload {
     pub from_avatar_url: Option<String>,
     pub created_at: DateTime<Utc>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_event_roundtrip() {
+        let event = ClientEvent::SendMessage {
+            channel_id: Uuid::nil(),
+            content: "hello".to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: ClientEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ClientEvent::SendMessage { channel_id, content } => {
+                assert_eq!(channel_id, Uuid::nil());
+                assert_eq!(content, "hello");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn server_event_roundtrip() {
+        let event = ServerEvent::AuthError {
+            reason: "invalid token".to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: ServerEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ServerEvent::AuthError { reason } => assert_eq!(reason, "invalid token"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn server_payload_serialization() {
+        let payload = ServerPayload {
+            id: Uuid::nil(),
+            name: "Test Server".to_string(),
+            icon_url: None,
+            categories: vec![],
+            members: vec![],
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let parsed: ServerPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.name, "Test Server");
+        assert!(parsed.categories.is_empty());
+    }
+
+    #[test]
+    fn user_status_default_is_offline() {
+        assert_eq!(UserStatus::default(), UserStatus::Offline);
+    }
+
+    #[test]
+    fn member_role_serialization() {
+        let json = serde_json::to_string(&MemberRole::Founder).unwrap();
+        assert_eq!(json, "\"Founder\"");
+        let parsed: MemberRole = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, MemberRole::Founder);
+    }
+}

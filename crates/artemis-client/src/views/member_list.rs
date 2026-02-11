@@ -7,6 +7,7 @@ use crate::theme::colors;
 
 #[derive(Debug, Clone)]
 pub enum MemberListMsg {
+    #[allow(dead_code)]
     ToggleMemberList,
 }
 
