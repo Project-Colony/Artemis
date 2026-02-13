@@ -367,6 +367,9 @@ impl LocalStore {
                     .map(|dt| dt.with_timezone(&Utc))
                     .ok()
             }),
+            reply_to_id: None,
+            pinned: false,
+            reactions: vec![],
         })
     }
 }

@@ -4,7 +4,7 @@ use iced::{Border, Element, Length, Padding};
 
 use artemis_core::models::user::UserStatus;
 use artemis_core::protocol::{FriendPayload, FriendRequestPayload};
-use crate::theme::colors;
+use crate::theme::{colors, icons};
 
 #[derive(Debug, Clone)]
 pub enum FriendListMsg {
@@ -28,9 +28,9 @@ pub fn view<'a>(
     // Header
     let header = container(
         row![
-            text("Friends").size(16).color(colors::TEXT_PRIMARY),
+            text(format!("{} Friends", icons::MEMBERS)).size(16).color(colors::TEXT_PRIMARY),
             Space::with_width(Length::Fill),
-            button(text("+").size(16).color(colors::STATUS_ONLINE))
+            button(text(icons::USER_PLUS).size(14).color(colors::STATUS_ONLINE))
                 .on_press(FriendListMsg::ToggleAddFriend)
                 .padding(Padding::from([2, 8]))
                 .style(|_theme, status| {
@@ -100,7 +100,7 @@ pub fn view<'a>(
     if !pending_requests.is_empty() {
         content = content.push(
             container(
-                text(format!("PENDING \u{2014} {}", pending_requests.len()))
+                text(format!("{} PENDING \u{2014} {}", icons::PENDING, pending_requests.len()))
                     .size(11)
                     .color(colors::STATUS_IDLE),
             )
@@ -127,7 +127,7 @@ pub fn view<'a>(
     if !online.is_empty() {
         content = content.push(
             container(
-                text(format!("ONLINE \u{2014} {}", online.len()))
+                text(format!("{} ONLINE \u{2014} {}", icons::STATUS_ONLINE, online.len()))
                     .size(11)
                     .color(colors::TEXT_MUTED),
             )
@@ -145,7 +145,7 @@ pub fn view<'a>(
     if !offline.is_empty() {
         content = content.push(
             container(
-                text(format!("OFFLINE \u{2014} {}", offline.len()))
+                text(format!("{} OFFLINE \u{2014} {}", icons::STATUS_OFFLINE, offline.len()))
                     .size(11)
                     .color(colors::TEXT_MUTED),
             )
@@ -233,17 +233,13 @@ fn friend_entry<'a>(friend: &FriendPayload, is_active: bool) -> Element<'a, Frie
         ..container::Style::default()
     });
 
-    let status_dot = container(text("").size(1))
-        .width(8)
-        .height(8)
-        .style(move |_| container::Style {
-            background: Some(iced::Background::Color(status_color)),
-            border: Border {
-                radius: 4.0.into(),
-                ..Border::default()
-            },
-            ..container::Style::default()
-        });
+    let status_icon = match friend.status {
+        UserStatus::Online => icons::STATUS_ONLINE,
+        UserStatus::Idle => icons::STATUS_IDLE,
+        UserStatus::DoNotDisturb => icons::STATUS_DND,
+        UserStatus::Offline => icons::STATUS_OFFLINE,
+    };
+    let status_dot = text(status_icon).size(10).color(status_color);
 
     let name_col = column![
         text(display).size(13).color(if is_active {
@@ -333,7 +329,7 @@ fn friend_request_entry<'a>(req: &FriendRequestPayload) -> Element<'a, FriendLis
     ]
     .spacing(1);
 
-    let accept_btn = button(text("\u{2713}").size(14).color(colors::STATUS_ONLINE))
+    let accept_btn = button(text(icons::CHECK).size(14).color(colors::STATUS_ONLINE))
         .on_press(FriendListMsg::AcceptRequest(from_id))
         .padding(Padding::from([4, 8]))
         .style(|_theme, _status| button::Style {
@@ -346,7 +342,7 @@ fn friend_request_entry<'a>(req: &FriendRequestPayload) -> Element<'a, FriendLis
             ..button::Style::default()
         });
 
-    let decline_btn = button(text("\u{2717}").size(14).color(iced::color!(0xEF, 0x44, 0x44)))
+    let decline_btn = button(text(icons::DECLINE).size(14).color(iced::color!(0xEF, 0x44, 0x44)))
         .on_press(FriendListMsg::DeclineRequest(from_id))
         .padding(Padding::from([4, 8]))
         .style(|_theme, _status| button::Style {

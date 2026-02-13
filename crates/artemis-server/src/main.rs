@@ -10,7 +10,7 @@ use tower_http::trace::TraceLayer;
 use state::AppState;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     // Config from env vars
@@ -22,14 +22,10 @@ async fn main() {
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
 
     // Connect to database
-    let pool = db::connect(&database_url)
-        .await
-        .expect("Failed to connect to database");
+    let pool = db::connect(&database_url).await?;
 
     // Run migrations
-    db::run_migrations(&pool)
-        .await
-        .expect("Failed to run migrations");
+    db::run_migrations(&pool).await?;
 
     let app_state = AppState {
         db: pool,
@@ -48,6 +44,8 @@ async fn main() {
 
     tracing::info!("Artemis server listening on {bind_addr}");
 
-    let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+    axum::serve(listener, app).await?;
+
+    Ok(())
 }

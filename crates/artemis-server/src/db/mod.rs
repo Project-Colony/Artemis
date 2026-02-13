@@ -20,6 +20,10 @@ pub async fn run_migrations(pool: &DbPool) -> Result<(), sqlx::Error> {
     sqlx::raw_sql(migration).execute(pool).await?;
     let migration2 = include_str!("../../migrations/002_friends_and_dms.sql");
     sqlx::raw_sql(migration2).execute(pool).await?;
+    let migration3 = include_str!("../../migrations/003_reactions_replies_pins_unread.sql");
+    sqlx::raw_sql(migration3).execute(pool).await?;
+    let migration4 = include_str!("../../migrations/004_attachments_search_emojis.sql");
+    sqlx::raw_sql(migration4).execute(pool).await?;
     tracing::info!("Database migrations applied");
     Ok(())
 }
@@ -97,7 +101,7 @@ pub async fn update_user_status(pool: &DbPool, user_id: Uuid, status: &str) -> R
 
 pub async fn get_user_servers(pool: &DbPool, user_id: Uuid) -> Result<Vec<ServerPayload>, sqlx::Error> {
     let server_rows = sqlx::query_as::<_, ServerRow>(
-        "SELECT s.id, s.name, s.icon_url, s.owner_id
+        "SELECT s.id, s.name, s.icon_url
          FROM servers s
          JOIN server_members sm ON sm.server_id = s.id
          WHERE sm.user_id = $1
@@ -240,15 +244,16 @@ async fn get_server_members(pool: &DbPool, server_id: Uuid) -> Result<Vec<Member
 
 // ── Message queries ──
 
-pub async fn create_message(pool: &DbPool, channel_id: Uuid, author_id: Uuid, content: &str) -> Result<Message, sqlx::Error> {
+pub async fn create_message(pool: &DbPool, channel_id: Uuid, author_id: Uuid, content: &str, reply_to_id: Option<Uuid>) -> Result<Message, sqlx::Error> {
     let row = sqlx::query_as::<_, MessageRow>(
-        "INSERT INTO messages (channel_id, author_id, content)
-         VALUES ($1, $2, $3)
-         RETURNING id, channel_id, author_id, content, edited_at, created_at"
+        "INSERT INTO messages (channel_id, author_id, content, reply_to_id)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, channel_id, author_id, content, edited_at, created_at, reply_to_id"
     )
     .bind(channel_id)
     .bind(author_id)
     .bind(content)
+    .bind(reply_to_id)
     .fetch_one(pool)
     .await?;
 
@@ -269,6 +274,9 @@ pub async fn create_message(pool: &DbPool, channel_id: Uuid, author_id: Uuid, co
         attachments: vec![],
         timestamp: row.created_at,
         edited_at: row.edited_at,
+        reply_to_id: row.reply_to_id,
+        pinned: false,
+        reactions: vec![],
     })
 }
 
@@ -280,7 +288,7 @@ pub async fn get_messages(
 ) -> Result<Vec<Message>, sqlx::Error> {
     let rows = if let Some(before_id) = before {
         sqlx::query_as::<_, MessageRow>(
-            "SELECT m.id, m.channel_id, m.author_id, m.content, m.edited_at, m.created_at
+            "SELECT m.id, m.channel_id, m.author_id, m.content, m.edited_at, m.created_at, m.reply_to_id
              FROM messages m
              WHERE m.channel_id = $1 AND m.created_at < (SELECT created_at FROM messages WHERE id = $2)
              ORDER BY m.created_at DESC
@@ -293,7 +301,7 @@ pub async fn get_messages(
         .await?
     } else {
         sqlx::query_as::<_, MessageRow>(
-            "SELECT m.id, m.channel_id, m.author_id, m.content, m.edited_at, m.created_at
+            "SELECT m.id, m.channel_id, m.author_id, m.content, m.edited_at, m.created_at, m.reply_to_id
              FROM messages m
              WHERE m.channel_id = $1
              ORDER BY m.created_at DESC
@@ -314,6 +322,15 @@ pub async fn get_messages(
         .fetch_one(pool)
         .await?;
 
+        let pinned = sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM pinned_messages WHERE message_id = $1"
+        )
+        .bind(row.id)
+        .fetch_one(pool)
+        .await
+        .map(|r| r.0 > 0)
+        .unwrap_or(false);
+
         messages.push(Message {
             id: row.id,
             channel_id: row.channel_id,
@@ -324,6 +341,9 @@ pub async fn get_messages(
             attachments: vec![],
             timestamp: row.created_at,
             edited_at: row.edited_at,
+            reply_to_id: row.reply_to_id,
+            pinned,
+            reactions: vec![],
         });
     }
 
@@ -399,6 +419,7 @@ pub async fn create_channel(
 // ── Row types ──
 
 #[derive(sqlx::FromRow)]
+#[allow(dead_code)]
 pub struct UserRow {
     pub id: Uuid,
     pub username: String,
@@ -413,6 +434,7 @@ pub struct UserRow {
 }
 
 #[derive(sqlx::FromRow)]
+#[allow(dead_code)]
 pub struct FriendRequestRow {
     pub id: Uuid,
     pub from_user_id: Uuid,
@@ -444,7 +466,6 @@ struct ServerRow {
     id: Uuid,
     name: String,
     icon_url: Option<String>,
-    owner_id: Uuid,
 }
 
 #[derive(sqlx::FromRow)]
@@ -479,6 +500,7 @@ struct MessageRow {
     content: String,
     edited_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
+    reply_to_id: Option<Uuid>,
 }
 
 // ── Public key ──
@@ -628,4 +650,597 @@ fn parse_channel_type(s: &str) -> ChannelType {
         "voice" => ChannelType::Voice,
         _ => ChannelType::Text,
     }
+}
+
+// ── Reactions ──
+
+pub async fn add_reaction(pool: &DbPool, message_id: Uuid, user_id: Uuid, emoji: &str) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "INSERT INTO message_reactions (message_id, user_id, emoji) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING"
+    )
+    .bind(message_id)
+    .bind(user_id)
+    .bind(emoji)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn remove_reaction(pool: &DbPool, message_id: Uuid, user_id: Uuid, emoji: &str) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "DELETE FROM message_reactions WHERE message_id = $1 AND user_id = $2 AND emoji = $3"
+    )
+    .bind(message_id)
+    .bind(user_id)
+    .bind(emoji)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+// ── Pins ──
+
+pub async fn pin_message(pool: &DbPool, channel_id: Uuid, message_id: Uuid, pinned_by: Uuid) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "INSERT INTO pinned_messages (channel_id, message_id, pinned_by) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING"
+    )
+    .bind(channel_id)
+    .bind(message_id)
+    .bind(pinned_by)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn unpin_message(pool: &DbPool, channel_id: Uuid, message_id: Uuid) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "DELETE FROM pinned_messages WHERE channel_id = $1 AND message_id = $2"
+    )
+    .bind(channel_id)
+    .bind(message_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn get_pinned_messages(pool: &DbPool, channel_id: Uuid) -> Result<Vec<Message>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, MessageRow>(
+        "SELECT m.id, m.channel_id, m.author_id, m.content, m.edited_at, m.created_at, m.reply_to_id
+         FROM pinned_messages pm
+         JOIN messages m ON m.id = pm.message_id
+         WHERE pm.channel_id = $1
+         ORDER BY pm.pinned_at DESC"
+    )
+    .bind(channel_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut messages = Vec::new();
+    for row in rows {
+        let author = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT username, avatar_url FROM users WHERE id = $1"
+        )
+        .bind(row.author_id)
+        .fetch_one(pool)
+        .await?;
+
+        messages.push(Message {
+            id: row.id,
+            channel_id: row.channel_id,
+            author_id: row.author_id,
+            author_name: author.0,
+            author_avatar: author.1,
+            content: row.content,
+            attachments: vec![],
+            timestamp: row.created_at,
+            edited_at: row.edited_at,
+            reply_to_id: row.reply_to_id,
+            pinned: true,
+            reactions: vec![],
+        });
+    }
+    Ok(messages)
+}
+
+/// Get the channel_id for a message.
+pub async fn get_message_channel(pool: &DbPool, message_id: Uuid) -> Result<Option<Uuid>, sqlx::Error> {
+    let row = sqlx::query_as::<_, (Uuid,)>(
+        "SELECT channel_id FROM messages WHERE id = $1"
+    )
+    .bind(message_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| r.0))
+}
+
+// ── Unread tracking ──
+
+pub async fn ack_message(pool: &DbPool, user_id: Uuid, channel_id: Uuid, message_id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO channel_read_state (user_id, channel_id, last_read_message_id, last_read_at, mention_count)
+         VALUES ($1, $2, $3, NOW(), 0)
+         ON CONFLICT (user_id, channel_id) DO UPDATE SET last_read_message_id = $3, last_read_at = NOW(), mention_count = 0"
+    )
+    .bind(user_id)
+    .bind(channel_id)
+    .bind(message_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn get_unread_state(pool: &DbPool, user_id: Uuid) -> Result<Vec<ChannelUnreadPayload>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, UnreadRow>(
+        "SELECT sm.server_id, c.id AS channel_id,
+                rs.last_read_message_id,
+                COALESCE(rs.mention_count, 0) AS mention_count,
+                (SELECT COUNT(*) FROM messages m
+                 WHERE m.channel_id = c.id
+                 AND (rs.last_read_message_id IS NULL OR m.created_at > (SELECT created_at FROM messages WHERE id = rs.last_read_message_id))
+                )::INTEGER AS unread_count
+         FROM server_members sm
+         JOIN channels c ON c.server_id = sm.server_id
+         LEFT JOIN channel_read_state rs ON rs.user_id = $1 AND rs.channel_id = c.id
+         WHERE sm.user_id = $1"
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(|r| ChannelUnreadPayload {
+        channel_id: r.channel_id,
+        last_read_message_id: r.last_read_message_id,
+        mention_count: r.mention_count as u32,
+        unread_count: r.unread_count as u32,
+    }).collect())
+}
+
+#[derive(sqlx::FromRow)]
+#[allow(dead_code)]
+struct UnreadRow {
+    server_id: Uuid,
+    channel_id: Uuid,
+    last_read_message_id: Option<Uuid>,
+    mention_count: i32,
+    unread_count: i32,
+}
+
+// ── Server / channel management ──
+
+pub async fn edit_server(pool: &DbPool, server_id: Uuid, name: Option<&str>, icon_url: Option<&str>) -> Result<(), sqlx::Error> {
+    if let Some(name) = name {
+        sqlx::query("UPDATE servers SET name = $1 WHERE id = $2")
+            .bind(name).bind(server_id).execute(pool).await?;
+    }
+    if let Some(icon) = icon_url {
+        sqlx::query("UPDATE servers SET icon_url = $1 WHERE id = $2")
+            .bind(icon).bind(server_id).execute(pool).await?;
+    }
+    Ok(())
+}
+
+pub async fn delete_server(pool: &DbPool, server_id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM servers WHERE id = $1")
+        .bind(server_id).execute(pool).await?;
+    Ok(())
+}
+
+pub async fn get_server_owner(pool: &DbPool, server_id: Uuid) -> Result<Option<Uuid>, sqlx::Error> {
+    let row = sqlx::query_as::<_, (Uuid,)>(
+        "SELECT owner_id FROM servers WHERE id = $1"
+    )
+    .bind(server_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| r.0))
+}
+
+pub async fn get_member_role(pool: &DbPool, user_id: Uuid, server_id: Uuid) -> Result<Option<String>, sqlx::Error> {
+    let row = sqlx::query_as::<_, (String,)>(
+        "SELECT role FROM server_members WHERE user_id = $1 AND server_id = $2"
+    )
+    .bind(user_id)
+    .bind(server_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| r.0))
+}
+
+pub async fn create_category(pool: &DbPool, server_id: Uuid, name: &str) -> Result<CategoryPayload, sqlx::Error> {
+    let row = sqlx::query_as::<_, (Uuid,)>(
+        "INSERT INTO categories (server_id, name, position)
+         VALUES ($1, $2, (SELECT COALESCE(MAX(position), 0) + 1 FROM categories WHERE server_id = $1))
+         RETURNING id"
+    )
+    .bind(server_id)
+    .bind(name)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(CategoryPayload {
+        id: row.0,
+        name: name.to_string(),
+        channels: vec![],
+    })
+}
+
+pub async fn delete_channel(pool: &DbPool, channel_id: Uuid) -> Result<Option<Uuid>, sqlx::Error> {
+    // Return server_id before deleting
+    let row = sqlx::query_as::<_, (Uuid,)>(
+        "SELECT server_id FROM channels WHERE id = $1"
+    )
+    .bind(channel_id)
+    .fetch_optional(pool)
+    .await?;
+
+    if let Some((server_id,)) = row {
+        sqlx::query("DELETE FROM channels WHERE id = $1")
+            .bind(channel_id).execute(pool).await?;
+        Ok(Some(server_id))
+    } else {
+        Ok(None)
+    }
+}
+
+pub async fn edit_channel(pool: &DbPool, channel_id: Uuid, name: Option<&str>, topic: Option<&str>) -> Result<(), sqlx::Error> {
+    if let Some(name) = name {
+        sqlx::query("UPDATE channels SET name = $1 WHERE id = $2")
+            .bind(name).bind(channel_id).execute(pool).await?;
+    }
+    if let Some(topic) = topic {
+        sqlx::query("UPDATE channels SET topic = $1 WHERE id = $2")
+            .bind(topic).bind(channel_id).execute(pool).await?;
+    }
+    Ok(())
+}
+
+pub async fn get_channel_server(pool: &DbPool, channel_id: Uuid) -> Result<Option<Uuid>, sqlx::Error> {
+    let row = sqlx::query_as::<_, (Uuid,)>(
+        "SELECT server_id FROM channels WHERE id = $1"
+    )
+    .bind(channel_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| r.0))
+}
+
+pub async fn leave_server(pool: &DbPool, user_id: Uuid, server_id: Uuid) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "DELETE FROM server_members WHERE user_id = $1 AND server_id = $2"
+    )
+    .bind(user_id)
+    .bind(server_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn get_invite_code(pool: &DbPool, server_id: Uuid) -> Result<Option<String>, sqlx::Error> {
+    let row = sqlx::query_as::<_, (Option<String>,)>(
+        "SELECT invite_code FROM servers WHERE id = $1"
+    )
+    .bind(server_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|r| r.0))
+}
+
+// ── User profile ──
+
+pub async fn update_profile(pool: &DbPool, user_id: Uuid, display_name: Option<&str>, custom_status: Option<&str>) -> Result<(), sqlx::Error> {
+    if let Some(dn) = display_name {
+        sqlx::query("UPDATE users SET display_name = $1 WHERE id = $2")
+            .bind(dn).bind(user_id).execute(pool).await?;
+    }
+    if let Some(cs) = custom_status {
+        sqlx::query("UPDATE users SET custom_status = $1 WHERE id = $2")
+            .bind(cs).bind(user_id).execute(pool).await?;
+    }
+    Ok(())
+}
+
+// ── DM history ──
+
+pub async fn get_direct_messages(
+    pool: &DbPool,
+    user_id: Uuid,
+    friend_id: Uuid,
+    before: Option<Uuid>,
+    limit: u32,
+) -> Result<Vec<DirectMessagePayload>, sqlx::Error> {
+    let rows = if let Some(before_id) = before {
+        sqlx::query_as::<_, DmRow>(
+            "SELECT dm.id, dm.sender_id, u.username AS sender_username, dm.encrypted_content, dm.created_at
+             FROM direct_messages dm
+             JOIN users u ON u.id = dm.sender_id
+             WHERE ((dm.sender_id = $1 AND dm.recipient_id = $2) OR (dm.sender_id = $2 AND dm.recipient_id = $1))
+               AND dm.created_at < (SELECT created_at FROM direct_messages WHERE id = $3)
+             ORDER BY dm.created_at DESC
+             LIMIT $4"
+        )
+        .bind(user_id).bind(friend_id).bind(before_id).bind(limit as i64)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as::<_, DmRow>(
+            "SELECT dm.id, dm.sender_id, u.username AS sender_username, dm.encrypted_content, dm.created_at
+             FROM direct_messages dm
+             JOIN users u ON u.id = dm.sender_id
+             WHERE (dm.sender_id = $1 AND dm.recipient_id = $2) OR (dm.sender_id = $2 AND dm.recipient_id = $1)
+             ORDER BY dm.created_at DESC
+             LIMIT $3"
+        )
+        .bind(user_id).bind(friend_id).bind(limit as i64)
+        .fetch_all(pool)
+        .await?
+    };
+
+    let mut messages: Vec<DirectMessagePayload> = rows.into_iter().map(|r| DirectMessagePayload {
+        id: r.id,
+        sender_id: r.sender_id,
+        sender_username: r.sender_username,
+        encrypted_content: r.encrypted_content,
+        created_at: r.created_at,
+    }).collect();
+
+    messages.reverse();
+    Ok(messages)
+}
+
+#[derive(sqlx::FromRow)]
+struct DmRow {
+    id: Uuid,
+    sender_id: Uuid,
+    sender_username: String,
+    encrypted_content: String,
+    created_at: DateTime<Utc>,
+}
+
+// ── Full-text search ──
+
+pub async fn search_messages(
+    pool: &DbPool,
+    server_id: Uuid,
+    channel_id: Option<Uuid>,
+    query: &str,
+    limit: u32,
+) -> Result<Vec<Message>, sqlx::Error> {
+    let rows = if let Some(ch_id) = channel_id {
+        sqlx::query_as::<_, MessageRow>(
+            "SELECT m.id, m.channel_id, m.author_id, m.content, m.edited_at, m.created_at, m.reply_to_id
+             FROM messages m
+             WHERE m.channel_id = $1
+               AND to_tsvector('english', m.content) @@ plainto_tsquery('english', $2)
+             ORDER BY ts_rank(to_tsvector('english', m.content), plainto_tsquery('english', $2)) DESC
+             LIMIT $3"
+        )
+        .bind(ch_id)
+        .bind(query)
+        .bind(limit as i64)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as::<_, MessageRow>(
+            "SELECT m.id, m.channel_id, m.author_id, m.content, m.edited_at, m.created_at, m.reply_to_id
+             FROM messages m
+             JOIN channels c ON c.id = m.channel_id
+             WHERE c.server_id = $1
+               AND to_tsvector('english', m.content) @@ plainto_tsquery('english', $2)
+             ORDER BY ts_rank(to_tsvector('english', m.content), plainto_tsquery('english', $2)) DESC
+             LIMIT $3"
+        )
+        .bind(server_id)
+        .bind(query)
+        .bind(limit as i64)
+        .fetch_all(pool)
+        .await?
+    };
+
+    let mut messages = Vec::new();
+    for row in rows {
+        let author = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT username, avatar_url FROM users WHERE id = $1"
+        )
+        .bind(row.author_id)
+        .fetch_one(pool)
+        .await?;
+
+        messages.push(Message {
+            id: row.id,
+            channel_id: row.channel_id,
+            author_id: row.author_id,
+            author_name: author.0,
+            author_avatar: author.1,
+            content: row.content,
+            attachments: vec![],
+            timestamp: row.created_at,
+            edited_at: row.edited_at,
+            reply_to_id: row.reply_to_id,
+            pinned: false,
+            reactions: vec![],
+        });
+    }
+    Ok(messages)
+}
+
+pub async fn search_messages_count(
+    pool: &DbPool,
+    server_id: Uuid,
+    channel_id: Option<Uuid>,
+    query: &str,
+) -> Result<u32, sqlx::Error> {
+    let row = if let Some(ch_id) = channel_id {
+        sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM messages m
+             WHERE m.channel_id = $1
+               AND to_tsvector('english', m.content) @@ plainto_tsquery('english', $2)"
+        )
+        .bind(ch_id)
+        .bind(query)
+        .fetch_one(pool)
+        .await?
+    } else {
+        sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM messages m
+             JOIN channels c ON c.id = m.channel_id
+             WHERE c.server_id = $1
+               AND to_tsvector('english', m.content) @@ plainto_tsquery('english', $2)"
+        )
+        .bind(server_id)
+        .bind(query)
+        .fetch_one(pool)
+        .await?
+    };
+    Ok(row.0 as u32)
+}
+
+// ── Custom emojis ──
+
+pub async fn add_custom_emoji(
+    pool: &DbPool,
+    server_id: Uuid,
+    name: &str,
+    image_url: &str,
+    uploaded_by: Uuid,
+) -> Result<CustomEmojiPayload, sqlx::Error> {
+    let row = sqlx::query_as::<_, (Uuid,)>(
+        "INSERT INTO custom_emojis (server_id, name, image_url, uploaded_by)
+         VALUES ($1, $2, $3, $4) RETURNING id"
+    )
+    .bind(server_id)
+    .bind(name)
+    .bind(image_url)
+    .bind(uploaded_by)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(CustomEmojiPayload {
+        id: row.0,
+        name: name.to_string(),
+        image_url: image_url.to_string(),
+        uploaded_by,
+    })
+}
+
+pub async fn remove_custom_emoji(pool: &DbPool, server_id: Uuid, emoji_id: Uuid) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "DELETE FROM custom_emojis WHERE id = $1 AND server_id = $2"
+    )
+    .bind(emoji_id)
+    .bind(server_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn get_custom_emojis(pool: &DbPool, server_id: Uuid) -> Result<Vec<CustomEmojiPayload>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, CustomEmojiRow>(
+        "SELECT id, name, image_url, uploaded_by FROM custom_emojis WHERE server_id = $1 ORDER BY name"
+    )
+    .bind(server_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(|r| CustomEmojiPayload {
+        id: r.id,
+        name: r.name,
+        image_url: r.image_url,
+        uploaded_by: r.uploaded_by,
+    }).collect())
+}
+
+#[derive(sqlx::FromRow)]
+struct CustomEmojiRow {
+    id: Uuid,
+    name: String,
+    image_url: String,
+    uploaded_by: Uuid,
+}
+
+// ── Mention tracking ──
+
+pub async fn increment_mention_count(pool: &DbPool, user_id: Uuid, channel_id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO channel_read_state (user_id, channel_id, last_read_message_id, last_read_at, mention_count)
+         VALUES ($1, $2, NULL, NOW(), 1)
+         ON CONFLICT (user_id, channel_id) DO UPDATE SET mention_count = channel_read_state.mention_count + 1"
+    )
+    .bind(user_id)
+    .bind(channel_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// ── Attachments ──
+
+#[allow(dead_code)]
+pub async fn add_attachment(
+    pool: &DbPool,
+    message_id: Uuid,
+    filename: &str,
+    url: &str,
+    content_type: &str,
+    size_bytes: i64,
+) -> Result<Uuid, sqlx::Error> {
+    let row = sqlx::query_as::<_, (Uuid,)>(
+        "INSERT INTO attachments (message_id, filename, url, content_type, size_bytes)
+         VALUES ($1, $2, $3, $4, $5) RETURNING id"
+    )
+    .bind(message_id)
+    .bind(filename)
+    .bind(url)
+    .bind(content_type)
+    .bind(size_bytes)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
+#[allow(dead_code)]
+pub async fn get_message_attachments(pool: &DbPool, message_id: Uuid) -> Result<Vec<artemis_core::models::message::Attachment>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, AttachmentRow>(
+        "SELECT id, filename, url, content_type, size_bytes FROM attachments WHERE message_id = $1 ORDER BY uploaded_at"
+    )
+    .bind(message_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(|r| artemis_core::models::message::Attachment {
+        id: r.id,
+        filename: r.filename,
+        url: r.url,
+        content_type: r.content_type,
+        size_bytes: r.size_bytes as u64,
+    }).collect())
+}
+
+#[derive(sqlx::FromRow)]
+#[allow(dead_code)]
+struct AttachmentRow {
+    id: Uuid,
+    filename: String,
+    url: String,
+    content_type: String,
+    size_bytes: i64,
+}
+
+/// Get user IDs for server members by username (for @mention resolution).
+pub async fn resolve_mentions(pool: &DbPool, server_id: Uuid, usernames: &[String]) -> Result<Vec<(String, Uuid)>, sqlx::Error> {
+    let mut results = Vec::new();
+    for username in usernames {
+        let row = sqlx::query_as::<_, (Uuid,)>(
+            "SELECT u.id FROM users u
+             JOIN server_members sm ON sm.user_id = u.id
+             WHERE sm.server_id = $1 AND u.username = $2"
+        )
+        .bind(server_id)
+        .bind(username)
+        .fetch_optional(pool)
+        .await?;
+        if let Some((uid,)) = row {
+            results.push((username.clone(), uid));
+        }
+    }
+    Ok(results)
 }
