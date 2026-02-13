@@ -79,6 +79,12 @@ struct Artemis {
     // Navigation: home (friends) vs server
     is_home: bool,
 
+    // Reply state
+    reply_to_id: Option<Uuid>,
+
+    // Search state
+    search_query: String,
+
     // Mode
     is_mock: bool,
 }
@@ -139,6 +145,8 @@ impl Artemis {
                 message_input: String::new(),
                 show_member_list: true,
                 is_home: true,
+                reply_to_id: None,
+                search_query: String::new(),
                 is_mock: false,
             },
             IcedTask::none(),
@@ -538,12 +546,13 @@ impl Artemis {
                         // DM mode: send E2E encrypted message through server relay
                         self.send_dm();
                     } else if let Some(channel_id) = self.active_channel_id {
+                        let reply_id = self.reply_to_id.take();
                         // Server channel mode
                         if let Some(tx) = &self.client_tx {
                             let _ = tx.send(ClientEvent::SendMessage {
                                 channel_id,
                                 content: self.message_input.clone(),
-                                reply_to_id: None,
+                                reply_to_id: reply_id,
                             });
                             self.message_input.clear();
                         } else {
@@ -558,7 +567,7 @@ impl Artemis {
                                 attachments: vec![],
                                 timestamp: chrono::Utc::now(),
                                 edited_at: None,
-                                reply_to_id: None,
+                                reply_to_id: reply_id,
                                 pinned: false,
                                 reactions: vec![],
                             };
@@ -581,6 +590,79 @@ impl Artemis {
                             channel_id,
                             before: oldest,
                             limit: 50,
+                        });
+                    }
+                }
+            }
+            AppMessage::ChatArea(ChatAreaMsg::ReplyTo(msg_id)) => {
+                self.reply_to_id = Some(msg_id);
+            }
+            AppMessage::ChatArea(ChatAreaMsg::CancelReply) => {
+                self.reply_to_id = None;
+            }
+            AppMessage::ChatArea(ChatAreaMsg::ToggleReaction(msg_id, emoji)) => {
+                if let Some(tx) = &self.client_tx {
+                    // Check if we already reacted with this emoji
+                    let already_reacted = self.messages.iter()
+                        .find(|m| m.id == msg_id)
+                        .map(|m| m.reactions.iter().any(|r| r.emoji == emoji && r.me))
+                        .unwrap_or(false);
+
+                    if already_reacted {
+                        let _ = tx.send(ClientEvent::RemoveReaction { message_id: msg_id, emoji });
+                    } else {
+                        let _ = tx.send(ClientEvent::AddReaction { message_id: msg_id, emoji });
+                    }
+                } else {
+                    // Offline/mock: toggle reaction locally
+                    if let Some(msg) = self.messages.iter_mut().find(|m| m.id == msg_id) {
+                        if let Some(rc) = msg.reactions.iter_mut().find(|r| r.emoji == emoji) {
+                            if rc.me {
+                                rc.count = rc.count.saturating_sub(1);
+                                rc.me = false;
+                                if rc.count == 0 {
+                                    msg.reactions.retain(|r| r.emoji != emoji);
+                                }
+                            } else {
+                                rc.count += 1;
+                                rc.me = true;
+                            }
+                        } else {
+                            msg.reactions.push(artemis_core::models::message::ReactionCount {
+                                emoji,
+                                count: 1,
+                                me: true,
+                            });
+                        }
+                    }
+                }
+            }
+            AppMessage::ChatArea(ChatAreaMsg::TogglePin(msg_id, is_pinned)) => {
+                if let Some(tx) = &self.client_tx {
+                    if is_pinned {
+                        let _ = tx.send(ClientEvent::UnpinMessage { message_id: msg_id });
+                    } else {
+                        let _ = tx.send(ClientEvent::PinMessage { message_id: msg_id });
+                    }
+                } else {
+                    // Offline/mock
+                    if let Some(msg) = self.messages.iter_mut().find(|m| m.id == msg_id) {
+                        msg.pinned = !msg.pinned;
+                    }
+                }
+            }
+            AppMessage::ChatArea(ChatAreaMsg::SearchInputChanged(val)) => {
+                self.search_query = val;
+            }
+            AppMessage::ChatArea(ChatAreaMsg::SubmitSearch) => {
+                if !self.search_query.trim().is_empty() {
+                    if let Some(tx) = &self.client_tx {
+                        let server_id = self.servers.get(self.active_server_idx).map(|s| s.id).unwrap_or(Uuid::nil());
+                        let _ = tx.send(ClientEvent::SearchMessages {
+                            server_id,
+                            channel_id: self.active_channel_id,
+                            query: self.search_query.clone(),
+                            limit: 25,
                         });
                     }
                 }
@@ -906,25 +988,187 @@ impl Artemis {
                 }
             }
 
-            // New Discord-like events (handled for future UI expansion)
-            ServerEvent::ReactionAdded { .. }
-            | ServerEvent::ReactionRemoved { .. }
-            | ServerEvent::MessagePinned { .. }
-            | ServerEvent::MessageUnpinned { .. }
-            | ServerEvent::PinnedMessages { .. }
-            | ServerEvent::UnreadState { .. }
-            | ServerEvent::ServerUpdated { .. }
-            | ServerEvent::ServerDeleted { .. }
-            | ServerEvent::ChannelCreated { .. }
-            | ServerEvent::ChannelDeleted { .. }
-            | ServerEvent::ChannelUpdated { .. }
-            | ServerEvent::CategoryCreated { .. }
-            | ServerEvent::InviteCode { .. }
-            | ServerEvent::ProfileUpdated { .. }
-            | ServerEvent::DirectMessageHistory { .. } => {
-                // Protocol events are defined and handled server-side.
-                // Client UI integration will follow.
-                tracing::debug!("Received event (not yet rendered in UI)");
+            // ── Reactions ──
+
+            ServerEvent::ReactionAdded { message_id, user_id: reactor_id, emoji } => {
+                if let Some(msg) = self.messages.iter_mut().find(|m| m.id == message_id) {
+                    let is_me = self.user_id.map(|uid| uid == reactor_id).unwrap_or(false);
+                    if let Some(rc) = msg.reactions.iter_mut().find(|r| r.emoji == emoji) {
+                        rc.count += 1;
+                        if is_me { rc.me = true; }
+                    } else {
+                        msg.reactions.push(artemis_core::models::message::ReactionCount {
+                            emoji,
+                            count: 1,
+                            me: is_me,
+                        });
+                    }
+                }
+            }
+
+            ServerEvent::ReactionRemoved { message_id, user_id: reactor_id, emoji } => {
+                if let Some(msg) = self.messages.iter_mut().find(|m| m.id == message_id) {
+                    let is_me = self.user_id.map(|uid| uid == reactor_id).unwrap_or(false);
+                    if let Some(rc) = msg.reactions.iter_mut().find(|r| r.emoji == emoji) {
+                        rc.count = rc.count.saturating_sub(1);
+                        if is_me { rc.me = false; }
+                    }
+                    msg.reactions.retain(|r| r.count > 0);
+                }
+            }
+
+            // ── Pins ──
+
+            ServerEvent::MessagePinned { message_id, .. } => {
+                if let Some(msg) = self.messages.iter_mut().find(|m| m.id == message_id) {
+                    msg.pinned = true;
+                }
+            }
+
+            ServerEvent::MessageUnpinned { message_id, .. } => {
+                if let Some(msg) = self.messages.iter_mut().find(|m| m.id == message_id) {
+                    msg.pinned = false;
+                }
+            }
+
+            ServerEvent::PinnedMessages { messages, .. } => {
+                // Mark pinned messages in local state
+                for pinned_msg in &messages {
+                    if let Some(msg) = self.messages.iter_mut().find(|m| m.id == pinned_msg.id) {
+                        msg.pinned = true;
+                    }
+                }
+            }
+
+            // ── Unread ──
+
+            ServerEvent::UnreadState { channels } => {
+                tracing::info!("Unread state received for {} channels", channels.len());
+                // Could be used for badge counts in the channel sidebar in the future
+            }
+
+            // ── Server / channel management ──
+
+            ServerEvent::ServerUpdated { server_id, name, icon_url } => {
+                if let Some(server) = self.servers.iter_mut().find(|s| s.id == server_id) {
+                    if let Some(n) = name { server.name = n; }
+                    if let Some(icon) = icon_url { server.icon_url = Some(icon); }
+                }
+            }
+
+            ServerEvent::ServerDeleted { server_id } => {
+                self.servers.retain(|s| s.id != server_id);
+                if self.servers.is_empty() {
+                    self.is_home = true;
+                }
+            }
+
+            ServerEvent::ChannelCreated { server_id, category_id, channel } => {
+                if let Some(server) = self.servers.iter_mut().find(|s| s.id == server_id) {
+                    if let Some(cat) = server.categories.iter_mut().find(|c| c.id == category_id) {
+                        cat.channels.push(channel);
+                    }
+                }
+            }
+
+            ServerEvent::ChannelDeleted { server_id, channel_id } => {
+                if let Some(server) = self.servers.iter_mut().find(|s| s.id == server_id) {
+                    for cat in &mut server.categories {
+                        cat.channels.retain(|ch| ch.id != channel_id);
+                    }
+                }
+                if self.active_channel_id == Some(channel_id) {
+                    self.active_channel_id = None;
+                }
+            }
+
+            ServerEvent::ChannelUpdated { channel_id, name, topic } => {
+                for server in &mut self.servers {
+                    for cat in &mut server.categories {
+                        if let Some(ch) = cat.channels.iter_mut().find(|c| c.id == channel_id) {
+                            if let Some(n) = name.clone() { ch.name = n; }
+                            if let Some(t) = topic.clone() { ch.topic = Some(t); }
+                        }
+                    }
+                }
+            }
+
+            ServerEvent::CategoryCreated { server_id, category } => {
+                if let Some(server) = self.servers.iter_mut().find(|s| s.id == server_id) {
+                    server.categories.push(category);
+                }
+            }
+
+            ServerEvent::InviteCode { server_id, invite_code } => {
+                tracing::info!("Invite code for server {}: {}", server_id, invite_code);
+            }
+
+            ServerEvent::ProfileUpdated { user_id: uid, display_name, custom_status } => {
+                if let Some(member) = self.members.iter_mut().find(|m| m.user.id == uid) {
+                    if let Some(dn) = display_name { member.user.display_name = Some(dn); }
+                    if let Some(cs) = custom_status { member.user.custom_status = Some(cs); }
+                }
+            }
+
+            ServerEvent::DirectMessageHistory { friend_id, messages, .. } => {
+                let dm_channel_id = self.dm_channel_id(friend_id);
+                for dm in messages {
+                    let msg_id = dm.id;
+                    if !self.messages.iter().any(|m| m.id == msg_id) {
+                        // Attempt decrypt
+                        let content = if let Some(identity) = &self.identity {
+                            let sender_pk = self.friends.iter()
+                                .find(|f| f.user_id == dm.sender_id)
+                                .and_then(|f| f.public_key.as_ref());
+                            if let Some(pk) = sender_pk {
+                                match identity.decrypt_from_b64(pk, &dm.encrypted_content) {
+                                    Ok(pt) => String::from_utf8(pt).unwrap_or(dm.encrypted_content.clone()),
+                                    Err(_) => dm.encrypted_content.clone(),
+                                }
+                            } else {
+                                dm.encrypted_content.clone()
+                            }
+                        } else {
+                            dm.encrypted_content.clone()
+                        };
+
+                        self.messages.push(Message {
+                            id: dm.id,
+                            channel_id: dm_channel_id,
+                            author_id: dm.sender_id,
+                            author_name: dm.sender_username,
+                            author_avatar: None,
+                            content,
+                            attachments: vec![],
+                            timestamp: dm.created_at,
+                            edited_at: None,
+                            reply_to_id: None,
+                            pinned: false,
+                            reactions: vec![],
+                        });
+                    }
+                }
+                self.messages.sort_by_key(|m| m.timestamp);
+            }
+
+            // ── Search results ──
+
+            ServerEvent::SearchResults { messages, .. } => {
+                // Replace current view with search results (add them to messages list)
+                for msg in messages {
+                    if !self.messages.iter().any(|m| m.id == msg.id) {
+                        self.messages.push(msg);
+                    }
+                }
+                self.messages.sort_by_key(|m| m.timestamp);
+            }
+
+            // ── Custom emojis ──
+
+            ServerEvent::CustomEmojiAdded { .. }
+            | ServerEvent::CustomEmojiRemoved { .. }
+            | ServerEvent::CustomEmojiList { .. } => {
+                tracing::debug!("Custom emoji event received");
             }
         }
     }
@@ -966,11 +1210,14 @@ impl Artemis {
                         Some(self.dm_channel_id(friend.user_id))
                     });
 
+                    let reply_msg = self.reply_to_id.and_then(|rid| self.messages.iter().find(|m| m.id == rid));
                     let chat_view = chat_area::view_with_payload(
                         None,
                         &self.messages,
                         &self.message_input,
                         dm_channel,
+                        reply_msg,
+                        &self.search_query,
                     )
                     .map(AppMessage::ChatArea);
 
@@ -988,11 +1235,14 @@ impl Artemis {
                             .find(|ch| Some(ch.id) == self.active_channel_id)
                     });
 
+                    let reply_msg = self.reply_to_id.and_then(|rid| self.messages.iter().find(|m| m.id == rid));
                     let chat_view = chat_area::view_with_payload(
                         active_channel_payload,
                         &self.messages,
                         &self.message_input,
                         self.active_channel_id,
+                        reply_msg,
+                        &self.search_query,
                     )
                     .map(AppMessage::ChatArea);
 

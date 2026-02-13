@@ -22,6 +22,8 @@ pub async fn run_migrations(pool: &DbPool) -> Result<(), sqlx::Error> {
     sqlx::raw_sql(migration2).execute(pool).await?;
     let migration3 = include_str!("../../migrations/003_reactions_replies_pins_unread.sql");
     sqlx::raw_sql(migration3).execute(pool).await?;
+    let migration4 = include_str!("../../migrations/004_attachments_search_emojis.sql");
+    sqlx::raw_sql(migration4).execute(pool).await?;
     tracing::info!("Database migrations applied");
     Ok(())
 }
@@ -992,4 +994,253 @@ struct DmRow {
     sender_username: String,
     encrypted_content: String,
     created_at: DateTime<Utc>,
+}
+
+// ── Full-text search ──
+
+pub async fn search_messages(
+    pool: &DbPool,
+    server_id: Uuid,
+    channel_id: Option<Uuid>,
+    query: &str,
+    limit: u32,
+) -> Result<Vec<Message>, sqlx::Error> {
+    let rows = if let Some(ch_id) = channel_id {
+        sqlx::query_as::<_, MessageRow>(
+            "SELECT m.id, m.channel_id, m.author_id, m.content, m.edited_at, m.created_at, m.reply_to_id
+             FROM messages m
+             WHERE m.channel_id = $1
+               AND to_tsvector('english', m.content) @@ plainto_tsquery('english', $2)
+             ORDER BY ts_rank(to_tsvector('english', m.content), plainto_tsquery('english', $2)) DESC
+             LIMIT $3"
+        )
+        .bind(ch_id)
+        .bind(query)
+        .bind(limit as i64)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as::<_, MessageRow>(
+            "SELECT m.id, m.channel_id, m.author_id, m.content, m.edited_at, m.created_at, m.reply_to_id
+             FROM messages m
+             JOIN channels c ON c.id = m.channel_id
+             WHERE c.server_id = $1
+               AND to_tsvector('english', m.content) @@ plainto_tsquery('english', $2)
+             ORDER BY ts_rank(to_tsvector('english', m.content), plainto_tsquery('english', $2)) DESC
+             LIMIT $3"
+        )
+        .bind(server_id)
+        .bind(query)
+        .bind(limit as i64)
+        .fetch_all(pool)
+        .await?
+    };
+
+    let mut messages = Vec::new();
+    for row in rows {
+        let author = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT username, avatar_url FROM users WHERE id = $1"
+        )
+        .bind(row.author_id)
+        .fetch_one(pool)
+        .await?;
+
+        messages.push(Message {
+            id: row.id,
+            channel_id: row.channel_id,
+            author_id: row.author_id,
+            author_name: author.0,
+            author_avatar: author.1,
+            content: row.content,
+            attachments: vec![],
+            timestamp: row.created_at,
+            edited_at: row.edited_at,
+            reply_to_id: row.reply_to_id,
+            pinned: false,
+            reactions: vec![],
+        });
+    }
+    Ok(messages)
+}
+
+pub async fn search_messages_count(
+    pool: &DbPool,
+    server_id: Uuid,
+    channel_id: Option<Uuid>,
+    query: &str,
+) -> Result<u32, sqlx::Error> {
+    let row = if let Some(ch_id) = channel_id {
+        sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM messages m
+             WHERE m.channel_id = $1
+               AND to_tsvector('english', m.content) @@ plainto_tsquery('english', $2)"
+        )
+        .bind(ch_id)
+        .bind(query)
+        .fetch_one(pool)
+        .await?
+    } else {
+        sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM messages m
+             JOIN channels c ON c.id = m.channel_id
+             WHERE c.server_id = $1
+               AND to_tsvector('english', m.content) @@ plainto_tsquery('english', $2)"
+        )
+        .bind(server_id)
+        .bind(query)
+        .fetch_one(pool)
+        .await?
+    };
+    Ok(row.0 as u32)
+}
+
+// ── Custom emojis ──
+
+pub async fn add_custom_emoji(
+    pool: &DbPool,
+    server_id: Uuid,
+    name: &str,
+    image_url: &str,
+    uploaded_by: Uuid,
+) -> Result<CustomEmojiPayload, sqlx::Error> {
+    let row = sqlx::query_as::<_, (Uuid,)>(
+        "INSERT INTO custom_emojis (server_id, name, image_url, uploaded_by)
+         VALUES ($1, $2, $3, $4) RETURNING id"
+    )
+    .bind(server_id)
+    .bind(name)
+    .bind(image_url)
+    .bind(uploaded_by)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(CustomEmojiPayload {
+        id: row.0,
+        name: name.to_string(),
+        image_url: image_url.to_string(),
+        uploaded_by,
+    })
+}
+
+pub async fn remove_custom_emoji(pool: &DbPool, server_id: Uuid, emoji_id: Uuid) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "DELETE FROM custom_emojis WHERE id = $1 AND server_id = $2"
+    )
+    .bind(emoji_id)
+    .bind(server_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn get_custom_emojis(pool: &DbPool, server_id: Uuid) -> Result<Vec<CustomEmojiPayload>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, CustomEmojiRow>(
+        "SELECT id, name, image_url, uploaded_by FROM custom_emojis WHERE server_id = $1 ORDER BY name"
+    )
+    .bind(server_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(|r| CustomEmojiPayload {
+        id: r.id,
+        name: r.name,
+        image_url: r.image_url,
+        uploaded_by: r.uploaded_by,
+    }).collect())
+}
+
+#[derive(sqlx::FromRow)]
+struct CustomEmojiRow {
+    id: Uuid,
+    name: String,
+    image_url: String,
+    uploaded_by: Uuid,
+}
+
+// ── Mention tracking ──
+
+pub async fn increment_mention_count(pool: &DbPool, user_id: Uuid, channel_id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO channel_read_state (user_id, channel_id, last_read_message_id, last_read_at, mention_count)
+         VALUES ($1, $2, NULL, NOW(), 1)
+         ON CONFLICT (user_id, channel_id) DO UPDATE SET mention_count = channel_read_state.mention_count + 1"
+    )
+    .bind(user_id)
+    .bind(channel_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// ── Attachments ──
+
+#[allow(dead_code)]
+pub async fn add_attachment(
+    pool: &DbPool,
+    message_id: Uuid,
+    filename: &str,
+    url: &str,
+    content_type: &str,
+    size_bytes: i64,
+) -> Result<Uuid, sqlx::Error> {
+    let row = sqlx::query_as::<_, (Uuid,)>(
+        "INSERT INTO attachments (message_id, filename, url, content_type, size_bytes)
+         VALUES ($1, $2, $3, $4, $5) RETURNING id"
+    )
+    .bind(message_id)
+    .bind(filename)
+    .bind(url)
+    .bind(content_type)
+    .bind(size_bytes)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
+#[allow(dead_code)]
+pub async fn get_message_attachments(pool: &DbPool, message_id: Uuid) -> Result<Vec<artemis_core::models::message::Attachment>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, AttachmentRow>(
+        "SELECT id, filename, url, content_type, size_bytes FROM attachments WHERE message_id = $1 ORDER BY uploaded_at"
+    )
+    .bind(message_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(|r| artemis_core::models::message::Attachment {
+        id: r.id,
+        filename: r.filename,
+        url: r.url,
+        content_type: r.content_type,
+        size_bytes: r.size_bytes as u64,
+    }).collect())
+}
+
+#[derive(sqlx::FromRow)]
+#[allow(dead_code)]
+struct AttachmentRow {
+    id: Uuid,
+    filename: String,
+    url: String,
+    content_type: String,
+    size_bytes: i64,
+}
+
+/// Get user IDs for server members by username (for @mention resolution).
+pub async fn resolve_mentions(pool: &DbPool, server_id: Uuid, usernames: &[String]) -> Result<Vec<(String, Uuid)>, sqlx::Error> {
+    let mut results = Vec::new();
+    for username in usernames {
+        let row = sqlx::query_as::<_, (Uuid,)>(
+            "SELECT u.id FROM users u
+             JOIN server_members sm ON sm.user_id = u.id
+             WHERE sm.server_id = $1 AND u.username = $2"
+        )
+        .bind(server_id)
+        .bind(username)
+        .fetch_optional(pool)
+        .await?;
+        if let Some((uid,)) = row {
+            results.push((username.clone(), uid));
+        }
+    }
+    Ok(results)
 }

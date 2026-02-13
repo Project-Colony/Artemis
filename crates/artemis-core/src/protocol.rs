@@ -162,6 +162,36 @@ pub enum ClientEvent {
 
     /// Fetch pending incoming friend requests.
     FetchFriendRequests,
+
+    // ── Search ──
+
+    /// Search messages in a channel (or server-wide if channel_id is None).
+    SearchMessages {
+        server_id: Uuid,
+        channel_id: Option<Uuid>,
+        query: String,
+        limit: u32,
+    },
+
+    // ── Custom emojis ──
+
+    /// Add a custom emoji to a server.
+    AddCustomEmoji {
+        server_id: Uuid,
+        name: String,
+        image_url: String,
+    },
+
+    /// Remove a custom emoji from a server.
+    RemoveCustomEmoji {
+        server_id: Uuid,
+        emoji_id: Uuid,
+    },
+
+    /// Fetch all custom emojis for a server.
+    FetchCustomEmojis {
+        server_id: Uuid,
+    },
 }
 
 /// Events sent FROM server TO client.
@@ -378,6 +408,35 @@ pub enum ServerEvent {
         user_id: Uuid,
         status: UserStatus,
     },
+
+    // ── Search ──
+
+    /// Search results for a query.
+    SearchResults {
+        query: String,
+        messages: Vec<Message>,
+        total_count: u32,
+    },
+
+    // ── Custom emojis ──
+
+    /// A custom emoji was added to a server.
+    CustomEmojiAdded {
+        server_id: Uuid,
+        emoji: CustomEmojiPayload,
+    },
+
+    /// A custom emoji was removed from a server.
+    CustomEmojiRemoved {
+        server_id: Uuid,
+        emoji_id: Uuid,
+    },
+
+    /// Custom emojis list for a server.
+    CustomEmojiList {
+        server_id: Uuid,
+        emojis: Vec<CustomEmojiPayload>,
+    },
 }
 
 /// Compact server info sent on auth.
@@ -442,6 +501,15 @@ pub struct ChannelUnreadPayload {
     pub last_read_message_id: Option<Uuid>,
     pub mention_count: u32,
     pub unread_count: u32,
+}
+
+/// A custom emoji on a server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomEmojiPayload {
+    pub id: Uuid,
+    pub name: String,
+    pub image_url: String,
+    pub uploaded_by: Uuid,
 }
 
 /// A direct message in history.
@@ -547,5 +615,108 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn search_event_roundtrip() {
+        let event = ClientEvent::SearchMessages {
+            server_id: Uuid::nil(),
+            channel_id: Some(Uuid::nil()),
+            query: "test query".to_string(),
+            limit: 25,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: ClientEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ClientEvent::SearchMessages { query, limit, .. } => {
+                assert_eq!(query, "test query");
+                assert_eq!(limit, 25);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn custom_emoji_payload_roundtrip() {
+        let payload = CustomEmojiPayload {
+            id: Uuid::nil(),
+            name: "rust".to_string(),
+            image_url: "https://example.com/rust.png".to_string(),
+            uploaded_by: Uuid::nil(),
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let parsed: CustomEmojiPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.name, "rust");
+        assert_eq!(parsed.image_url, "https://example.com/rust.png");
+    }
+
+    #[test]
+    fn search_results_event_roundtrip() {
+        let event = ServerEvent::SearchResults {
+            query: "hello".to_string(),
+            messages: vec![],
+            total_count: 0,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: ServerEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ServerEvent::SearchResults { query, total_count, messages } => {
+                assert_eq!(query, "hello");
+                assert_eq!(total_count, 0);
+                assert!(messages.is_empty());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn custom_emoji_event_roundtrip() {
+        let emoji = CustomEmojiPayload {
+            id: Uuid::nil(),
+            name: "party".to_string(),
+            image_url: "https://cdn.example.com/party.gif".to_string(),
+            uploaded_by: Uuid::nil(),
+        };
+        let event = ServerEvent::CustomEmojiAdded {
+            server_id: Uuid::nil(),
+            emoji,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: ServerEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ServerEvent::CustomEmojiAdded { emoji, .. } => {
+                assert_eq!(emoji.name, "party");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn channel_unread_payload_serialization() {
+        let payload = ChannelUnreadPayload {
+            channel_id: Uuid::nil(),
+            last_read_message_id: None,
+            mention_count: 3,
+            unread_count: 10,
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let parsed: ChannelUnreadPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.mention_count, 3);
+        assert_eq!(parsed.unread_count, 10);
+    }
+
+    #[test]
+    fn dm_payload_serialization() {
+        let payload = DirectMessagePayload {
+            id: Uuid::nil(),
+            sender_id: Uuid::nil(),
+            sender_username: "alice".to_string(),
+            encrypted_content: "encrypted-data".to_string(),
+            created_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let parsed: DirectMessagePayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.sender_username, "alice");
+        assert_eq!(parsed.encrypted_content, "encrypted-data");
     }
 }

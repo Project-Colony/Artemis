@@ -115,8 +115,28 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             continue;
                         };
 
+                        // Parse @mentions before sending
+                        let mentioned_usernames: Vec<String> = content
+                            .split_whitespace()
+                            .filter(|w| w.starts_with('@') && w.len() > 1)
+                            .map(|w| w[1..].trim_end_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_').to_string())
+                            .collect();
+
                         match db::create_message(&state.db, channel_id, uid, &content, reply_to_id).await {
                             Ok(message) => {
+                                // Track @mentions for unread state
+                                if !mentioned_usernames.is_empty() {
+                                    if let Ok(Some(server_id)) = db::get_channel_server(&state.db, channel_id).await {
+                                        if let Ok(resolved) = db::resolve_mentions(&state.db, server_id, &mentioned_usernames).await {
+                                            for (_uname, mentioned_uid) in resolved {
+                                                if mentioned_uid != uid {
+                                                    let _ = db::increment_mention_count(&state.db, mentioned_uid, channel_id).await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
                                 broadcast_event(&state, &ServerEvent::MessageReceived {
                                     message,
                                 }, None).await;
@@ -479,6 +499,80 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 }).await;
                             }
                             Err(e) => tracing::error!("Failed to fetch DM history: {}", e),
+                        }
+                    }
+
+                    // ── Search ──
+
+                    ClientEvent::SearchMessages { server_id, channel_id, query, limit } => {
+                        let Some(_uid) = user_id else { continue };
+
+                        let limit = limit.min(50);
+                        match db::search_messages(&state.db, server_id, channel_id, &query, limit).await {
+                            Ok(messages) => {
+                                let total_count = db::search_messages_count(&state.db, server_id, channel_id, &query).await.unwrap_or(0);
+                                let _ = send_event(&sender, &ServerEvent::SearchResults {
+                                    query,
+                                    messages,
+                                    total_count,
+                                }).await;
+                            }
+                            Err(e) => tracing::error!("Search failed: {}", e),
+                        }
+                    }
+
+                    // ── Custom emojis ──
+
+                    ClientEvent::AddCustomEmoji { server_id, name, image_url } => {
+                        let Some(uid) = user_id else { continue };
+
+                        if !has_mod_perms(&state.db, uid, server_id).await {
+                            let _ = send_event(&sender, &ServerEvent::Error {
+                                message: "Insufficient permissions".to_string(),
+                            }).await;
+                            continue;
+                        }
+
+                        match db::add_custom_emoji(&state.db, server_id, &name, &image_url, uid).await {
+                            Ok(emoji) => {
+                                broadcast_event(&state, &ServerEvent::CustomEmojiAdded {
+                                    server_id,
+                                    emoji,
+                                }, None).await;
+                            }
+                            Err(e) => tracing::error!("Failed to add custom emoji: {}", e),
+                        }
+                    }
+
+                    ClientEvent::RemoveCustomEmoji { server_id, emoji_id } => {
+                        let Some(uid) = user_id else { continue };
+
+                        if !has_mod_perms(&state.db, uid, server_id).await {
+                            let _ = send_event(&sender, &ServerEvent::Error {
+                                message: "Insufficient permissions".to_string(),
+                            }).await;
+                            continue;
+                        }
+
+                        if let Ok(true) = db::remove_custom_emoji(&state.db, server_id, emoji_id).await {
+                            broadcast_event(&state, &ServerEvent::CustomEmojiRemoved {
+                                server_id,
+                                emoji_id,
+                            }, None).await;
+                        }
+                    }
+
+                    ClientEvent::FetchCustomEmojis { server_id } => {
+                        let Some(_uid) = user_id else { continue };
+
+                        match db::get_custom_emojis(&state.db, server_id).await {
+                            Ok(emojis) => {
+                                let _ = send_event(&sender, &ServerEvent::CustomEmojiList {
+                                    server_id,
+                                    emojis,
+                                }).await;
+                            }
+                            Err(e) => tracing::error!("Failed to fetch custom emojis: {}", e),
                         }
                     }
 
