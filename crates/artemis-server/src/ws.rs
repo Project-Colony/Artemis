@@ -29,6 +29,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let sender = Arc::new(Mutex::new(sender));
 
     let mut user_id: Option<Uuid> = None;
+    let mut username_cache: Option<String> = None;
     let conn_id = Uuid::new_v4();
 
     while let Some(Ok(msg)) = receiver.next().await {
@@ -49,6 +50,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         match db::find_user_by_token(&state.db, &token).await {
                             Ok(Some(user)) => {
                                 user_id = Some(user.id);
+                                username_cache = Some(user.username.clone());
 
                                 // Register connection
                                 state.connections.write().await.insert(conn_id, ConnectedUser {
@@ -73,6 +75,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     username: user.username.clone(),
                                     servers,
                                 }).await;
+
+                                // Send unread state
+                                if let Ok(channels) = db::get_unread_state(&state.db, user.id).await {
+                                    let _ = send_event(&sender, &ServerEvent::UnreadState { channels }).await;
+                                }
 
                                 // Notify friends that we're online
                                 if let Ok(friends) = db::get_friends(&state.db, user.id).await {
@@ -100,7 +107,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         }
                     }
 
-                    ClientEvent::SendMessage { channel_id, content } => {
+                    ClientEvent::SendMessage { channel_id, content, reply_to_id } => {
                         let Some(uid) = user_id else {
                             let _ = send_event(&sender, &ServerEvent::Error {
                                 message: "Not authenticated".to_string(),
@@ -108,7 +115,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             continue;
                         };
 
-                        match db::create_message(&state.db, channel_id, uid, &content).await {
+                        match db::create_message(&state.db, channel_id, uid, &content, reply_to_id).await {
                             Ok(message) => {
                                 broadcast_event(&state, &ServerEvent::MessageReceived {
                                     message,
@@ -166,17 +173,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                     ClientEvent::StartTyping { channel_id } => {
                         if let Some(uid) = user_id {
-                            let username = {
-                                let conns = state.connections.read().await;
-                                conns.get(&conn_id).map(|_| "User".to_string())
-                            };
-                            if let Some(username) = username {
-                                broadcast_event(&state, &ServerEvent::UserTyping {
-                                    channel_id,
-                                    user_id: uid,
-                                    username,
-                                }, Some(uid)).await;
-                            }
+                            let uname = username_cache.clone().unwrap_or_else(|| "User".to_string());
+                            broadcast_event(&state, &ServerEvent::UserTyping {
+                                channel_id,
+                                user_id: uid,
+                                username: uname,
+                            }, Some(uid)).await;
                         }
                     }
 
@@ -193,6 +195,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 user_id: uid,
                                 status,
                             }, None).await;
+
+                            // Notify friends
+                            if let Ok(friends) = db::get_friends(&state.db, uid).await {
+                                for friend in &friends {
+                                    send_to_user(&state, friend.user_id, &ServerEvent::FriendPresenceUpdate {
+                                        user_id: uid,
+                                        status,
+                                    }).await;
+                                }
+                            }
                         }
                     }
 
@@ -204,22 +216,269 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             let servers = db::get_user_servers(&state.db, uid).await.unwrap_or_default();
                             let _ = send_event(&sender, &ServerEvent::Authenticated {
                                 user_id: uid,
-                                username: String::new(),
+                                username: username_cache.clone().unwrap_or_default(),
                                 servers,
                             }).await;
                         }
                     }
 
                     ClientEvent::CreateChannel { server_id, name, category_id } => {
-                        let Some(_uid) = user_id else { continue };
+                        let Some(uid) = user_id else { continue };
+
+                        // Permission check: founder or moderator
+                        if !has_mod_perms(&state.db, uid, server_id).await {
+                            let _ = send_event(&sender, &ServerEvent::Error {
+                                message: "Insufficient permissions".to_string(),
+                            }).await;
+                            continue;
+                        }
 
                         match db::create_channel(&state.db, server_id, category_id, &name).await {
-                            Ok(_channel) => {
-                                // Client will refresh channel list
+                            Ok(channel) => {
+                                let cat_id = category_id.unwrap_or(Uuid::nil());
+                                broadcast_event(&state, &ServerEvent::ChannelCreated {
+                                    server_id,
+                                    category_id: cat_id,
+                                    channel,
+                                }, None).await;
                             }
                             Err(e) => {
                                 tracing::error!("Failed to create channel: {}", e);
                             }
+                        }
+                    }
+
+                    // ── Reactions ──
+
+                    ClientEvent::AddReaction { message_id, emoji } => {
+                        let Some(uid) = user_id else { continue };
+
+                        if let Ok(true) = db::add_reaction(&state.db, message_id, uid, &emoji).await {
+                            broadcast_event(&state, &ServerEvent::ReactionAdded {
+                                message_id,
+                                user_id: uid,
+                                emoji,
+                            }, None).await;
+                        }
+                    }
+
+                    ClientEvent::RemoveReaction { message_id, emoji } => {
+                        let Some(uid) = user_id else { continue };
+
+                        if let Ok(true) = db::remove_reaction(&state.db, message_id, uid, &emoji).await {
+                            broadcast_event(&state, &ServerEvent::ReactionRemoved {
+                                message_id,
+                                user_id: uid,
+                                emoji,
+                            }, None).await;
+                        }
+                    }
+
+                    // ── Pins ──
+
+                    ClientEvent::PinMessage { message_id } => {
+                        let Some(uid) = user_id else { continue };
+
+                        if let Ok(Some(channel_id)) = db::get_message_channel(&state.db, message_id).await {
+                            if let Ok(true) = db::pin_message(&state.db, channel_id, message_id, uid).await {
+                                broadcast_event(&state, &ServerEvent::MessagePinned {
+                                    channel_id,
+                                    message_id,
+                                    pinned_by: uid,
+                                }, None).await;
+                            }
+                        }
+                    }
+
+                    ClientEvent::UnpinMessage { message_id } => {
+                        let Some(_uid) = user_id else { continue };
+
+                        if let Ok(Some(channel_id)) = db::get_message_channel(&state.db, message_id).await {
+                            if let Ok(true) = db::unpin_message(&state.db, channel_id, message_id).await {
+                                broadcast_event(&state, &ServerEvent::MessageUnpinned {
+                                    channel_id,
+                                    message_id,
+                                }, None).await;
+                            }
+                        }
+                    }
+
+                    ClientEvent::FetchPinnedMessages { channel_id } => {
+                        let Some(_uid) = user_id else { continue };
+
+                        match db::get_pinned_messages(&state.db, channel_id).await {
+                            Ok(messages) => {
+                                let _ = send_event(&sender, &ServerEvent::PinnedMessages {
+                                    channel_id,
+                                    messages,
+                                }).await;
+                            }
+                            Err(e) => tracing::error!("Failed to fetch pinned messages: {}", e),
+                        }
+                    }
+
+                    // ── Unread tracking ──
+
+                    ClientEvent::AckMessage { channel_id, message_id } => {
+                        let Some(uid) = user_id else { continue };
+                        let _ = db::ack_message(&state.db, uid, channel_id, message_id).await;
+                    }
+
+                    // ── Server / channel management ──
+
+                    ClientEvent::EditServer { server_id, name, icon_url } => {
+                        let Some(uid) = user_id else { continue };
+
+                        if !has_mod_perms(&state.db, uid, server_id).await {
+                            let _ = send_event(&sender, &ServerEvent::Error {
+                                message: "Insufficient permissions".to_string(),
+                            }).await;
+                            continue;
+                        }
+
+                        let _ = db::edit_server(&state.db, server_id, name.as_deref(), icon_url.as_deref()).await;
+                        broadcast_event(&state, &ServerEvent::ServerUpdated {
+                            server_id,
+                            name,
+                            icon_url,
+                        }, None).await;
+                    }
+
+                    ClientEvent::DeleteServer { server_id } => {
+                        let Some(uid) = user_id else { continue };
+
+                        // Founder only
+                        if db::get_server_owner(&state.db, server_id).await.ok().flatten() != Some(uid) {
+                            let _ = send_event(&sender, &ServerEvent::Error {
+                                message: "Only the server founder can delete a server".to_string(),
+                            }).await;
+                            continue;
+                        }
+
+                        let _ = db::delete_server(&state.db, server_id).await;
+                        broadcast_event(&state, &ServerEvent::ServerDeleted { server_id }, None).await;
+                    }
+
+                    ClientEvent::CreateCategory { server_id, name } => {
+                        let Some(uid) = user_id else { continue };
+
+                        if !has_mod_perms(&state.db, uid, server_id).await {
+                            let _ = send_event(&sender, &ServerEvent::Error {
+                                message: "Insufficient permissions".to_string(),
+                            }).await;
+                            continue;
+                        }
+
+                        match db::create_category(&state.db, server_id, &name).await {
+                            Ok(category) => {
+                                broadcast_event(&state, &ServerEvent::CategoryCreated {
+                                    server_id,
+                                    category,
+                                }, None).await;
+                            }
+                            Err(e) => tracing::error!("Failed to create category: {}", e),
+                        }
+                    }
+
+                    ClientEvent::DeleteChannel { channel_id } => {
+                        let Some(uid) = user_id else { continue };
+
+                        if let Ok(Some(server_id)) = db::get_channel_server(&state.db, channel_id).await {
+                            if !has_mod_perms(&state.db, uid, server_id).await {
+                                let _ = send_event(&sender, &ServerEvent::Error {
+                                    message: "Insufficient permissions".to_string(),
+                                }).await;
+                                continue;
+                            }
+
+                            if let Ok(Some(_)) = db::delete_channel(&state.db, channel_id).await {
+                                broadcast_event(&state, &ServerEvent::ChannelDeleted {
+                                    server_id,
+                                    channel_id,
+                                }, None).await;
+                            }
+                        }
+                    }
+
+                    ClientEvent::EditChannel { channel_id, name, topic } => {
+                        let Some(uid) = user_id else { continue };
+
+                        if let Ok(Some(server_id)) = db::get_channel_server(&state.db, channel_id).await {
+                            if !has_mod_perms(&state.db, uid, server_id).await {
+                                let _ = send_event(&sender, &ServerEvent::Error {
+                                    message: "Insufficient permissions".to_string(),
+                                }).await;
+                                continue;
+                            }
+
+                            let _ = db::edit_channel(&state.db, channel_id, name.as_deref(), topic.as_deref()).await;
+                            broadcast_event(&state, &ServerEvent::ChannelUpdated {
+                                channel_id,
+                                name,
+                                topic,
+                            }, None).await;
+                        }
+                    }
+
+                    ClientEvent::LeaveServer { server_id } => {
+                        let Some(uid) = user_id else { continue };
+
+                        // Check not founder
+                        if db::get_server_owner(&state.db, server_id).await.ok().flatten() == Some(uid) {
+                            let _ = send_event(&sender, &ServerEvent::Error {
+                                message: "Server founder cannot leave. Transfer ownership or delete the server.".to_string(),
+                            }).await;
+                            continue;
+                        }
+
+                        if let Ok(true) = db::leave_server(&state.db, uid, server_id).await {
+                            broadcast_event(&state, &ServerEvent::MemberLeft {
+                                server_id,
+                                user_id: uid,
+                            }, None).await;
+                        }
+                    }
+
+                    ClientEvent::GetInviteCode { server_id } => {
+                        let Some(_uid) = user_id else { continue };
+
+                        if let Ok(Some(invite_code)) = db::get_invite_code(&state.db, server_id).await {
+                            let _ = send_event(&sender, &ServerEvent::InviteCode {
+                                server_id,
+                                invite_code,
+                            }).await;
+                        }
+                    }
+
+                    // ── User profile ──
+
+                    ClientEvent::UpdateProfile { display_name, custom_status } => {
+                        let Some(uid) = user_id else { continue };
+
+                        let _ = db::update_profile(&state.db, uid, display_name.as_deref(), custom_status.as_deref()).await;
+                        broadcast_event(&state, &ServerEvent::ProfileUpdated {
+                            user_id: uid,
+                            display_name,
+                            custom_status,
+                        }, None).await;
+                    }
+
+                    // ── DM history ──
+
+                    ClientEvent::FetchDirectMessages { friend_id, before, limit } => {
+                        let Some(uid) = user_id else { continue };
+
+                        let limit = limit.min(100);
+                        match db::get_direct_messages(&state.db, uid, friend_id, before, limit).await {
+                            Ok(messages) => {
+                                let has_more = messages.len() == limit as usize;
+                                let _ = send_event(&sender, &ServerEvent::DirectMessageHistory {
+                                    friend_id,
+                                    messages,
+                                    has_more,
+                                }).await;
+                            }
+                            Err(e) => tracing::error!("Failed to fetch DM history: {}", e),
                         }
                     }
 
@@ -272,25 +531,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             continue;
                         }
 
-                        // Look up sender info to notify target
-                        let sender_user = db::find_user_by_token(&state.db, "").await; // need username
-                        let sender_username = {
-                            // Find username from connections or DB
-                            let mut name = String::new();
-                            if let Ok(Some(u)) = db::find_user_by_github_id(&state.db, 0).await {
-                                name = u.username;
-                            }
-                            // Actually we need the sender's info properly
-                            name
-                        };
-                        let _ = sender_user; // suppress warning
-
-                        // Get sender info from DB
+                        // Get sender info from DB and notify recipient
                         if let Ok(Some(from_user)) = sqlx::query_as::<_, db::UserRow>(
                             "SELECT id, username, display_name, avatar_url, github_id, status, custom_status, auth_token, public_key, created_at FROM users WHERE id = $1"
                         ).bind(uid).fetch_optional(&state.db).await {
-                            // Notify recipient if online
-                            let _ = sender_username;
                             send_to_user(&state, target.id, &ServerEvent::FriendRequestReceived {
                                 from_user_id: uid,
                                 from_username: from_user.username,
@@ -399,11 +643,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         match db::store_direct_message(&state.db, uid, recipient_id, &encrypted_content).await {
                             Ok((msg_id, timestamp)) => {
                                 // Get sender username
-                                let sender_name = sqlx::query_as::<_, (String,)>(
-                                    "SELECT username FROM users WHERE id = $1"
-                                ).bind(uid).fetch_one(&state.db).await
-                                    .map(|r| r.0)
-                                    .unwrap_or_else(|_| "Unknown".to_string());
+                                let sender_name = username_cache.clone().unwrap_or_else(|| "Unknown".to_string());
 
                                 // Relay to recipient if online
                                 send_to_user(&state, recipient_id, &ServerEvent::DirectMessageReceived {
@@ -458,6 +698,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
 
         tracing::info!("User {} disconnected", uid);
+    }
+}
+
+/// Check if user has moderator+ permissions on a server.
+async fn has_mod_perms(pool: &db::DbPool, user_id: Uuid, server_id: Uuid) -> bool {
+    match db::get_member_role(pool, user_id, server_id).await {
+        Ok(Some(role)) => matches!(role.as_str(), "founder" | "moderator"),
+        _ => false,
     }
 }
 

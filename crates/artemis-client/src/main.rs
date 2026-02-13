@@ -543,6 +543,7 @@ impl Artemis {
                             let _ = tx.send(ClientEvent::SendMessage {
                                 channel_id,
                                 content: self.message_input.clone(),
+                                reply_to_id: None,
                             });
                             self.message_input.clear();
                         } else {
@@ -557,6 +558,9 @@ impl Artemis {
                                 attachments: vec![],
                                 timestamp: chrono::Utc::now(),
                                 edited_at: None,
+                                reply_to_id: None,
+                                pinned: false,
+                                reactions: vec![],
                             };
                             self.messages.push(msg);
                             self.message_input.clear();
@@ -638,6 +642,9 @@ impl Artemis {
             attachments: vec![],
             timestamp: chrono::Utc::now(),
             edited_at: None,
+            reply_to_id: None,
+            pinned: false,
+            reactions: vec![],
         };
         self.messages.push(msg);
         self.message_input.clear();
@@ -886,6 +893,9 @@ impl Artemis {
                     attachments: vec![],
                     timestamp,
                     edited_at: None,
+                    reply_to_id: None,
+                    pinned: false,
+                    reactions: vec![],
                 };
                 self.messages.push(msg);
             }
@@ -894,6 +904,27 @@ impl Artemis {
                 if let Some(friend) = self.friends.iter_mut().find(|f| f.user_id == user_id) {
                     friend.status = status;
                 }
+            }
+
+            // New Discord-like events (handled for future UI expansion)
+            ServerEvent::ReactionAdded { .. }
+            | ServerEvent::ReactionRemoved { .. }
+            | ServerEvent::MessagePinned { .. }
+            | ServerEvent::MessageUnpinned { .. }
+            | ServerEvent::PinnedMessages { .. }
+            | ServerEvent::UnreadState { .. }
+            | ServerEvent::ServerUpdated { .. }
+            | ServerEvent::ServerDeleted { .. }
+            | ServerEvent::ChannelCreated { .. }
+            | ServerEvent::ChannelDeleted { .. }
+            | ServerEvent::ChannelUpdated { .. }
+            | ServerEvent::CategoryCreated { .. }
+            | ServerEvent::InviteCode { .. }
+            | ServerEvent::ProfileUpdated { .. }
+            | ServerEvent::DirectMessageHistory { .. } => {
+                // Protocol events are defined and handled server-side.
+                // Client UI integration will follow.
+                tracing::debug!("Received event (not yet rendered in UI)");
             }
         }
     }

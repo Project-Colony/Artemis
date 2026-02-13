@@ -176,6 +176,9 @@ pub fn sample_data() -> (Vec<Server>, Vec<Message>, Vec<ServerMember>) {
             attachments: vec![],
             timestamp: Utc::now() - chrono::Duration::minutes(15),
             edited_at: None,
+            reply_to_id: None,
+            pinned: false,
+            reactions: vec![],
         },
         Message {
             id: Uuid::new_v4(),
@@ -187,6 +190,9 @@ pub fn sample_data() -> (Vec<Server>, Vec<Message>, Vec<ServerMember>) {
             attachments: vec![],
             timestamp: Utc::now() - chrono::Duration::minutes(12),
             edited_at: None,
+            reply_to_id: None,
+            pinned: false,
+            reactions: vec![],
         },
         Message {
             id: Uuid::new_v4(),
@@ -198,6 +204,9 @@ pub fn sample_data() -> (Vec<Server>, Vec<Message>, Vec<ServerMember>) {
             attachments: vec![],
             timestamp: Utc::now() - chrono::Duration::minutes(10),
             edited_at: None,
+            reply_to_id: None,
+            pinned: false,
+            reactions: vec![],
         },
         Message {
             id: Uuid::new_v4(),
@@ -209,6 +218,9 @@ pub fn sample_data() -> (Vec<Server>, Vec<Message>, Vec<ServerMember>) {
             attachments: vec![],
             timestamp: Utc::now() - chrono::Duration::minutes(5),
             edited_at: None,
+            reply_to_id: None,
+            pinned: false,
+            reactions: vec![],
         },
         Message {
             id: Uuid::new_v4(),
@@ -220,6 +232,9 @@ pub fn sample_data() -> (Vec<Server>, Vec<Message>, Vec<ServerMember>) {
             attachments: vec![],
             timestamp: Utc::now() - chrono::Duration::minutes(2),
             edited_at: None,
+            reply_to_id: None,
+            pinned: false,
+            reactions: vec![],
         },
         Message {
             id: Uuid::new_v4(),
@@ -232,6 +247,9 @@ pub fn sample_data() -> (Vec<Server>, Vec<Message>, Vec<ServerMember>) {
             attachments: vec![],
             timestamp: Utc::now() - chrono::Duration::minutes(1),
             edited_at: None,
+            reply_to_id: None,
+            pinned: false,
+            reactions: vec![],
         },
     ];
 

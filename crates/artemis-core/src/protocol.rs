@@ -12,10 +12,13 @@ pub enum ClientEvent {
     /// Authenticate with the server.
     Authenticate { token: String },
 
-    /// Send a message to a channel.
+    /// Send a message to a channel (with optional reply).
     SendMessage {
         channel_id: Uuid,
         content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
+        reply_to_id: Option<Uuid>,
     },
 
     /// Edit an existing message.
@@ -48,6 +51,90 @@ pub enum ClientEvent {
         server_id: Uuid,
         name: String,
         category_id: Option<Uuid>,
+    },
+
+    // ── Reactions ──
+
+    /// Add a reaction to a message.
+    AddReaction {
+        message_id: Uuid,
+        emoji: String,
+    },
+
+    /// Remove own reaction from a message.
+    RemoveReaction {
+        message_id: Uuid,
+        emoji: String,
+    },
+
+    // ── Pins ──
+
+    /// Pin a message in a channel.
+    PinMessage { message_id: Uuid },
+
+    /// Unpin a message.
+    UnpinMessage { message_id: Uuid },
+
+    /// Fetch pinned messages for a channel.
+    FetchPinnedMessages { channel_id: Uuid },
+
+    // ── Unread tracking ──
+
+    /// Mark a channel as read up to a message.
+    AckMessage {
+        channel_id: Uuid,
+        message_id: Uuid,
+    },
+
+    // ── Server / channel management ──
+
+    /// Edit server properties (name, icon).
+    EditServer {
+        server_id: Uuid,
+        name: Option<String>,
+        icon_url: Option<String>,
+    },
+
+    /// Delete a server (founder only).
+    DeleteServer { server_id: Uuid },
+
+    /// Create a new category in a server.
+    CreateCategory {
+        server_id: Uuid,
+        name: String,
+    },
+
+    /// Delete a channel.
+    DeleteChannel { channel_id: Uuid },
+
+    /// Edit a channel (name, topic).
+    EditChannel {
+        channel_id: Uuid,
+        name: Option<String>,
+        topic: Option<String>,
+    },
+
+    /// Leave a server.
+    LeaveServer { server_id: Uuid },
+
+    /// Get the invite code for a server.
+    GetInviteCode { server_id: Uuid },
+
+    // ── User profile ──
+
+    /// Update own profile.
+    UpdateProfile {
+        display_name: Option<String>,
+        custom_status: Option<String>,
+    },
+
+    // ── DM history ──
+
+    /// Fetch DM history with a friend.
+    FetchDirectMessages {
+        friend_id: Uuid,
+        before: Option<Uuid>,
+        limit: u32,
     },
 
     // ── Friend / DM / E2E relay ──
@@ -141,6 +228,112 @@ pub enum ServerEvent {
 
     /// Server error.
     Error { message: String },
+
+    // ── Reactions ──
+
+    /// A reaction was added to a message.
+    ReactionAdded {
+        message_id: Uuid,
+        user_id: Uuid,
+        emoji: String,
+    },
+
+    /// A reaction was removed from a message.
+    ReactionRemoved {
+        message_id: Uuid,
+        user_id: Uuid,
+        emoji: String,
+    },
+
+    // ── Pins ──
+
+    /// A message was pinned.
+    MessagePinned {
+        channel_id: Uuid,
+        message_id: Uuid,
+        pinned_by: Uuid,
+    },
+
+    /// A message was unpinned.
+    MessageUnpinned {
+        channel_id: Uuid,
+        message_id: Uuid,
+    },
+
+    /// Pinned messages list for a channel.
+    PinnedMessages {
+        channel_id: Uuid,
+        messages: Vec<Message>,
+    },
+
+    // ── Unread ──
+
+    /// Unread state for channels after auth.
+    UnreadState {
+        channels: Vec<ChannelUnreadPayload>,
+    },
+
+    // ── Server / channel management ──
+
+    /// A server was updated.
+    ServerUpdated {
+        server_id: Uuid,
+        name: Option<String>,
+        icon_url: Option<String>,
+    },
+
+    /// A server was deleted.
+    ServerDeleted { server_id: Uuid },
+
+    /// A channel was created in a server.
+    ChannelCreated {
+        server_id: Uuid,
+        category_id: Uuid,
+        channel: ChannelPayload,
+    },
+
+    /// A channel was deleted.
+    ChannelDeleted {
+        server_id: Uuid,
+        channel_id: Uuid,
+    },
+
+    /// A channel was updated.
+    ChannelUpdated {
+        channel_id: Uuid,
+        name: Option<String>,
+        topic: Option<String>,
+    },
+
+    /// A category was created.
+    CategoryCreated {
+        server_id: Uuid,
+        category: CategoryPayload,
+    },
+
+    /// Invite code response.
+    InviteCode {
+        server_id: Uuid,
+        invite_code: String,
+    },
+
+    // ── User profile ──
+
+    /// A user's profile was updated.
+    ProfileUpdated {
+        user_id: Uuid,
+        display_name: Option<String>,
+        custom_status: Option<String>,
+    },
+
+    // ── DM history ──
+
+    /// DM message history response.
+    DirectMessageHistory {
+        friend_id: Uuid,
+        messages: Vec<DirectMessagePayload>,
+        has_more: bool,
+    },
 
     // ── Friend / DM / E2E relay ──
 
@@ -242,6 +435,25 @@ pub struct FriendRequestPayload {
     pub created_at: DateTime<Utc>,
 }
 
+/// Unread state for a channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelUnreadPayload {
+    pub channel_id: Uuid,
+    pub last_read_message_id: Option<Uuid>,
+    pub mention_count: u32,
+    pub unread_count: u32,
+}
+
+/// A direct message in history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectMessagePayload {
+    pub id: Uuid,
+    pub sender_id: Uuid,
+    pub sender_username: String,
+    pub encrypted_content: String,
+    pub created_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,11 +463,12 @@ mod tests {
         let event = ClientEvent::SendMessage {
             channel_id: Uuid::nil(),
             content: "hello".to_string(),
+            reply_to_id: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: ClientEvent = serde_json::from_str(&json).unwrap();
         match parsed {
-            ClientEvent::SendMessage { channel_id, content } => {
+            ClientEvent::SendMessage { channel_id, content, .. } => {
                 assert_eq!(channel_id, Uuid::nil());
                 assert_eq!(content, "hello");
             }
@@ -302,5 +515,37 @@ mod tests {
         assert_eq!(json, "\"Founder\"");
         let parsed: MemberRole = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, MemberRole::Founder);
+    }
+
+    #[test]
+    fn reaction_event_roundtrip() {
+        let event = ClientEvent::AddReaction {
+            message_id: Uuid::nil(),
+            emoji: "thumbsup".to_string(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: ClientEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ClientEvent::AddReaction { emoji, .. } => assert_eq!(emoji, "thumbsup"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn reply_message_roundtrip() {
+        let reply_id = Uuid::new_v4();
+        let event = ClientEvent::SendMessage {
+            channel_id: Uuid::nil(),
+            content: "reply".to_string(),
+            reply_to_id: Some(reply_id),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: ClientEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            ClientEvent::SendMessage { reply_to_id, .. } => {
+                assert_eq!(reply_to_id, Some(reply_id));
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 }
