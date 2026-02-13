@@ -4,7 +4,7 @@ mod theme;
 mod views;
 
 use iced::widget::{container, row};
-use iced::{Element, Length, Task as IcedTask};
+use iced::{Element, Font, Length, Task as IcedTask};
 use futures::SinkExt;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -23,6 +23,21 @@ use views::{
     ServerListMsg,
 };
 
+/// JetBrains Mono Nerd Font — Regular weight.
+const JETBRAINS_MONO_REGULAR: &[u8] =
+    include_bytes!("../assets/fonts/JetBrainsMonoNerdFont-Regular.ttf");
+
+/// JetBrains Mono Nerd Font — Bold weight.
+const JETBRAINS_MONO_BOLD: &[u8] =
+    include_bytes!("../assets/fonts/JetBrainsMonoNerdFont-Bold.ttf");
+
+/// Font descriptor for JetBrains Mono Nerd Font.
+pub const FONT_REGULAR: Font = Font::with_name("JetBrainsMono Nerd Font");
+pub const FONT_BOLD: Font = Font {
+    weight: iced::font::Weight::Bold,
+    ..Font::with_name("JetBrainsMono Nerd Font")
+};
+
 /// GitHub OAuth App Client ID.
 const GITHUB_CLIENT_ID: &str = "Ov23liYMgdGLfkOKDQya";
 
@@ -34,6 +49,9 @@ fn main() -> iced::Result {
 
     iced::application("Artemis", Artemis::update, Artemis::view)
         .theme(|_| theme::artemis_theme())
+        .default_font(FONT_REGULAR)
+        .font(JETBRAINS_MONO_REGULAR)
+        .font(JETBRAINS_MONO_BOLD)
         .window_size((1280.0, 720.0))
         .run_with(Artemis::new)
 }

@@ -2,7 +2,7 @@ use iced::alignment::{Horizontal, Vertical};
 use iced::widget::{button, column, container, text, Space};
 use iced::{Border, Element, Length, Padding};
 
-use crate::theme::colors;
+use crate::theme::{colors, icons};
 
 #[derive(Debug, Clone)]
 pub enum LoginMsg {
@@ -23,9 +23,9 @@ pub enum LoginState {
 }
 
 pub fn view(state: &LoginState) -> Element<'_, LoginMsg> {
-    let title = text("Artemis").size(40).color(colors::ACCENT);
+    let title = text(format!("{} Artemis", icons::CHAT)).size(40).color(colors::ACCENT);
 
-    let subtitle = text("Peer-to-peer messaging via GitHub")
+    let subtitle = text(format!("{} Peer-to-peer messaging via GitHub", icons::GLOBE))
         .size(14)
         .color(colors::TEXT_MUTED);
 
@@ -37,7 +37,7 @@ pub fn view(state: &LoginState) -> Element<'_, LoginMsg> {
         LoginState::Idle => {
             let github_btn = button(
                 container(
-                    text("Sign in with GitHub")
+                    text("\u{f09b}  Sign in with GitHub") // nf-fa-github
                         .size(15)
                         .color(colors::TEXT_PRIMARY)
                         .align_x(Horizontal::Center),
@@ -103,7 +103,7 @@ pub fn view(state: &LoginState) -> Element<'_, LoginMsg> {
 
             form = form.push(Space::with_height(20));
             form = form.push(
-                text("No server needed \u{2014} connect directly with friends")
+                text(format!("{} No server needed \u{2014} connect directly with friends", icons::LOCK))
                     .size(11)
                     .color(colors::TEXT_TIMESTAMP),
             );
@@ -140,7 +140,7 @@ pub fn view(state: &LoginState) -> Element<'_, LoginMsg> {
             );
             form = form.push(Space::with_height(12));
             form = form.push(
-                text(format!("Go to: {}", verification_uri))
+                text(format!("{} Go to: {}", icons::GLOBE, verification_uri))
                     .size(12)
                     .color(colors::ACCENT),
             );
@@ -168,7 +168,7 @@ pub fn view(state: &LoginState) -> Element<'_, LoginMsg> {
 
         LoginState::Initializing => {
             form = form.push(
-                text("Setting up P2P identity...")
+                text(format!("{} Setting up P2P identity...", icons::LOCK))
                     .size(14)
                     .color(colors::ACCENT),
             );

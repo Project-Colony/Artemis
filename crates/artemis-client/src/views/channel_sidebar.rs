@@ -4,7 +4,7 @@ use iced::{Border, Element, Length, Padding};
 use uuid::Uuid;
 
 use artemis_core::protocol::ServerPayload;
-use crate::theme::colors;
+use crate::theme::{colors, icons};
 
 #[derive(Debug, Clone)]
 pub enum ChannelSidebarMsg {
@@ -50,7 +50,7 @@ pub fn view_from_payload<'a>(
     for category in &server.categories {
         let cat_header = button(
             row![
-                text("v").size(10).color(colors::TEXT_MUTED),
+                text(icons::CHEVRON_DOWN).size(10).color(colors::TEXT_MUTED),
                 Space::with_width(4),
                 text(&category.name).size(11).color(colors::TEXT_MUTED),
             ]
@@ -72,8 +72,8 @@ pub fn view_from_payload<'a>(
             let channel_id = channel.id;
 
             let icon_str = match channel.channel_type {
-                artemis_core::ChannelType::Text => "#",
-                artemis_core::ChannelType::Voice => "🔊",
+                artemis_core::ChannelType::Text => icons::CHANNEL_TEXT,
+                artemis_core::ChannelType::Voice => icons::CHANNEL_VOICE,
             };
 
             let name_color = if is_active {

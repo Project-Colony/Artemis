@@ -3,7 +3,7 @@ use iced::widget::{button, container, scrollable, text, Column, Space};
 use iced::{Border, Element, Length, Padding};
 
 use artemis_core::protocol::ServerPayload;
-use crate::theme::colors;
+use crate::theme::{colors, icons};
 
 #[derive(Debug, Clone)]
 pub enum ServerListMsg {
@@ -19,8 +19,8 @@ const HOME_COLOR: iced::Color = iced::Color::from_rgb(
 );
 
 fn home_button<'a>(is_home: bool) -> Element<'a, ServerListMsg> {
-    let label = text("\u{263D}") // ☽ crescent moon — Artemis
-        .size(24)
+    let label = text(icons::HOME) // nf-fa-home
+        .size(22)
         .color(colors::TEXT_PRIMARY)
         .align_x(Horizontal::Center);
 
@@ -121,8 +121,8 @@ fn server_button<'a>(
 fn add_server_button<'a>() -> Element<'a, ServerListMsg> {
     let btn = button(
         container(
-            text("+")
-                .size(22)
+            text(icons::PLUS)
+                .size(20)
                 .color(colors::STATUS_ONLINE)
                 .align_x(Horizontal::Center),
         )

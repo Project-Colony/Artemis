@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use artemis_core::models::message::ReactionCount;
 use artemis_core::protocol::ChannelPayload;
-use crate::theme::colors;
+use crate::theme::{colors, icons};
 
 #[derive(Debug, Clone)]
 pub enum ChatAreaMsg {
@@ -47,7 +47,7 @@ pub fn view_with_payload<'a>(
 
     // ── Top bar ──
     let mut top_row = row![
-        text("#").size(18).color(colors::TEXT_MUTED),
+        text(icons::CHANNEL_TEXT).size(16).color(colors::TEXT_MUTED),
         Space::with_width(6),
         text(channel_name).size(16).color(colors::TEXT_PRIMARY),
     ]
@@ -57,16 +57,17 @@ pub fn view_with_payload<'a>(
     if let Some(topic) = channel_topic {
         top_row = top_row
             .push(Space::with_width(12))
-            .push(text("|").size(14).color(colors::TEXT_TIMESTAMP))
+            .push(text(icons::DIVIDER).size(14).color(colors::TEXT_TIMESTAMP))
             .push(Space::with_width(12))
             .push(text(topic).size(13).color(colors::TEXT_MUTED));
     }
 
     // Search bar in top row
+    let search_placeholder = format!("{} Search messages...", icons::SEARCH);
     top_row = top_row
         .push(Space::with_width(Length::Fill))
         .push(
-            text_input("Search messages...", search_query)
+            text_input(&search_placeholder, search_query)
                 .on_input(ChatAreaMsg::SearchInputChanged)
                 .on_submit(ChatAreaMsg::SubmitSearch)
                 .padding(Padding::from([4, 8]))
@@ -103,7 +104,7 @@ pub fn view_with_payload<'a>(
     if !filtered.is_empty() {
         let load_btn = button(
             container(
-                text("Load older messages")
+                text(format!("{} Load older messages", icons::ARROW_UP))
                     .size(12)
                     .color(colors::TEXT_MUTED)
                     .align_x(iced::alignment::Horizontal::Center),
@@ -151,7 +152,7 @@ pub fn view_with_payload<'a>(
                 };
                 let reply_row = row![
                     Space::with_width(48),
-                    text("↱").size(12).color(colors::TEXT_TIMESTAMP),
+                    text(icons::THREAD).size(12).color(colors::TEXT_TIMESTAMP),
                     Space::with_width(4),
                     text(&replied_msg.author_name).size(11).color(colors::ROLE_MODERATOR),
                     Space::with_width(6),
@@ -234,7 +235,7 @@ pub fn view_with_payload<'a>(
             if msg.pinned {
                 header = header
                     .push(Space::with_width(6))
-                    .push(text("📌").size(11));
+                    .push(text(icons::PIN).size(11).color(colors::STATUS_IDLE));
             }
 
             // Edited indicator
@@ -250,7 +251,7 @@ pub fn view_with_payload<'a>(
             let msg_id = msg.id;
             let is_pinned = msg.pinned;
 
-            let reply_btn = button(text("↩").size(12).color(colors::TEXT_MUTED))
+            let reply_btn = button(text(icons::REPLY).size(12).color(colors::TEXT_MUTED))
                 .on_press(ChatAreaMsg::ReplyTo(msg_id))
                 .padding(Padding::from([2, 6]))
                 .style(|_theme, status| {
@@ -266,7 +267,11 @@ pub fn view_with_payload<'a>(
                     }
                 });
 
-            let pin_label = if is_pinned { "Unpin" } else { "Pin" };
+            let pin_label = if is_pinned {
+                format!("{} Unpin", icons::UNPIN)
+            } else {
+                format!("{} Pin", icons::PIN)
+            };
             let pin_btn = button(text(pin_label).size(10).color(colors::TEXT_MUTED))
                 .on_press(ChatAreaMsg::TogglePin(msg_id, is_pinned))
                 .padding(Padding::from([2, 6]))
@@ -362,7 +367,7 @@ pub fn view_with_payload<'a>(
                 text(": ").size(12).color(colors::TEXT_MUTED),
                 text(reply_preview).size(12).color(colors::TEXT_MUTED),
                 Space::with_width(Length::Fill),
-                button(text("✕").size(12).color(colors::TEXT_MUTED))
+                button(text(icons::CLOSE).size(12).color(colors::TEXT_MUTED))
                     .on_press(ChatAreaMsg::CancelReply)
                     .padding(Padding::from([2, 6]))
                     .style(|_theme, _status| button::Style {
@@ -397,7 +402,7 @@ pub fn view_with_payload<'a>(
         .padding(Padding::from([10, 12]))
         .size(14);
 
-    let send_btn = button(text("Send").size(13).color(colors::TEXT_PRIMARY))
+    let send_btn = button(text(format!("{} Send", icons::SEND)).size(13).color(colors::TEXT_PRIMARY))
         .on_press(ChatAreaMsg::SendMessage)
         .padding(Padding::from([8, 16]))
         .style(|_theme, _status| button::Style {

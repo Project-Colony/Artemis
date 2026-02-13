@@ -3,7 +3,7 @@ use iced::widget::{column, container, row, scrollable, text, Column, Space};
 use iced::{Border, Element, Length, Padding};
 
 use artemis_core::models::user::{MemberRole, UserStatus};
-use crate::theme::colors;
+use crate::theme::{colors, icons};
 
 #[derive(Debug, Clone)]
 pub enum MemberListMsg {
@@ -117,18 +117,14 @@ fn member_entry<'a>(
         ..container::Style::default()
     });
 
-    // Status dot
-    let status_dot = container(text("").size(1))
-        .width(10)
-        .height(10)
-        .style(move |_| container::Style {
-            background: Some(iced::Background::Color(status_color)),
-            border: Border {
-                radius: 5.0.into(),
-                ..Border::default()
-            },
-            ..container::Style::default()
-        });
+    // Status icon (Nerd Font)
+    let status_icon = match member.user.status {
+        UserStatus::Online => icons::STATUS_ONLINE,
+        UserStatus::Idle => icons::STATUS_IDLE,
+        UserStatus::DoNotDisturb => icons::STATUS_DND,
+        UserStatus::Offline => icons::STATUS_OFFLINE,
+    };
+    let status_dot = text(status_icon).size(10).color(status_color);
 
     // Name + status text
     let status_text = member
