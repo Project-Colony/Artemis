@@ -22,7 +22,8 @@ fn home_button<'a>(is_home: bool) -> Element<'a, ServerListMsg> {
     let label = text(icons::HOME) // nf-fa-home
         .size(22)
         .color(colors::TEXT_PRIMARY)
-        .align_x(Horizontal::Center);
+        .align_x(Horizontal::Center)
+        .align_y(Vertical::Center);
 
     let btn = button(
         container(label)
@@ -32,6 +33,7 @@ fn home_button<'a>(is_home: bool) -> Element<'a, ServerListMsg> {
             .align_y(Vertical::Center),
     )
     .on_press(ServerListMsg::GoHome)
+    .padding(0)
     .style(move |_theme, status| {
         let bg = if is_home {
             HOME_COLOR
@@ -84,7 +86,8 @@ fn server_button<'a>(
     let label = text(label_text)
         .size(18)
         .color(colors::TEXT_PRIMARY)
-        .align_x(Horizontal::Center);
+        .align_x(Horizontal::Center)
+        .align_y(Vertical::Center);
 
     let btn = button(
         container(label)
@@ -94,6 +97,7 @@ fn server_button<'a>(
             .align_y(Vertical::Center),
     )
     .on_press(ServerListMsg::SelectServer(index))
+    .padding(0)
     .style(move |_theme, status| {
         let bg = if is_active {
             colors::ACCENT
@@ -124,13 +128,15 @@ fn add_server_button<'a>() -> Element<'a, ServerListMsg> {
             text(icons::PLUS)
                 .size(20)
                 .color(colors::STATUS_ONLINE)
-                .align_x(Horizontal::Center),
+                .align_x(Horizontal::Center)
+                .align_y(Vertical::Center),
         )
         .width(48)
         .height(48)
         .align_x(Horizontal::Center)
         .align_y(Vertical::Center),
     )
+    .padding(0)
     .style(|_theme, status| {
         let bg = match status {
             button::Status::Hovered | button::Status::Pressed => colors::BG_HOVER,
