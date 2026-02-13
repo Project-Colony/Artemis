@@ -25,10 +25,13 @@ fn home_button<'a>(is_home: bool) -> Element<'a, ServerListMsg> {
         .align_x(Horizontal::Center)
         .align_y(Vertical::Center);
 
+    // Nerd Font monospace glyphs have slight right-side bearing;
+    // compensate with asymmetric padding: [top, right, bottom, left]
     let btn = button(
         container(label)
             .width(48)
             .height(48)
+            .padding(Padding { top: 0.0, right: 0.0, bottom: 0.0, left: 2.0 })
             .align_x(Horizontal::Center)
             .align_y(Vertical::Center),
     )
