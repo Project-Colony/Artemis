@@ -22,7 +22,6 @@ fn home_button<'a>(is_home: bool) -> Element<'a, ServerListMsg> {
     let label = text(icons::HOME) // nf-fa-home
         .size(22)
         .color(colors::TEXT_PRIMARY)
-        .width(Length::Fill)
         .align_x(Horizontal::Center)
         .align_y(Vertical::Center);
 
@@ -30,8 +29,8 @@ fn home_button<'a>(is_home: bool) -> Element<'a, ServerListMsg> {
         container(label)
             .width(48)
             .height(48)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill),
+            .align_x(Horizontal::Center)
+            .align_y(Vertical::Center),
     )
     .on_press(ServerListMsg::GoHome)
     .padding(0)
