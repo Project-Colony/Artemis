@@ -5,9 +5,9 @@ use iced::widget::{
 use iced::{Border, Element, Length, Padding};
 use uuid::Uuid;
 
+use crate::theme::{colors, icons};
 use artemis_core::models::message::ReactionCount;
 use artemis_core::protocol::ChannelPayload;
-use crate::theme::{colors, icons};
 
 #[derive(Debug, Clone)]
 pub enum ChatAreaMsg {
@@ -64,16 +64,14 @@ pub fn view_with_payload<'a>(
 
     // Search bar in top row
     let search_placeholder = format!("{} Search messages...", icons::SEARCH);
-    top_row = top_row
-        .push(Space::with_width(Length::Fill))
-        .push(
-            text_input(&search_placeholder, search_query)
-                .on_input(ChatAreaMsg::SearchInputChanged)
-                .on_submit(ChatAreaMsg::SubmitSearch)
-                .padding(Padding::from([4, 8]))
-                .size(12)
-                .width(200),
-        );
+    top_row = top_row.push(Space::with_width(Length::Fill)).push(
+        text_input(&search_placeholder, search_query)
+            .on_input(ChatAreaMsg::SearchInputChanged)
+            .on_submit(ChatAreaMsg::SubmitSearch)
+            .padding(Padding::from([4, 8]))
+            .size(12)
+            .width(200),
+    );
 
     let top_bar = container(top_row)
         .padding(Padding::from([12, 16]))
@@ -136,8 +134,7 @@ pub fn view_with_payload<'a>(
     let mut prev_author: Option<&Uuid> = None;
 
     for msg in &filtered {
-        let is_continuation =
-            prev_author.map(|id| id == &msg.author_id).unwrap_or(false)
+        let is_continuation = prev_author.map(|id| id == &msg.author_id).unwrap_or(false)
             && msg.reply_to_id.is_none();
 
         let timestamp: String = msg.timestamp.format("%H:%M").to_string();
@@ -154,23 +151,26 @@ pub fn view_with_payload<'a>(
                     Space::with_width(48),
                     text(icons::THREAD).size(12).color(colors::TEXT_TIMESTAMP),
                     Space::with_width(4),
-                    text(&replied_msg.author_name).size(11).color(colors::ROLE_MODERATOR),
+                    text(&replied_msg.author_name)
+                        .size(11)
+                        .color(colors::ROLE_MODERATOR),
                     Space::with_width(6),
                     text(reply_preview).size(11).color(colors::TEXT_MUTED),
                 ]
                 .spacing(0)
                 .align_y(Vertical::Center);
 
-                let reply_container = container(reply_row)
-                    .padding(Padding::from([2, 0]))
-                    .style(|_| container::Style {
-                        border: Border {
-                            color: colors::ACCENT,
-                            width: 0.0,
-                            radius: 0.0.into(),
-                        },
-                        ..container::Style::default()
-                    });
+                let reply_container =
+                    container(reply_row)
+                        .padding(Padding::from([2, 0]))
+                        .style(|_| container::Style {
+                            border: Border {
+                                color: colors::ACCENT,
+                                width: 0.0,
+                                radius: 0.0.into(),
+                            },
+                            ..container::Style::default()
+                        });
 
                 msg_column = msg_column.push(reply_container);
             }
@@ -178,19 +178,14 @@ pub fn view_with_payload<'a>(
 
         if is_continuation {
             let mut content_col: Column<'_, ChatAreaMsg> = Column::new().spacing(2);
-            content_col = content_col.push(
-                render_rich_content(&msg.content, 14),
-            );
+            content_col = content_col.push(render_rich_content(&msg.content, 14));
 
             // Reactions for continuation messages
             if !msg.reactions.is_empty() {
                 content_col = content_col.push(render_reactions(msg.id, &msg.reactions));
             }
 
-            let msg_row = row![
-                Space::with_width(48),
-                content_col,
-            ];
+            let msg_row = row![Space::with_width(48), content_col,];
             msg_column = msg_column.push(msg_row);
         } else {
             if prev_author.is_some() {
@@ -262,7 +257,10 @@ pub fn view_with_payload<'a>(
                     button::Style {
                         background: Some(iced::Background::Color(bg)),
                         text_color: colors::TEXT_MUTED,
-                        border: Border { radius: 3.0.into(), ..Border::default() },
+                        border: Border {
+                            radius: 3.0.into(),
+                            ..Border::default()
+                        },
                         ..button::Style::default()
                     }
                 });
@@ -283,13 +281,17 @@ pub fn view_with_payload<'a>(
                     button::Style {
                         background: Some(iced::Background::Color(bg)),
                         text_color: colors::TEXT_MUTED,
-                        border: Border { radius: 3.0.into(), ..Border::default() },
+                        border: Border {
+                            radius: 3.0.into(),
+                            ..Border::default()
+                        },
                         ..button::Style::default()
                     }
                 });
 
             // Quick reactions
-            let mut action_row: Row<'_, ChatAreaMsg> = Row::new().spacing(2).align_y(Vertical::Center);
+            let mut action_row: Row<'_, ChatAreaMsg> =
+                Row::new().spacing(2).align_y(Vertical::Center);
             action_row = action_row.push(reply_btn);
             action_row = action_row.push(pin_btn);
             for emoji in QUICK_REACTIONS {
@@ -300,13 +302,18 @@ pub fn view_with_payload<'a>(
                         .padding(Padding::from([2, 4]))
                         .style(|_theme, status| {
                             let bg = match status {
-                                button::Status::Hovered | button::Status::Pressed => colors::BG_HOVER,
+                                button::Status::Hovered | button::Status::Pressed => {
+                                    colors::BG_HOVER
+                                }
                                 _ => iced::Color::TRANSPARENT,
                             };
                             button::Style {
                                 background: Some(iced::Background::Color(bg)),
                                 text_color: colors::TEXT_PRIMARY,
-                                border: Border { radius: 3.0.into(), ..Border::default() },
+                                border: Border {
+                                    radius: 3.0.into(),
+                                    ..Border::default()
+                                },
                                 ..button::Style::default()
                             }
                         }),
@@ -324,8 +331,7 @@ pub fn view_with_payload<'a>(
 
             msg_content = msg_content.push(actions);
 
-            let msg_row = row![avatar, Space::with_width(12), msg_content]
-                .align_y(Vertical::Top);
+            let msg_row = row![avatar, Space::with_width(12), msg_content].align_y(Vertical::Top);
 
             msg_column = msg_column.push(msg_row);
         }
@@ -363,7 +369,9 @@ pub fn view_with_payload<'a>(
         let reply_bar = container(
             row![
                 text("Replying to ").size(12).color(colors::TEXT_MUTED),
-                text(&reply_msg.author_name).size(12).color(colors::ROLE_MODERATOR),
+                text(&reply_msg.author_name)
+                    .size(12)
+                    .color(colors::ROLE_MODERATOR),
                 text(": ").size(12).color(colors::TEXT_MUTED),
                 text(reply_preview).size(12).color(colors::TEXT_MUTED),
                 Space::with_width(Length::Fill),
@@ -402,28 +410,31 @@ pub fn view_with_payload<'a>(
         .padding(Padding::from([10, 12]))
         .size(14);
 
-    let send_btn = button(text(format!("{} Send", icons::SEND)).size(13).color(colors::TEXT_PRIMARY))
-        .on_press(ChatAreaMsg::SendMessage)
-        .padding(Padding::from([8, 16]))
-        .style(|_theme, _status| button::Style {
-            background: Some(iced::Background::Color(colors::ACCENT)),
-            text_color: colors::TEXT_PRIMARY,
-            border: Border {
-                radius: 4.0.into(),
-                ..Border::default()
-            },
-            ..button::Style::default()
-        });
-
-    let input_bar = container(
-        row![input, Space::with_width(8), send_btn,].align_y(Vertical::Center),
+    let send_btn = button(
+        text(format!("{} Send", icons::SEND))
+            .size(13)
+            .color(colors::TEXT_PRIMARY),
     )
+    .on_press(ChatAreaMsg::SendMessage)
     .padding(Padding::from([8, 16]))
-    .width(Length::Fill)
-    .style(|_| container::Style {
-        background: Some(iced::Background::Color(colors::BG_DARK)),
-        ..container::Style::default()
+    .style(|_theme, _status| button::Style {
+        background: Some(iced::Background::Color(colors::ACCENT)),
+        text_color: colors::TEXT_PRIMARY,
+        border: Border {
+            radius: 4.0.into(),
+            ..Border::default()
+        },
+        ..button::Style::default()
     });
+
+    let input_bar =
+        container(row![input, Space::with_width(8), send_btn,].align_y(Vertical::Center))
+            .padding(Padding::from([8, 16]))
+            .width(Length::Fill)
+            .style(|_| container::Style {
+                background: Some(iced::Background::Color(colors::BG_DARK)),
+                ..container::Style::default()
+            });
 
     chat_column = chat_column.push(input_bar);
 
@@ -451,23 +462,21 @@ fn render_rich_content(content: &str, size: u16) -> Element<'_, ChatAreaMsg> {
             }
             // Render mention with highlight
             parts = parts.push(
-                container(
-                    text(word).size(size).color(colors::ACCENT),
-                )
-                .padding(Padding::from([0, 2]))
-                .style(|_| container::Style {
-                    background: Some(iced::Background::Color(iced::Color {
-                        r: colors::ACCENT.r,
-                        g: colors::ACCENT.g,
-                        b: colors::ACCENT.b,
-                        a: 0.15,
-                    })),
-                    border: Border {
-                        radius: 3.0.into(),
-                        ..Border::default()
-                    },
-                    ..container::Style::default()
-                }),
+                container(text(word).size(size).color(colors::ACCENT))
+                    .padding(Padding::from([0, 2]))
+                    .style(|_| container::Style {
+                        background: Some(iced::Background::Color(iced::Color {
+                            r: colors::ACCENT.r,
+                            g: colors::ACCENT.g,
+                            b: colors::ACCENT.b,
+                            a: 0.15,
+                        })),
+                        border: Border {
+                            radius: 3.0.into(),
+                            ..Border::default()
+                        },
+                        ..container::Style::default()
+                    }),
             );
             current.push(' ');
         } else {
@@ -496,35 +505,49 @@ fn render_reactions(message_id: Uuid, reactions: &[ReactionCount]) -> Element<'_
         let mid = message_id;
 
         reaction_row = reaction_row.push(
-            button(text(label).size(11).color(if is_me { colors::TEXT_PRIMARY } else { colors::TEXT_MUTED }))
-                .on_press(ChatAreaMsg::ToggleReaction(mid, emoji))
-                .padding(Padding::from([2, 6]))
-                .style(move |_theme, status| {
-                    let bg = if is_me {
-                        match status {
-                            button::Status::Hovered | button::Status::Pressed => colors::BG_ACTIVE,
-                            _ => colors::BG_HOVER,
-                        }
-                    } else {
-                        match status {
-                            button::Status::Hovered | button::Status::Pressed => colors::BG_HOVER,
-                            _ => colors::BG_DARK,
-                        }
-                    };
-                    let border_color = if is_me { colors::ACCENT } else { iced::Color::TRANSPARENT };
-                    button::Style {
-                        background: Some(iced::Background::Color(bg)),
-                        text_color: if is_me { colors::TEXT_PRIMARY } else { colors::TEXT_MUTED },
-                        border: Border {
-                            radius: 10.0.into(),
-                            width: if is_me { 1.0 } else { 0.0 },
-                            color: border_color,
-                        },
-                        ..button::Style::default()
+            button(text(label).size(11).color(if is_me {
+                colors::TEXT_PRIMARY
+            } else {
+                colors::TEXT_MUTED
+            }))
+            .on_press(ChatAreaMsg::ToggleReaction(mid, emoji))
+            .padding(Padding::from([2, 6]))
+            .style(move |_theme, status| {
+                let bg = if is_me {
+                    match status {
+                        button::Status::Hovered | button::Status::Pressed => colors::BG_ACTIVE,
+                        _ => colors::BG_HOVER,
                     }
-                }),
+                } else {
+                    match status {
+                        button::Status::Hovered | button::Status::Pressed => colors::BG_HOVER,
+                        _ => colors::BG_DARK,
+                    }
+                };
+                let border_color = if is_me {
+                    colors::ACCENT
+                } else {
+                    iced::Color::TRANSPARENT
+                };
+                button::Style {
+                    background: Some(iced::Background::Color(bg)),
+                    text_color: if is_me {
+                        colors::TEXT_PRIMARY
+                    } else {
+                        colors::TEXT_MUTED
+                    },
+                    border: Border {
+                        radius: 10.0.into(),
+                        width: if is_me { 1.0 } else { 0.0 },
+                        color: border_color,
+                    },
+                    ..button::Style::default()
+                }
+            }),
         );
     }
 
-    container(reaction_row).padding(Padding::from([2, 0])).into()
+    container(reaction_row)
+        .padding(Padding::from([2, 0]))
+        .into()
 }

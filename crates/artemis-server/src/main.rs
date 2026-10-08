@@ -18,7 +18,8 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "postgres://artemis:artemis@localhost:5432/artemis".to_string());
     let github_client_id = std::env::var("GITHUB_CLIENT_ID").unwrap_or_default();
     let github_client_secret = std::env::var("GITHUB_CLIENT_SECRET").unwrap_or_default();
-    let base_url = std::env::var("BASE_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
+    let base_url =
+        std::env::var("BASE_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
 
     // Connect to database

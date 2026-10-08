@@ -3,9 +3,9 @@ mod net;
 mod theme;
 mod views;
 
+use futures::SinkExt;
 use iced::widget::{container, row};
 use iced::{Element, Font, Length, Task as IcedTask};
-use futures::SinkExt;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -28,8 +28,7 @@ const JETBRAINS_MONO_REGULAR: &[u8] =
     include_bytes!("../assets/fonts/JetBrainsMonoNerdFont-Regular.ttf");
 
 /// JetBrains Mono Nerd Font — Bold weight.
-const JETBRAINS_MONO_BOLD: &[u8] =
-    include_bytes!("../assets/fonts/JetBrainsMonoNerdFont-Bold.ttf");
+const JETBRAINS_MONO_BOLD: &[u8] = include_bytes!("../assets/fonts/JetBrainsMonoNerdFont-Bold.ttf");
 
 /// Font descriptor for JetBrains Mono Nerd Font.
 pub const FONT_REGULAR: Font = Font::with_name("JetBrainsMono Nerd Font");
@@ -226,9 +225,9 @@ impl Artemis {
                                         match error.as_str() {
                                             "authorization_pending" => continue,
                                             "slow_down" => {
-                                                tokio::time::sleep(
-                                                    std::time::Duration::from_secs(5),
-                                                )
+                                                tokio::time::sleep(std::time::Duration::from_secs(
+                                                    5,
+                                                ))
                                                 .await;
                                                 continue;
                                             }
@@ -309,7 +308,10 @@ impl Artemis {
                 let identity = Identity::generate();
                 let public_key = identity.public_key_b64();
                 self.identity = Some(identity);
-                tracing::info!("E2E identity generated, public key: {}...", &public_key[..8]);
+                tracing::info!(
+                    "E2E identity generated, public key: {}...",
+                    &public_key[..8]
+                );
 
                 // Connect to server relay
                 let server_url = DEFAULT_SERVER_URL.to_string();
@@ -321,9 +323,7 @@ impl Artemis {
                         match net::connect(&server_url, tk).await {
                             Ok((tx, mut rx)) => {
                                 // Publish public key
-                                let _ = tx.send(ClientEvent::PublishPublicKey {
-                                    public_key: pk,
-                                });
+                                let _ = tx.send(ClientEvent::PublishPublicKey { public_key: pk });
                                 // Fetch friends and requests
                                 let _ = tx.send(ClientEvent::FetchFriends);
                                 let _ = tx.send(ClientEvent::FetchFriendRequests);
@@ -532,8 +532,7 @@ impl Artemis {
                         })
                         .collect();
 
-                    if let (Some(channel_id), Some(tx)) =
-                        (self.active_channel_id, &self.client_tx)
+                    if let (Some(channel_id), Some(tx)) = (self.active_channel_id, &self.client_tx)
                     {
                         let _ = tx.send(ClientEvent::FetchMessages {
                             channel_id,
@@ -621,15 +620,23 @@ impl Artemis {
             AppMessage::ChatArea(ChatAreaMsg::ToggleReaction(msg_id, emoji)) => {
                 if let Some(tx) = &self.client_tx {
                     // Check if we already reacted with this emoji
-                    let already_reacted = self.messages.iter()
+                    let already_reacted = self
+                        .messages
+                        .iter()
                         .find(|m| m.id == msg_id)
                         .map(|m| m.reactions.iter().any(|r| r.emoji == emoji && r.me))
                         .unwrap_or(false);
 
                     if already_reacted {
-                        let _ = tx.send(ClientEvent::RemoveReaction { message_id: msg_id, emoji });
+                        let _ = tx.send(ClientEvent::RemoveReaction {
+                            message_id: msg_id,
+                            emoji,
+                        });
                     } else {
-                        let _ = tx.send(ClientEvent::AddReaction { message_id: msg_id, emoji });
+                        let _ = tx.send(ClientEvent::AddReaction {
+                            message_id: msg_id,
+                            emoji,
+                        });
                     }
                 } else {
                     // Offline/mock: toggle reaction locally
@@ -646,11 +653,12 @@ impl Artemis {
                                 rc.me = true;
                             }
                         } else {
-                            msg.reactions.push(artemis_core::models::message::ReactionCount {
-                                emoji,
-                                count: 1,
-                                me: true,
-                            });
+                            msg.reactions
+                                .push(artemis_core::models::message::ReactionCount {
+                                    emoji,
+                                    count: 1,
+                                    me: true,
+                                });
                         }
                     }
                 }
@@ -675,7 +683,11 @@ impl Artemis {
             AppMessage::ChatArea(ChatAreaMsg::SubmitSearch) => {
                 if !self.search_query.trim().is_empty() {
                     if let Some(tx) = &self.client_tx {
-                        let server_id = self.servers.get(self.active_server_idx).map(|s| s.id).unwrap_or(Uuid::nil());
+                        let server_id = self
+                            .servers
+                            .get(self.active_server_idx)
+                            .map(|s| s.id)
+                            .unwrap_or(Uuid::nil());
                         let _ = tx.send(ClientEvent::SearchMessages {
                             server_id,
                             channel_id: self.active_channel_id,
@@ -801,9 +813,7 @@ impl Artemis {
 
                 self.screen = AppScreen::Chat;
 
-                if let (Some(channel_id), Some(tx)) =
-                    (self.active_channel_id, &self.client_tx)
-                {
+                if let (Some(channel_id), Some(tx)) = (self.active_channel_id, &self.client_tx) {
                     let _ = tx.send(ClientEvent::FetchMessages {
                         channel_id,
                         before: None,
@@ -884,7 +894,6 @@ impl Artemis {
             }
 
             // ── Friend / DM events ──
-
             ServerEvent::PublicKeyAcknowledged => {
                 tracing::info!("Public key registered on server");
             }
@@ -939,10 +948,7 @@ impl Artemis {
 
             ServerEvent::PendingFriendRequests { requests } => {
                 self.pending_requests = requests;
-                tracing::info!(
-                    "Pending friend requests: {}",
-                    self.pending_requests.len()
-                );
+                tracing::info!("Pending friend requests: {}", self.pending_requests.len());
             }
 
             ServerEvent::DirectMessageReceived {
@@ -1007,36 +1013,47 @@ impl Artemis {
             }
 
             // ── Reactions ──
-
-            ServerEvent::ReactionAdded { message_id, user_id: reactor_id, emoji } => {
+            ServerEvent::ReactionAdded {
+                message_id,
+                user_id: reactor_id,
+                emoji,
+            } => {
                 if let Some(msg) = self.messages.iter_mut().find(|m| m.id == message_id) {
                     let is_me = self.user_id.map(|uid| uid == reactor_id).unwrap_or(false);
                     if let Some(rc) = msg.reactions.iter_mut().find(|r| r.emoji == emoji) {
                         rc.count += 1;
-                        if is_me { rc.me = true; }
+                        if is_me {
+                            rc.me = true;
+                        }
                     } else {
-                        msg.reactions.push(artemis_core::models::message::ReactionCount {
-                            emoji,
-                            count: 1,
-                            me: is_me,
-                        });
+                        msg.reactions
+                            .push(artemis_core::models::message::ReactionCount {
+                                emoji,
+                                count: 1,
+                                me: is_me,
+                            });
                     }
                 }
             }
 
-            ServerEvent::ReactionRemoved { message_id, user_id: reactor_id, emoji } => {
+            ServerEvent::ReactionRemoved {
+                message_id,
+                user_id: reactor_id,
+                emoji,
+            } => {
                 if let Some(msg) = self.messages.iter_mut().find(|m| m.id == message_id) {
                     let is_me = self.user_id.map(|uid| uid == reactor_id).unwrap_or(false);
                     if let Some(rc) = msg.reactions.iter_mut().find(|r| r.emoji == emoji) {
                         rc.count = rc.count.saturating_sub(1);
-                        if is_me { rc.me = false; }
+                        if is_me {
+                            rc.me = false;
+                        }
                     }
                     msg.reactions.retain(|r| r.count > 0);
                 }
             }
 
             // ── Pins ──
-
             ServerEvent::MessagePinned { message_id, .. } => {
                 if let Some(msg) = self.messages.iter_mut().find(|m| m.id == message_id) {
                     msg.pinned = true;
@@ -1059,18 +1076,24 @@ impl Artemis {
             }
 
             // ── Unread ──
-
             ServerEvent::UnreadState { channels } => {
                 tracing::info!("Unread state received for {} channels", channels.len());
                 // Could be used for badge counts in the channel sidebar in the future
             }
 
             // ── Server / channel management ──
-
-            ServerEvent::ServerUpdated { server_id, name, icon_url } => {
+            ServerEvent::ServerUpdated {
+                server_id,
+                name,
+                icon_url,
+            } => {
                 if let Some(server) = self.servers.iter_mut().find(|s| s.id == server_id) {
-                    if let Some(n) = name { server.name = n; }
-                    if let Some(icon) = icon_url { server.icon_url = Some(icon); }
+                    if let Some(n) = name {
+                        server.name = n;
+                    }
+                    if let Some(icon) = icon_url {
+                        server.icon_url = Some(icon);
+                    }
                 }
             }
 
@@ -1081,7 +1104,11 @@ impl Artemis {
                 }
             }
 
-            ServerEvent::ChannelCreated { server_id, category_id, channel } => {
+            ServerEvent::ChannelCreated {
+                server_id,
+                category_id,
+                channel,
+            } => {
                 if let Some(server) = self.servers.iter_mut().find(|s| s.id == server_id) {
                     if let Some(cat) = server.categories.iter_mut().find(|c| c.id == category_id) {
                         cat.channels.push(channel);
@@ -1089,7 +1116,10 @@ impl Artemis {
                 }
             }
 
-            ServerEvent::ChannelDeleted { server_id, channel_id } => {
+            ServerEvent::ChannelDeleted {
+                server_id,
+                channel_id,
+            } => {
                 if let Some(server) = self.servers.iter_mut().find(|s| s.id == server_id) {
                     for cat in &mut server.categories {
                         cat.channels.retain(|ch| ch.id != channel_id);
@@ -1100,47 +1130,76 @@ impl Artemis {
                 }
             }
 
-            ServerEvent::ChannelUpdated { channel_id, name, topic } => {
+            ServerEvent::ChannelUpdated {
+                channel_id,
+                name,
+                topic,
+            } => {
                 for server in &mut self.servers {
                     for cat in &mut server.categories {
                         if let Some(ch) = cat.channels.iter_mut().find(|c| c.id == channel_id) {
-                            if let Some(n) = name.clone() { ch.name = n; }
-                            if let Some(t) = topic.clone() { ch.topic = Some(t); }
+                            if let Some(n) = name.clone() {
+                                ch.name = n;
+                            }
+                            if let Some(t) = topic.clone() {
+                                ch.topic = Some(t);
+                            }
                         }
                     }
                 }
             }
 
-            ServerEvent::CategoryCreated { server_id, category } => {
+            ServerEvent::CategoryCreated {
+                server_id,
+                category,
+            } => {
                 if let Some(server) = self.servers.iter_mut().find(|s| s.id == server_id) {
                     server.categories.push(category);
                 }
             }
 
-            ServerEvent::InviteCode { server_id, invite_code } => {
+            ServerEvent::InviteCode {
+                server_id,
+                invite_code,
+            } => {
                 tracing::info!("Invite code for server {}: {}", server_id, invite_code);
             }
 
-            ServerEvent::ProfileUpdated { user_id: uid, display_name, custom_status } => {
+            ServerEvent::ProfileUpdated {
+                user_id: uid,
+                display_name,
+                custom_status,
+            } => {
                 if let Some(member) = self.members.iter_mut().find(|m| m.user.id == uid) {
-                    if let Some(dn) = display_name { member.user.display_name = Some(dn); }
-                    if let Some(cs) = custom_status { member.user.custom_status = Some(cs); }
+                    if let Some(dn) = display_name {
+                        member.user.display_name = Some(dn);
+                    }
+                    if let Some(cs) = custom_status {
+                        member.user.custom_status = Some(cs);
+                    }
                 }
             }
 
-            ServerEvent::DirectMessageHistory { friend_id, messages, .. } => {
+            ServerEvent::DirectMessageHistory {
+                friend_id,
+                messages,
+                ..
+            } => {
                 let dm_channel_id = self.dm_channel_id(friend_id);
                 for dm in messages {
                     let msg_id = dm.id;
                     if !self.messages.iter().any(|m| m.id == msg_id) {
                         // Attempt decrypt
                         let content = if let Some(identity) = &self.identity {
-                            let sender_pk = self.friends.iter()
+                            let sender_pk = self
+                                .friends
+                                .iter()
                                 .find(|f| f.user_id == dm.sender_id)
                                 .and_then(|f| f.public_key.as_ref());
                             if let Some(pk) = sender_pk {
                                 match identity.decrypt_from_b64(pk, &dm.encrypted_content) {
-                                    Ok(pt) => String::from_utf8(pt).unwrap_or(dm.encrypted_content.clone()),
+                                    Ok(pt) => String::from_utf8(pt)
+                                        .unwrap_or(dm.encrypted_content.clone()),
                                     Err(_) => dm.encrypted_content.clone(),
                                 }
                             } else {
@@ -1170,7 +1229,6 @@ impl Artemis {
             }
 
             // ── Search results ──
-
             ServerEvent::SearchResults { messages, .. } => {
                 // Replace current view with search results (add them to messages list)
                 for msg in messages {
@@ -1182,7 +1240,6 @@ impl Artemis {
             }
 
             // ── Custom emojis ──
-
             ServerEvent::CustomEmojiAdded { .. }
             | ServerEvent::CustomEmojiRemoved { .. }
             | ServerEvent::CustomEmojiList { .. } => {
@@ -1203,12 +1260,9 @@ impl Artemis {
                 } else {
                     Some(self.active_server_idx)
                 };
-                let server_strip = server_list::view_from_payloads(
-                    &self.servers,
-                    active_srv_idx,
-                    self.is_home,
-                )
-                .map(AppMessage::ServerList);
+                let server_strip =
+                    server_list::view_from_payloads(&self.servers, active_srv_idx, self.is_home)
+                        .map(AppMessage::ServerList);
 
                 let mut main_row = row![server_strip];
 
@@ -1228,7 +1282,9 @@ impl Artemis {
                         Some(self.dm_channel_id(friend.user_id))
                     });
 
-                    let reply_msg = self.reply_to_id.and_then(|rid| self.messages.iter().find(|m| m.id == rid));
+                    let reply_msg = self
+                        .reply_to_id
+                        .and_then(|rid| self.messages.iter().find(|m| m.id == rid));
                     let chat_view = chat_area::view_with_payload(
                         None,
                         &self.messages,
@@ -1253,7 +1309,9 @@ impl Artemis {
                             .find(|ch| Some(ch.id) == self.active_channel_id)
                     });
 
-                    let reply_msg = self.reply_to_id.and_then(|rid| self.messages.iter().find(|m| m.id == rid));
+                    let reply_msg = self
+                        .reply_to_id
+                        .and_then(|rid| self.messages.iter().find(|m| m.id == rid));
                     let chat_view = chat_area::view_with_payload(
                         active_channel_payload,
                         &self.messages,

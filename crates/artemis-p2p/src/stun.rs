@@ -37,10 +37,7 @@ pub async fn discover_public_endpoint() -> Result<SocketAddr, StunError> {
     Err(StunError::AllServersFailed)
 }
 
-async fn query_stun_server(
-    socket: &UdpSocket,
-    server: &str,
-) -> Result<SocketAddr, StunError> {
+async fn query_stun_server(socket: &UdpSocket, server: &str) -> Result<SocketAddr, StunError> {
     let server_addr: SocketAddr = tokio::net::lookup_host(server)
         .await
         .map_err(|e| StunError::Dns(e.to_string()))?
@@ -70,10 +67,7 @@ async fn query_stun_server(
     parse_stun_response(&buf[..len], &transaction_id)
 }
 
-fn parse_stun_response(
-    data: &[u8],
-    expected_txn: &[u8; 12],
-) -> Result<SocketAddr, StunError> {
+fn parse_stun_response(data: &[u8], expected_txn: &[u8; 12]) -> Result<SocketAddr, StunError> {
     if data.len() < 20 {
         return Err(StunError::InvalidResponse("too short".to_string()));
     }
@@ -147,8 +141,8 @@ fn parse_xor_mapped_address(data: &[u8]) -> Result<SocketAddr, StunError> {
     match family {
         0x01 => {
             // IPv4
-            let xor_ip = u32::from_be_bytes([data[4], data[5], data[6], data[7]])
-                ^ STUN_MAGIC_COOKIE;
+            let xor_ip =
+                u32::from_be_bytes([data[4], data[5], data[6], data[7]]) ^ STUN_MAGIC_COOKIE;
             let ip = std::net::Ipv4Addr::from(xor_ip);
             Ok(SocketAddr::new(std::net::IpAddr::V4(ip), xor_port))
         }

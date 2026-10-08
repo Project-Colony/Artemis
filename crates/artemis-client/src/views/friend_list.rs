@@ -2,9 +2,9 @@ use iced::alignment::{Horizontal, Vertical};
 use iced::widget::{button, column, container, row, scrollable, text, text_input, Column, Space};
 use iced::{Border, Element, Length, Padding};
 
+use crate::theme::{colors, icons};
 use artemis_core::models::user::UserStatus;
 use artemis_core::protocol::{FriendPayload, FriendRequestPayload};
-use crate::theme::{colors, icons};
 
 #[derive(Debug, Clone)]
 pub enum FriendListMsg {
@@ -28,7 +28,9 @@ pub fn view<'a>(
     // Header
     let header = container(
         row![
-            text(format!("{} Friends", icons::MEMBERS)).size(16).color(colors::TEXT_PRIMARY),
+            text(format!("{} Friends", icons::MEMBERS))
+                .size(16)
+                .color(colors::TEXT_PRIMARY),
             Space::with_width(Length::Fill),
             button(text(icons::USER_PLUS).size(14).color(colors::STATUS_ONLINE))
                 .on_press(FriendListMsg::ToggleAddFriend)
@@ -81,15 +83,13 @@ pub fn view<'a>(
                 ..button::Style::default()
             });
 
-        let form = container(
-            row![input, Space::with_width(4), add_btn].align_y(Vertical::Center),
-        )
-        .padding(Padding::from([8, 12]))
-        .width(Length::Fill)
-        .style(|_| container::Style {
-            background: Some(iced::Background::Color(colors::BG_MEDIUM)),
-            ..container::Style::default()
-        });
+        let form = container(row![input, Space::with_width(4), add_btn].align_y(Vertical::Center))
+            .padding(Padding::from([8, 12]))
+            .width(Length::Fill)
+            .style(|_| container::Style {
+                background: Some(iced::Background::Color(colors::BG_MEDIUM)),
+                ..container::Style::default()
+            });
 
         content = content.push(form);
     }
@@ -100,9 +100,13 @@ pub fn view<'a>(
     if !pending_requests.is_empty() {
         content = content.push(
             container(
-                text(format!("{} PENDING \u{2014} {}", icons::PENDING, pending_requests.len()))
-                    .size(11)
-                    .color(colors::STATUS_IDLE),
+                text(format!(
+                    "{} PENDING \u{2014} {}",
+                    icons::PENDING,
+                    pending_requests.len()
+                ))
+                .size(11)
+                .color(colors::STATUS_IDLE),
             )
             .padding(Padding::from([6, 16])),
         );
@@ -127,9 +131,13 @@ pub fn view<'a>(
     if !online.is_empty() {
         content = content.push(
             container(
-                text(format!("{} ONLINE \u{2014} {}", icons::STATUS_ONLINE, online.len()))
-                    .size(11)
-                    .color(colors::TEXT_MUTED),
+                text(format!(
+                    "{} ONLINE \u{2014} {}",
+                    icons::STATUS_ONLINE,
+                    online.len()
+                ))
+                .size(11)
+                .color(colors::TEXT_MUTED),
             )
             .padding(Padding::from([6, 16])),
         );
@@ -145,9 +153,13 @@ pub fn view<'a>(
     if !offline.is_empty() {
         content = content.push(
             container(
-                text(format!("{} OFFLINE \u{2014} {}", icons::STATUS_OFFLINE, offline.len()))
-                    .size(11)
-                    .color(colors::TEXT_MUTED),
+                text(format!(
+                    "{} OFFLINE \u{2014} {}",
+                    icons::STATUS_OFFLINE,
+                    offline.len()
+                ))
+                .size(11)
+                .color(colors::TEXT_MUTED),
             )
             .padding(Padding::from([6, 16])),
         );
@@ -342,18 +354,22 @@ fn friend_request_entry<'a>(req: &FriendRequestPayload) -> Element<'a, FriendLis
             ..button::Style::default()
         });
 
-    let decline_btn = button(text(icons::DECLINE).size(14).color(iced::color!(0xEF, 0x44, 0x44)))
-        .on_press(FriendListMsg::DeclineRequest(from_id))
-        .padding(Padding::from([4, 8]))
-        .style(|_theme, _status| button::Style {
-            background: Some(iced::Background::Color(colors::BG_HOVER)),
-            text_color: iced::color!(0xEF, 0x44, 0x44),
-            border: Border {
-                radius: 4.0.into(),
-                ..Border::default()
-            },
-            ..button::Style::default()
-        });
+    let decline_btn = button(
+        text(icons::DECLINE)
+            .size(14)
+            .color(iced::color!(0xEF, 0x44, 0x44)),
+    )
+    .on_press(FriendListMsg::DeclineRequest(from_id))
+    .padding(Padding::from([4, 8]))
+    .style(|_theme, _status| button::Style {
+        background: Some(iced::Background::Color(colors::BG_HOVER)),
+        text_color: iced::color!(0xEF, 0x44, 0x44),
+        border: Border {
+            radius: 4.0.into(),
+            ..Border::default()
+        },
+        ..button::Style::default()
+    });
 
     let entry_row = row![
         avatar,

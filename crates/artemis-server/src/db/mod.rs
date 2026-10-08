@@ -30,7 +30,10 @@ pub async fn run_migrations(pool: &DbPool) -> Result<(), sqlx::Error> {
 
 // ── User queries ──
 
-pub async fn find_user_by_github_id(pool: &DbPool, github_id: i64) -> Result<Option<UserRow>, sqlx::Error> {
+pub async fn find_user_by_github_id(
+    pool: &DbPool,
+    github_id: i64,
+) -> Result<Option<UserRow>, sqlx::Error> {
     sqlx::query_as::<_, UserRow>(
         "SELECT id, username, display_name, avatar_url, github_id, status, custom_status, auth_token, public_key, created_at FROM users WHERE github_id = $1"
     )
@@ -39,7 +42,10 @@ pub async fn find_user_by_github_id(pool: &DbPool, github_id: i64) -> Result<Opt
     .await
 }
 
-pub async fn find_user_by_token(pool: &DbPool, token: &str) -> Result<Option<UserRow>, sqlx::Error> {
+pub async fn find_user_by_token(
+    pool: &DbPool,
+    token: &str,
+) -> Result<Option<UserRow>, sqlx::Error> {
     sqlx::query_as::<_, UserRow>(
         "SELECT id, username, display_name, avatar_url, github_id, status, custom_status, auth_token, public_key, created_at FROM users WHERE auth_token = $1"
     )
@@ -48,7 +54,10 @@ pub async fn find_user_by_token(pool: &DbPool, token: &str) -> Result<Option<Use
     .await
 }
 
-pub async fn find_user_by_username(pool: &DbPool, username: &str) -> Result<Option<UserRow>, sqlx::Error> {
+pub async fn find_user_by_username(
+    pool: &DbPool,
+    username: &str,
+) -> Result<Option<UserRow>, sqlx::Error> {
     sqlx::query_as::<_, UserRow>(
         "SELECT id, username, display_name, avatar_url, github_id, status, custom_status, auth_token, public_key, created_at FROM users WHERE username = $1"
     )
@@ -79,7 +88,11 @@ pub async fn create_user(
     .await
 }
 
-pub async fn update_user_token(pool: &DbPool, user_id: Uuid, token: &str) -> Result<(), sqlx::Error> {
+pub async fn update_user_token(
+    pool: &DbPool,
+    user_id: Uuid,
+    token: &str,
+) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE users SET auth_token = $1 WHERE id = $2")
         .bind(token)
         .bind(user_id)
@@ -88,7 +101,11 @@ pub async fn update_user_token(pool: &DbPool, user_id: Uuid, token: &str) -> Res
     Ok(())
 }
 
-pub async fn update_user_status(pool: &DbPool, user_id: Uuid, status: &str) -> Result<(), sqlx::Error> {
+pub async fn update_user_status(
+    pool: &DbPool,
+    user_id: Uuid,
+    status: &str,
+) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE users SET status = $1 WHERE id = $2")
         .bind(status)
         .bind(user_id)
@@ -99,13 +116,16 @@ pub async fn update_user_status(pool: &DbPool, user_id: Uuid, status: &str) -> R
 
 // ── Server queries ──
 
-pub async fn get_user_servers(pool: &DbPool, user_id: Uuid) -> Result<Vec<ServerPayload>, sqlx::Error> {
+pub async fn get_user_servers(
+    pool: &DbPool,
+    user_id: Uuid,
+) -> Result<Vec<ServerPayload>, sqlx::Error> {
     let server_rows = sqlx::query_as::<_, ServerRow>(
         "SELECT s.id, s.name, s.icon_url
          FROM servers s
          JOIN server_members sm ON sm.server_id = s.id
          WHERE sm.user_id = $1
-         ORDER BY s.created_at"
+         ORDER BY s.created_at",
     )
     .bind(user_id)
     .fetch_all(pool)
@@ -126,9 +146,14 @@ pub async fn get_user_servers(pool: &DbPool, user_id: Uuid) -> Result<Vec<Server
     Ok(payloads)
 }
 
-pub async fn create_server(pool: &DbPool, name: &str, owner_id: Uuid, invite_code: &str) -> Result<Uuid, sqlx::Error> {
+pub async fn create_server(
+    pool: &DbPool,
+    name: &str,
+    owner_id: Uuid,
+    invite_code: &str,
+) -> Result<Uuid, sqlx::Error> {
     let row: (Uuid,) = sqlx::query_as(
-        "INSERT INTO servers (name, owner_id, invite_code) VALUES ($1, $2, $3) RETURNING id"
+        "INSERT INTO servers (name, owner_id, invite_code) VALUES ($1, $2, $3) RETURNING id",
     )
     .bind(name)
     .bind(owner_id)
@@ -139,17 +164,15 @@ pub async fn create_server(pool: &DbPool, name: &str, owner_id: Uuid, invite_cod
     let server_id = row.0;
 
     // Add owner as founder member
-    sqlx::query(
-        "INSERT INTO server_members (user_id, server_id, role) VALUES ($1, $2, 'founder')"
-    )
-    .bind(owner_id)
-    .bind(server_id)
-    .execute(pool)
-    .await?;
+    sqlx::query("INSERT INTO server_members (user_id, server_id, role) VALUES ($1, $2, 'founder')")
+        .bind(owner_id)
+        .bind(server_id)
+        .execute(pool)
+        .await?;
 
     // Create default category + channel
     let cat_id: (Uuid,) = sqlx::query_as(
-        "INSERT INTO categories (server_id, name, position) VALUES ($1, 'GENERAL', 0) RETURNING id"
+        "INSERT INTO categories (server_id, name, position) VALUES ($1, 'GENERAL', 0) RETURNING id",
     )
     .bind(server_id)
     .fetch_one(pool)
@@ -157,7 +180,7 @@ pub async fn create_server(pool: &DbPool, name: &str, owner_id: Uuid, invite_cod
 
     sqlx::query(
         "INSERT INTO channels (category_id, server_id, name, channel_type, topic, position)
-         VALUES ($1, $2, 'general', 'text', 'Welcome!', 0)"
+         VALUES ($1, $2, 'general', 'text', 'Welcome!', 0)",
     )
     .bind(cat_id.0)
     .bind(server_id)
@@ -167,13 +190,15 @@ pub async fn create_server(pool: &DbPool, name: &str, owner_id: Uuid, invite_cod
     Ok(server_id)
 }
 
-pub async fn join_server_by_invite(pool: &DbPool, user_id: Uuid, invite_code: &str) -> Result<Option<Uuid>, sqlx::Error> {
-    let server = sqlx::query_as::<_, (Uuid,)>(
-        "SELECT id FROM servers WHERE invite_code = $1"
-    )
-    .bind(invite_code)
-    .fetch_optional(pool)
-    .await?;
+pub async fn join_server_by_invite(
+    pool: &DbPool,
+    user_id: Uuid,
+    invite_code: &str,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let server = sqlx::query_as::<_, (Uuid,)>("SELECT id FROM servers WHERE invite_code = $1")
+        .bind(invite_code)
+        .fetch_optional(pool)
+        .await?;
 
     if let Some((server_id,)) = server {
         sqlx::query(
@@ -189,9 +214,12 @@ pub async fn join_server_by_invite(pool: &DbPool, user_id: Uuid, invite_code: &s
     }
 }
 
-async fn get_server_categories(pool: &DbPool, server_id: Uuid) -> Result<Vec<CategoryPayload>, sqlx::Error> {
+async fn get_server_categories(
+    pool: &DbPool,
+    server_id: Uuid,
+) -> Result<Vec<CategoryPayload>, sqlx::Error> {
     let cat_rows = sqlx::query_as::<_, CategoryRow>(
-        "SELECT id, name FROM categories WHERE server_id = $1 ORDER BY position"
+        "SELECT id, name FROM categories WHERE server_id = $1 ORDER BY position",
     )
     .bind(server_id)
     .fetch_all(pool)
@@ -209,46 +237,61 @@ async fn get_server_categories(pool: &DbPool, server_id: Uuid) -> Result<Vec<Cat
         categories.push(CategoryPayload {
             id: cat.id,
             name: cat.name,
-            channels: channels.into_iter().map(|ch| ChannelPayload {
-                id: ch.id,
-                name: ch.name,
-                channel_type: parse_channel_type(&ch.channel_type),
-                topic: ch.topic,
-            }).collect(),
+            channels: channels
+                .into_iter()
+                .map(|ch| ChannelPayload {
+                    id: ch.id,
+                    name: ch.name,
+                    channel_type: parse_channel_type(&ch.channel_type),
+                    topic: ch.topic,
+                })
+                .collect(),
         });
     }
     Ok(categories)
 }
 
-async fn get_server_members(pool: &DbPool, server_id: Uuid) -> Result<Vec<MemberPayload>, sqlx::Error> {
+async fn get_server_members(
+    pool: &DbPool,
+    server_id: Uuid,
+) -> Result<Vec<MemberPayload>, sqlx::Error> {
     let rows = sqlx::query_as::<_, MemberRow>(
         "SELECT u.id, u.username, u.avatar_url, sm.role, u.status, u.custom_status
          FROM users u
          JOIN server_members sm ON sm.user_id = u.id
          WHERE sm.server_id = $1
-         ORDER BY sm.role, u.username"
+         ORDER BY sm.role, u.username",
     )
     .bind(server_id)
     .fetch_all(pool)
     .await?;
 
-    Ok(rows.into_iter().map(|r| MemberPayload {
-        user_id: r.id,
-        username: r.username,
-        avatar_url: r.avatar_url,
-        role: parse_role(&r.role),
-        status: parse_status(&r.status),
-        custom_status: r.custom_status,
-    }).collect())
+    Ok(rows
+        .into_iter()
+        .map(|r| MemberPayload {
+            user_id: r.id,
+            username: r.username,
+            avatar_url: r.avatar_url,
+            role: parse_role(&r.role),
+            status: parse_status(&r.status),
+            custom_status: r.custom_status,
+        })
+        .collect())
 }
 
 // ── Message queries ──
 
-pub async fn create_message(pool: &DbPool, channel_id: Uuid, author_id: Uuid, content: &str, reply_to_id: Option<Uuid>) -> Result<Message, sqlx::Error> {
+pub async fn create_message(
+    pool: &DbPool,
+    channel_id: Uuid,
+    author_id: Uuid,
+    content: &str,
+    reply_to_id: Option<Uuid>,
+) -> Result<Message, sqlx::Error> {
     let row = sqlx::query_as::<_, MessageRow>(
         "INSERT INTO messages (channel_id, author_id, content, reply_to_id)
          VALUES ($1, $2, $3, $4)
-         RETURNING id, channel_id, author_id, content, edited_at, created_at, reply_to_id"
+         RETURNING id, channel_id, author_id, content, edited_at, created_at, reply_to_id",
     )
     .bind(channel_id)
     .bind(author_id)
@@ -258,7 +301,7 @@ pub async fn create_message(pool: &DbPool, channel_id: Uuid, author_id: Uuid, co
     .await?;
 
     let author = sqlx::query_as::<_, (String, Option<String>)>(
-        "SELECT username, avatar_url FROM users WHERE id = $1"
+        "SELECT username, avatar_url FROM users WHERE id = $1",
     )
     .bind(author_id)
     .fetch_one(pool)
@@ -316,14 +359,14 @@ pub async fn get_messages(
     let mut messages = Vec::new();
     for row in rows {
         let author = sqlx::query_as::<_, (String, Option<String>)>(
-            "SELECT username, avatar_url FROM users WHERE id = $1"
+            "SELECT username, avatar_url FROM users WHERE id = $1",
         )
         .bind(row.author_id)
         .fetch_one(pool)
         .await?;
 
         let pinned = sqlx::query_as::<_, (i64,)>(
-            "SELECT COUNT(*) FROM pinned_messages WHERE message_id = $1"
+            "SELECT COUNT(*) FROM pinned_messages WHERE message_id = $1",
         )
         .bind(row.id)
         .fetch_one(pool)
@@ -351,11 +394,16 @@ pub async fn get_messages(
     Ok(messages)
 }
 
-pub async fn edit_message(pool: &DbPool, message_id: Uuid, author_id: Uuid, content: &str) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+pub async fn edit_message(
+    pool: &DbPool,
+    message_id: Uuid,
+    author_id: Uuid,
+    content: &str,
+) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
     let result = sqlx::query_as::<_, (DateTime<Utc>,)>(
         "UPDATE messages SET content = $1, edited_at = NOW()
          WHERE id = $2 AND author_id = $3
-         RETURNING edited_at"
+         RETURNING edited_at",
     )
     .bind(content)
     .bind(message_id)
@@ -366,14 +414,16 @@ pub async fn edit_message(pool: &DbPool, message_id: Uuid, author_id: Uuid, cont
     Ok(result.map(|r| r.0))
 }
 
-pub async fn delete_message(pool: &DbPool, message_id: Uuid, author_id: Uuid) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query(
-        "DELETE FROM messages WHERE id = $1 AND author_id = $2"
-    )
-    .bind(message_id)
-    .bind(author_id)
-    .execute(pool)
-    .await?;
+pub async fn delete_message(
+    pool: &DbPool,
+    message_id: Uuid,
+    author_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM messages WHERE id = $1 AND author_id = $2")
+        .bind(message_id)
+        .bind(author_id)
+        .execute(pool)
+        .await?;
 
     Ok(result.rows_affected() > 0)
 }
@@ -389,7 +439,7 @@ pub async fn create_channel(
     } else {
         // Get first category of the server
         let row: (Uuid,) = sqlx::query_as(
-            "SELECT id FROM categories WHERE server_id = $1 ORDER BY position LIMIT 1"
+            "SELECT id FROM categories WHERE server_id = $1 ORDER BY position LIMIT 1",
         )
         .bind(server_id)
         .fetch_one(pool)
@@ -505,7 +555,11 @@ struct MessageRow {
 
 // ── Public key ──
 
-pub async fn save_public_key(pool: &DbPool, user_id: Uuid, public_key: &str) -> Result<(), sqlx::Error> {
+pub async fn save_public_key(
+    pool: &DbPool,
+    user_id: Uuid,
+    public_key: &str,
+) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE users SET public_key = $1 WHERE id = $2")
         .bind(public_key)
         .bind(user_id)
@@ -516,11 +570,15 @@ pub async fn save_public_key(pool: &DbPool, user_id: Uuid, public_key: &str) -> 
 
 // ── Friend requests ──
 
-pub async fn send_friend_request(pool: &DbPool, from_id: Uuid, to_id: Uuid) -> Result<(), sqlx::Error> {
+pub async fn send_friend_request(
+    pool: &DbPool,
+    from_id: Uuid,
+    to_id: Uuid,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO friend_requests (from_user_id, to_user_id, status)
          VALUES ($1, $2, 'pending')
-         ON CONFLICT (from_user_id, to_user_id) DO NOTHING"
+         ON CONFLICT (from_user_id, to_user_id) DO NOTHING",
     )
     .bind(from_id)
     .bind(to_id)
@@ -529,10 +587,14 @@ pub async fn send_friend_request(pool: &DbPool, from_id: Uuid, to_id: Uuid) -> R
     Ok(())
 }
 
-pub async fn accept_friend_request(pool: &DbPool, from_id: Uuid, to_id: Uuid) -> Result<bool, sqlx::Error> {
+pub async fn accept_friend_request(
+    pool: &DbPool,
+    from_id: Uuid,
+    to_id: Uuid,
+) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE friend_requests SET status = 'accepted'
-         WHERE from_user_id = $1 AND to_user_id = $2 AND status = 'pending'"
+         WHERE from_user_id = $1 AND to_user_id = $2 AND status = 'pending'",
     )
     .bind(from_id)
     .bind(to_id)
@@ -544,22 +606,28 @@ pub async fn accept_friend_request(pool: &DbPool, from_id: Uuid, to_id: Uuid) ->
     }
 
     // Create bidirectional friendship (smaller UUID first)
-    let (a, b) = if from_id < to_id { (from_id, to_id) } else { (to_id, from_id) };
-    sqlx::query(
-        "INSERT INTO friendships (user_a, user_b) VALUES ($1, $2) ON CONFLICT DO NOTHING"
-    )
-    .bind(a)
-    .bind(b)
-    .execute(pool)
-    .await?;
+    let (a, b) = if from_id < to_id {
+        (from_id, to_id)
+    } else {
+        (to_id, from_id)
+    };
+    sqlx::query("INSERT INTO friendships (user_a, user_b) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+        .bind(a)
+        .bind(b)
+        .execute(pool)
+        .await?;
 
     Ok(true)
 }
 
-pub async fn decline_friend_request(pool: &DbPool, from_id: Uuid, to_id: Uuid) -> Result<bool, sqlx::Error> {
+pub async fn decline_friend_request(
+    pool: &DbPool,
+    from_id: Uuid,
+    to_id: Uuid,
+) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "UPDATE friend_requests SET status = 'declined'
-         WHERE from_user_id = $1 AND to_user_id = $2 AND status = 'pending'"
+         WHERE from_user_id = $1 AND to_user_id = $2 AND status = 'pending'",
     )
     .bind(from_id)
     .bind(to_id)
@@ -568,7 +636,10 @@ pub async fn decline_friend_request(pool: &DbPool, from_id: Uuid, to_id: Uuid) -
     Ok(result.rows_affected() > 0)
 }
 
-pub async fn get_pending_friend_requests(pool: &DbPool, user_id: Uuid) -> Result<Vec<FriendRequestDetailRow>, sqlx::Error> {
+pub async fn get_pending_friend_requests(
+    pool: &DbPool,
+    user_id: Uuid,
+) -> Result<Vec<FriendRequestDetailRow>, sqlx::Error> {
     sqlx::query_as::<_, FriendRequestDetailRow>(
         "SELECT fr.from_user_id, u.username AS from_username, u.avatar_url AS from_avatar_url, fr.created_at
          FROM friend_requests fr
@@ -582,9 +653,13 @@ pub async fn get_pending_friend_requests(pool: &DbPool, user_id: Uuid) -> Result
 }
 
 pub async fn are_friends(pool: &DbPool, user_a: Uuid, user_b: Uuid) -> Result<bool, sqlx::Error> {
-    let (a, b) = if user_a < user_b { (user_a, user_b) } else { (user_b, user_a) };
+    let (a, b) = if user_a < user_b {
+        (user_a, user_b)
+    } else {
+        (user_b, user_a)
+    };
     let row = sqlx::query_as::<_, (i64,)>(
-        "SELECT COUNT(*) FROM friendships WHERE user_a = $1 AND user_b = $2"
+        "SELECT COUNT(*) FROM friendships WHERE user_a = $1 AND user_b = $2",
     )
     .bind(a)
     .bind(b)
@@ -599,7 +674,7 @@ pub async fn get_friends(pool: &DbPool, user_id: Uuid) -> Result<Vec<FriendRow>,
          FROM friendships f
          JOIN users u ON u.id = CASE WHEN f.user_a = $1 THEN f.user_b ELSE f.user_a END
          WHERE f.user_a = $1 OR f.user_b = $1
-         ORDER BY u.username"
+         ORDER BY u.username",
     )
     .bind(user_id)
     .fetch_all(pool)
@@ -616,7 +691,7 @@ pub async fn store_direct_message(
 ) -> Result<(Uuid, DateTime<Utc>), sqlx::Error> {
     let row = sqlx::query_as::<_, (Uuid, DateTime<Utc>)>(
         "INSERT INTO direct_messages (sender_id, recipient_id, encrypted_content)
-         VALUES ($1, $2, $3) RETURNING id, created_at"
+         VALUES ($1, $2, $3) RETURNING id, created_at",
     )
     .bind(sender_id)
     .bind(recipient_id)
@@ -654,7 +729,12 @@ fn parse_channel_type(s: &str) -> ChannelType {
 
 // ── Reactions ──
 
-pub async fn add_reaction(pool: &DbPool, message_id: Uuid, user_id: Uuid, emoji: &str) -> Result<bool, sqlx::Error> {
+pub async fn add_reaction(
+    pool: &DbPool,
+    message_id: Uuid,
+    user_id: Uuid,
+    emoji: &str,
+) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "INSERT INTO message_reactions (message_id, user_id, emoji) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING"
     )
@@ -666,9 +746,14 @@ pub async fn add_reaction(pool: &DbPool, message_id: Uuid, user_id: Uuid, emoji:
     Ok(result.rows_affected() > 0)
 }
 
-pub async fn remove_reaction(pool: &DbPool, message_id: Uuid, user_id: Uuid, emoji: &str) -> Result<bool, sqlx::Error> {
+pub async fn remove_reaction(
+    pool: &DbPool,
+    message_id: Uuid,
+    user_id: Uuid,
+    emoji: &str,
+) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
-        "DELETE FROM message_reactions WHERE message_id = $1 AND user_id = $2 AND emoji = $3"
+        "DELETE FROM message_reactions WHERE message_id = $1 AND user_id = $2 AND emoji = $3",
     )
     .bind(message_id)
     .bind(user_id)
@@ -680,7 +765,12 @@ pub async fn remove_reaction(pool: &DbPool, message_id: Uuid, user_id: Uuid, emo
 
 // ── Pins ──
 
-pub async fn pin_message(pool: &DbPool, channel_id: Uuid, message_id: Uuid, pinned_by: Uuid) -> Result<bool, sqlx::Error> {
+pub async fn pin_message(
+    pool: &DbPool,
+    channel_id: Uuid,
+    message_id: Uuid,
+    pinned_by: Uuid,
+) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "INSERT INTO pinned_messages (channel_id, message_id, pinned_by) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING"
     )
@@ -692,18 +782,24 @@ pub async fn pin_message(pool: &DbPool, channel_id: Uuid, message_id: Uuid, pinn
     Ok(result.rows_affected() > 0)
 }
 
-pub async fn unpin_message(pool: &DbPool, channel_id: Uuid, message_id: Uuid) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query(
-        "DELETE FROM pinned_messages WHERE channel_id = $1 AND message_id = $2"
-    )
-    .bind(channel_id)
-    .bind(message_id)
-    .execute(pool)
-    .await?;
+pub async fn unpin_message(
+    pool: &DbPool,
+    channel_id: Uuid,
+    message_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let result =
+        sqlx::query("DELETE FROM pinned_messages WHERE channel_id = $1 AND message_id = $2")
+            .bind(channel_id)
+            .bind(message_id)
+            .execute(pool)
+            .await?;
     Ok(result.rows_affected() > 0)
 }
 
-pub async fn get_pinned_messages(pool: &DbPool, channel_id: Uuid) -> Result<Vec<Message>, sqlx::Error> {
+pub async fn get_pinned_messages(
+    pool: &DbPool,
+    channel_id: Uuid,
+) -> Result<Vec<Message>, sqlx::Error> {
     let rows = sqlx::query_as::<_, MessageRow>(
         "SELECT m.id, m.channel_id, m.author_id, m.content, m.edited_at, m.created_at, m.reply_to_id
          FROM pinned_messages pm
@@ -718,7 +814,7 @@ pub async fn get_pinned_messages(pool: &DbPool, channel_id: Uuid) -> Result<Vec<
     let mut messages = Vec::new();
     for row in rows {
         let author = sqlx::query_as::<_, (String, Option<String>)>(
-            "SELECT username, avatar_url FROM users WHERE id = $1"
+            "SELECT username, avatar_url FROM users WHERE id = $1",
         )
         .bind(row.author_id)
         .fetch_one(pool)
@@ -743,19 +839,25 @@ pub async fn get_pinned_messages(pool: &DbPool, channel_id: Uuid) -> Result<Vec<
 }
 
 /// Get the channel_id for a message.
-pub async fn get_message_channel(pool: &DbPool, message_id: Uuid) -> Result<Option<Uuid>, sqlx::Error> {
-    let row = sqlx::query_as::<_, (Uuid,)>(
-        "SELECT channel_id FROM messages WHERE id = $1"
-    )
-    .bind(message_id)
-    .fetch_optional(pool)
-    .await?;
+pub async fn get_message_channel(
+    pool: &DbPool,
+    message_id: Uuid,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let row = sqlx::query_as::<_, (Uuid,)>("SELECT channel_id FROM messages WHERE id = $1")
+        .bind(message_id)
+        .fetch_optional(pool)
+        .await?;
     Ok(row.map(|r| r.0))
 }
 
 // ── Unread tracking ──
 
-pub async fn ack_message(pool: &DbPool, user_id: Uuid, channel_id: Uuid, message_id: Uuid) -> Result<(), sqlx::Error> {
+pub async fn ack_message(
+    pool: &DbPool,
+    user_id: Uuid,
+    channel_id: Uuid,
+    message_id: Uuid,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO channel_read_state (user_id, channel_id, last_read_message_id, last_read_at, mention_count)
          VALUES ($1, $2, $3, NOW(), 0)
@@ -769,7 +871,10 @@ pub async fn ack_message(pool: &DbPool, user_id: Uuid, channel_id: Uuid, message
     Ok(())
 }
 
-pub async fn get_unread_state(pool: &DbPool, user_id: Uuid) -> Result<Vec<ChannelUnreadPayload>, sqlx::Error> {
+pub async fn get_unread_state(
+    pool: &DbPool,
+    user_id: Uuid,
+) -> Result<Vec<ChannelUnreadPayload>, sqlx::Error> {
     let rows = sqlx::query_as::<_, UnreadRow>(
         "SELECT sm.server_id, c.id AS channel_id,
                 rs.last_read_message_id,
@@ -787,12 +892,15 @@ pub async fn get_unread_state(pool: &DbPool, user_id: Uuid) -> Result<Vec<Channe
     .fetch_all(pool)
     .await?;
 
-    Ok(rows.into_iter().map(|r| ChannelUnreadPayload {
-        channel_id: r.channel_id,
-        last_read_message_id: r.last_read_message_id,
-        mention_count: r.mention_count as u32,
-        unread_count: r.unread_count as u32,
-    }).collect())
+    Ok(rows
+        .into_iter()
+        .map(|r| ChannelUnreadPayload {
+            channel_id: r.channel_id,
+            last_read_message_id: r.last_read_message_id,
+            mention_count: r.mention_count as u32,
+            unread_count: r.unread_count as u32,
+        })
+        .collect())
 }
 
 #[derive(sqlx::FromRow)]
@@ -807,37 +915,52 @@ struct UnreadRow {
 
 // ── Server / channel management ──
 
-pub async fn edit_server(pool: &DbPool, server_id: Uuid, name: Option<&str>, icon_url: Option<&str>) -> Result<(), sqlx::Error> {
+pub async fn edit_server(
+    pool: &DbPool,
+    server_id: Uuid,
+    name: Option<&str>,
+    icon_url: Option<&str>,
+) -> Result<(), sqlx::Error> {
     if let Some(name) = name {
         sqlx::query("UPDATE servers SET name = $1 WHERE id = $2")
-            .bind(name).bind(server_id).execute(pool).await?;
+            .bind(name)
+            .bind(server_id)
+            .execute(pool)
+            .await?;
     }
     if let Some(icon) = icon_url {
         sqlx::query("UPDATE servers SET icon_url = $1 WHERE id = $2")
-            .bind(icon).bind(server_id).execute(pool).await?;
+            .bind(icon)
+            .bind(server_id)
+            .execute(pool)
+            .await?;
     }
     Ok(())
 }
 
 pub async fn delete_server(pool: &DbPool, server_id: Uuid) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM servers WHERE id = $1")
-        .bind(server_id).execute(pool).await?;
+        .bind(server_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
 pub async fn get_server_owner(pool: &DbPool, server_id: Uuid) -> Result<Option<Uuid>, sqlx::Error> {
-    let row = sqlx::query_as::<_, (Uuid,)>(
-        "SELECT owner_id FROM servers WHERE id = $1"
-    )
-    .bind(server_id)
-    .fetch_optional(pool)
-    .await?;
+    let row = sqlx::query_as::<_, (Uuid,)>("SELECT owner_id FROM servers WHERE id = $1")
+        .bind(server_id)
+        .fetch_optional(pool)
+        .await?;
     Ok(row.map(|r| r.0))
 }
 
-pub async fn get_member_role(pool: &DbPool, user_id: Uuid, server_id: Uuid) -> Result<Option<String>, sqlx::Error> {
+pub async fn get_member_role(
+    pool: &DbPool,
+    user_id: Uuid,
+    server_id: Uuid,
+) -> Result<Option<String>, sqlx::Error> {
     let row = sqlx::query_as::<_, (String,)>(
-        "SELECT role FROM server_members WHERE user_id = $1 AND server_id = $2"
+        "SELECT role FROM server_members WHERE user_id = $1 AND server_id = $2",
     )
     .bind(user_id)
     .bind(server_id)
@@ -846,7 +969,11 @@ pub async fn get_member_role(pool: &DbPool, user_id: Uuid, server_id: Uuid) -> R
     Ok(row.map(|r| r.0))
 }
 
-pub async fn create_category(pool: &DbPool, server_id: Uuid, name: &str) -> Result<CategoryPayload, sqlx::Error> {
+pub async fn create_category(
+    pool: &DbPool,
+    server_id: Uuid,
+    name: &str,
+) -> Result<CategoryPayload, sqlx::Error> {
     let row = sqlx::query_as::<_, (Uuid,)>(
         "INSERT INTO categories (server_id, name, position)
          VALUES ($1, $2, (SELECT COALESCE(MAX(position), 0) + 1 FROM categories WHERE server_id = $1))
@@ -866,75 +993,102 @@ pub async fn create_category(pool: &DbPool, server_id: Uuid, name: &str) -> Resu
 
 pub async fn delete_channel(pool: &DbPool, channel_id: Uuid) -> Result<Option<Uuid>, sqlx::Error> {
     // Return server_id before deleting
-    let row = sqlx::query_as::<_, (Uuid,)>(
-        "SELECT server_id FROM channels WHERE id = $1"
-    )
-    .bind(channel_id)
-    .fetch_optional(pool)
-    .await?;
+    let row = sqlx::query_as::<_, (Uuid,)>("SELECT server_id FROM channels WHERE id = $1")
+        .bind(channel_id)
+        .fetch_optional(pool)
+        .await?;
 
     if let Some((server_id,)) = row {
         sqlx::query("DELETE FROM channels WHERE id = $1")
-            .bind(channel_id).execute(pool).await?;
+            .bind(channel_id)
+            .execute(pool)
+            .await?;
         Ok(Some(server_id))
     } else {
         Ok(None)
     }
 }
 
-pub async fn edit_channel(pool: &DbPool, channel_id: Uuid, name: Option<&str>, topic: Option<&str>) -> Result<(), sqlx::Error> {
+pub async fn edit_channel(
+    pool: &DbPool,
+    channel_id: Uuid,
+    name: Option<&str>,
+    topic: Option<&str>,
+) -> Result<(), sqlx::Error> {
     if let Some(name) = name {
         sqlx::query("UPDATE channels SET name = $1 WHERE id = $2")
-            .bind(name).bind(channel_id).execute(pool).await?;
+            .bind(name)
+            .bind(channel_id)
+            .execute(pool)
+            .await?;
     }
     if let Some(topic) = topic {
         sqlx::query("UPDATE channels SET topic = $1 WHERE id = $2")
-            .bind(topic).bind(channel_id).execute(pool).await?;
+            .bind(topic)
+            .bind(channel_id)
+            .execute(pool)
+            .await?;
     }
     Ok(())
 }
 
-pub async fn get_channel_server(pool: &DbPool, channel_id: Uuid) -> Result<Option<Uuid>, sqlx::Error> {
-    let row = sqlx::query_as::<_, (Uuid,)>(
-        "SELECT server_id FROM channels WHERE id = $1"
-    )
-    .bind(channel_id)
-    .fetch_optional(pool)
-    .await?;
+pub async fn get_channel_server(
+    pool: &DbPool,
+    channel_id: Uuid,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let row = sqlx::query_as::<_, (Uuid,)>("SELECT server_id FROM channels WHERE id = $1")
+        .bind(channel_id)
+        .fetch_optional(pool)
+        .await?;
     Ok(row.map(|r| r.0))
 }
 
-pub async fn leave_server(pool: &DbPool, user_id: Uuid, server_id: Uuid) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query(
-        "DELETE FROM server_members WHERE user_id = $1 AND server_id = $2"
-    )
-    .bind(user_id)
-    .bind(server_id)
-    .execute(pool)
-    .await?;
+pub async fn leave_server(
+    pool: &DbPool,
+    user_id: Uuid,
+    server_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM server_members WHERE user_id = $1 AND server_id = $2")
+        .bind(user_id)
+        .bind(server_id)
+        .execute(pool)
+        .await?;
     Ok(result.rows_affected() > 0)
 }
 
-pub async fn get_invite_code(pool: &DbPool, server_id: Uuid) -> Result<Option<String>, sqlx::Error> {
-    let row = sqlx::query_as::<_, (Option<String>,)>(
-        "SELECT invite_code FROM servers WHERE id = $1"
-    )
-    .bind(server_id)
-    .fetch_optional(pool)
-    .await?;
+pub async fn get_invite_code(
+    pool: &DbPool,
+    server_id: Uuid,
+) -> Result<Option<String>, sqlx::Error> {
+    let row =
+        sqlx::query_as::<_, (Option<String>,)>("SELECT invite_code FROM servers WHERE id = $1")
+            .bind(server_id)
+            .fetch_optional(pool)
+            .await?;
     Ok(row.and_then(|r| r.0))
 }
 
 // ── User profile ──
 
-pub async fn update_profile(pool: &DbPool, user_id: Uuid, display_name: Option<&str>, custom_status: Option<&str>) -> Result<(), sqlx::Error> {
+pub async fn update_profile(
+    pool: &DbPool,
+    user_id: Uuid,
+    display_name: Option<&str>,
+    custom_status: Option<&str>,
+) -> Result<(), sqlx::Error> {
     if let Some(dn) = display_name {
         sqlx::query("UPDATE users SET display_name = $1 WHERE id = $2")
-            .bind(dn).bind(user_id).execute(pool).await?;
+            .bind(dn)
+            .bind(user_id)
+            .execute(pool)
+            .await?;
     }
     if let Some(cs) = custom_status {
         sqlx::query("UPDATE users SET custom_status = $1 WHERE id = $2")
-            .bind(cs).bind(user_id).execute(pool).await?;
+            .bind(cs)
+            .bind(user_id)
+            .execute(pool)
+            .await?;
     }
     Ok(())
 }
@@ -975,13 +1129,16 @@ pub async fn get_direct_messages(
         .await?
     };
 
-    let mut messages: Vec<DirectMessagePayload> = rows.into_iter().map(|r| DirectMessagePayload {
-        id: r.id,
-        sender_id: r.sender_id,
-        sender_username: r.sender_username,
-        encrypted_content: r.encrypted_content,
-        created_at: r.created_at,
-    }).collect();
+    let mut messages: Vec<DirectMessagePayload> = rows
+        .into_iter()
+        .map(|r| DirectMessagePayload {
+            id: r.id,
+            sender_id: r.sender_id,
+            sender_username: r.sender_username,
+            encrypted_content: r.encrypted_content,
+            created_at: r.created_at,
+        })
+        .collect();
 
     messages.reverse();
     Ok(messages)
@@ -1039,7 +1196,7 @@ pub async fn search_messages(
     let mut messages = Vec::new();
     for row in rows {
         let author = sqlx::query_as::<_, (String, Option<String>)>(
-            "SELECT username, avatar_url FROM users WHERE id = $1"
+            "SELECT username, avatar_url FROM users WHERE id = $1",
         )
         .bind(row.author_id)
         .fetch_one(pool)
@@ -1073,7 +1230,7 @@ pub async fn search_messages_count(
         sqlx::query_as::<_, (i64,)>(
             "SELECT COUNT(*) FROM messages m
              WHERE m.channel_id = $1
-               AND to_tsvector('english', m.content) @@ plainto_tsquery('english', $2)"
+               AND to_tsvector('english', m.content) @@ plainto_tsquery('english', $2)",
         )
         .bind(ch_id)
         .bind(query)
@@ -1084,7 +1241,7 @@ pub async fn search_messages_count(
             "SELECT COUNT(*) FROM messages m
              JOIN channels c ON c.id = m.channel_id
              WHERE c.server_id = $1
-               AND to_tsvector('english', m.content) @@ plainto_tsquery('english', $2)"
+               AND to_tsvector('english', m.content) @@ plainto_tsquery('english', $2)",
         )
         .bind(server_id)
         .bind(query)
@@ -1105,7 +1262,7 @@ pub async fn add_custom_emoji(
 ) -> Result<CustomEmojiPayload, sqlx::Error> {
     let row = sqlx::query_as::<_, (Uuid,)>(
         "INSERT INTO custom_emojis (server_id, name, image_url, uploaded_by)
-         VALUES ($1, $2, $3, $4) RETURNING id"
+         VALUES ($1, $2, $3, $4) RETURNING id",
     )
     .bind(server_id)
     .bind(name)
@@ -1122,18 +1279,23 @@ pub async fn add_custom_emoji(
     })
 }
 
-pub async fn remove_custom_emoji(pool: &DbPool, server_id: Uuid, emoji_id: Uuid) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query(
-        "DELETE FROM custom_emojis WHERE id = $1 AND server_id = $2"
-    )
-    .bind(emoji_id)
-    .bind(server_id)
-    .execute(pool)
-    .await?;
+pub async fn remove_custom_emoji(
+    pool: &DbPool,
+    server_id: Uuid,
+    emoji_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM custom_emojis WHERE id = $1 AND server_id = $2")
+        .bind(emoji_id)
+        .bind(server_id)
+        .execute(pool)
+        .await?;
     Ok(result.rows_affected() > 0)
 }
 
-pub async fn get_custom_emojis(pool: &DbPool, server_id: Uuid) -> Result<Vec<CustomEmojiPayload>, sqlx::Error> {
+pub async fn get_custom_emojis(
+    pool: &DbPool,
+    server_id: Uuid,
+) -> Result<Vec<CustomEmojiPayload>, sqlx::Error> {
     let rows = sqlx::query_as::<_, CustomEmojiRow>(
         "SELECT id, name, image_url, uploaded_by FROM custom_emojis WHERE server_id = $1 ORDER BY name"
     )
@@ -1141,12 +1303,15 @@ pub async fn get_custom_emojis(pool: &DbPool, server_id: Uuid) -> Result<Vec<Cus
     .fetch_all(pool)
     .await?;
 
-    Ok(rows.into_iter().map(|r| CustomEmojiPayload {
-        id: r.id,
-        name: r.name,
-        image_url: r.image_url,
-        uploaded_by: r.uploaded_by,
-    }).collect())
+    Ok(rows
+        .into_iter()
+        .map(|r| CustomEmojiPayload {
+            id: r.id,
+            name: r.name,
+            image_url: r.image_url,
+            uploaded_by: r.uploaded_by,
+        })
+        .collect())
 }
 
 #[derive(sqlx::FromRow)]
@@ -1159,7 +1324,11 @@ struct CustomEmojiRow {
 
 // ── Mention tracking ──
 
-pub async fn increment_mention_count(pool: &DbPool, user_id: Uuid, channel_id: Uuid) -> Result<(), sqlx::Error> {
+pub async fn increment_mention_count(
+    pool: &DbPool,
+    user_id: Uuid,
+    channel_id: Uuid,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO channel_read_state (user_id, channel_id, last_read_message_id, last_read_at, mention_count)
          VALUES ($1, $2, NULL, NOW(), 1)
@@ -1185,7 +1354,7 @@ pub async fn add_attachment(
 ) -> Result<Uuid, sqlx::Error> {
     let row = sqlx::query_as::<_, (Uuid,)>(
         "INSERT INTO attachments (message_id, filename, url, content_type, size_bytes)
-         VALUES ($1, $2, $3, $4, $5) RETURNING id"
+         VALUES ($1, $2, $3, $4, $5) RETURNING id",
     )
     .bind(message_id)
     .bind(filename)
@@ -1198,7 +1367,10 @@ pub async fn add_attachment(
 }
 
 #[allow(dead_code)]
-pub async fn get_message_attachments(pool: &DbPool, message_id: Uuid) -> Result<Vec<artemis_core::models::message::Attachment>, sqlx::Error> {
+pub async fn get_message_attachments(
+    pool: &DbPool,
+    message_id: Uuid,
+) -> Result<Vec<artemis_core::models::message::Attachment>, sqlx::Error> {
     let rows = sqlx::query_as::<_, AttachmentRow>(
         "SELECT id, filename, url, content_type, size_bytes FROM attachments WHERE message_id = $1 ORDER BY uploaded_at"
     )
@@ -1206,13 +1378,16 @@ pub async fn get_message_attachments(pool: &DbPool, message_id: Uuid) -> Result<
     .fetch_all(pool)
     .await?;
 
-    Ok(rows.into_iter().map(|r| artemis_core::models::message::Attachment {
-        id: r.id,
-        filename: r.filename,
-        url: r.url,
-        content_type: r.content_type,
-        size_bytes: r.size_bytes as u64,
-    }).collect())
+    Ok(rows
+        .into_iter()
+        .map(|r| artemis_core::models::message::Attachment {
+            id: r.id,
+            filename: r.filename,
+            url: r.url,
+            content_type: r.content_type,
+            size_bytes: r.size_bytes as u64,
+        })
+        .collect())
 }
 
 #[derive(sqlx::FromRow)]
@@ -1226,13 +1401,17 @@ struct AttachmentRow {
 }
 
 /// Get user IDs for server members by username (for @mention resolution).
-pub async fn resolve_mentions(pool: &DbPool, server_id: Uuid, usernames: &[String]) -> Result<Vec<(String, Uuid)>, sqlx::Error> {
+pub async fn resolve_mentions(
+    pool: &DbPool,
+    server_id: Uuid,
+    usernames: &[String],
+) -> Result<Vec<(String, Uuid)>, sqlx::Error> {
     let mut results = Vec::new();
     for username in usernames {
         let row = sqlx::query_as::<_, (Uuid,)>(
             "SELECT u.id FROM users u
              JOIN server_members sm ON sm.user_id = u.id
-             WHERE sm.server_id = $1 AND u.username = $2"
+             WHERE sm.server_id = $1 AND u.username = $2",
         )
         .bind(server_id)
         .bind(username)

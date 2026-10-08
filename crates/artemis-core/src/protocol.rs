@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::models::message::Message;
-use crate::models::user::{UserStatus, MemberRole};
+use crate::models::user::{MemberRole, UserStatus};
 
 /// Events sent FROM client TO server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,10 +22,7 @@ pub enum ClientEvent {
     },
 
     /// Edit an existing message.
-    EditMessage {
-        message_id: Uuid,
-        content: String,
-    },
+    EditMessage { message_id: Uuid, content: String },
 
     /// Delete a message.
     DeleteMessage { message_id: Uuid },
@@ -54,21 +51,13 @@ pub enum ClientEvent {
     },
 
     // ── Reactions ──
-
     /// Add a reaction to a message.
-    AddReaction {
-        message_id: Uuid,
-        emoji: String,
-    },
+    AddReaction { message_id: Uuid, emoji: String },
 
     /// Remove own reaction from a message.
-    RemoveReaction {
-        message_id: Uuid,
-        emoji: String,
-    },
+    RemoveReaction { message_id: Uuid, emoji: String },
 
     // ── Pins ──
-
     /// Pin a message in a channel.
     PinMessage { message_id: Uuid },
 
@@ -79,15 +68,10 @@ pub enum ClientEvent {
     FetchPinnedMessages { channel_id: Uuid },
 
     // ── Unread tracking ──
-
     /// Mark a channel as read up to a message.
-    AckMessage {
-        channel_id: Uuid,
-        message_id: Uuid,
-    },
+    AckMessage { channel_id: Uuid, message_id: Uuid },
 
     // ── Server / channel management ──
-
     /// Edit server properties (name, icon).
     EditServer {
         server_id: Uuid,
@@ -99,10 +83,7 @@ pub enum ClientEvent {
     DeleteServer { server_id: Uuid },
 
     /// Create a new category in a server.
-    CreateCategory {
-        server_id: Uuid,
-        name: String,
-    },
+    CreateCategory { server_id: Uuid, name: String },
 
     /// Delete a channel.
     DeleteChannel { channel_id: Uuid },
@@ -121,7 +102,6 @@ pub enum ClientEvent {
     GetInviteCode { server_id: Uuid },
 
     // ── User profile ──
-
     /// Update own profile.
     UpdateProfile {
         display_name: Option<String>,
@@ -129,7 +109,6 @@ pub enum ClientEvent {
     },
 
     // ── DM history ──
-
     /// Fetch DM history with a friend.
     FetchDirectMessages {
         friend_id: Uuid,
@@ -138,7 +117,6 @@ pub enum ClientEvent {
     },
 
     // ── Friend / DM / E2E relay ──
-
     /// Publish own public key to the server.
     PublishPublicKey { public_key: String },
 
@@ -164,7 +142,6 @@ pub enum ClientEvent {
     FetchFriendRequests,
 
     // ── Search ──
-
     /// Search messages in a channel (or server-wide if channel_id is None).
     SearchMessages {
         server_id: Uuid,
@@ -174,7 +151,6 @@ pub enum ClientEvent {
     },
 
     // ── Custom emojis ──
-
     /// Add a custom emoji to a server.
     AddCustomEmoji {
         server_id: Uuid,
@@ -183,15 +159,10 @@ pub enum ClientEvent {
     },
 
     /// Remove a custom emoji from a server.
-    RemoveCustomEmoji {
-        server_id: Uuid,
-        emoji_id: Uuid,
-    },
+    RemoveCustomEmoji { server_id: Uuid, emoji_id: Uuid },
 
     /// Fetch all custom emojis for a server.
-    FetchCustomEmojis {
-        server_id: Uuid,
-    },
+    FetchCustomEmojis { server_id: Uuid },
 }
 
 /// Events sent FROM server TO client.
@@ -236,10 +207,7 @@ pub enum ServerEvent {
     },
 
     /// A user's presence changed.
-    PresenceUpdate {
-        user_id: Uuid,
-        status: UserStatus,
-    },
+    PresenceUpdate { user_id: Uuid, status: UserStatus },
 
     /// A user joined the server.
     MemberJoined {
@@ -251,16 +219,12 @@ pub enum ServerEvent {
     },
 
     /// A user left the server.
-    MemberLeft {
-        server_id: Uuid,
-        user_id: Uuid,
-    },
+    MemberLeft { server_id: Uuid, user_id: Uuid },
 
     /// Server error.
     Error { message: String },
 
     // ── Reactions ──
-
     /// A reaction was added to a message.
     ReactionAdded {
         message_id: Uuid,
@@ -276,7 +240,6 @@ pub enum ServerEvent {
     },
 
     // ── Pins ──
-
     /// A message was pinned.
     MessagePinned {
         channel_id: Uuid,
@@ -285,10 +248,7 @@ pub enum ServerEvent {
     },
 
     /// A message was unpinned.
-    MessageUnpinned {
-        channel_id: Uuid,
-        message_id: Uuid,
-    },
+    MessageUnpinned { channel_id: Uuid, message_id: Uuid },
 
     /// Pinned messages list for a channel.
     PinnedMessages {
@@ -297,14 +257,10 @@ pub enum ServerEvent {
     },
 
     // ── Unread ──
-
     /// Unread state for channels after auth.
-    UnreadState {
-        channels: Vec<ChannelUnreadPayload>,
-    },
+    UnreadState { channels: Vec<ChannelUnreadPayload> },
 
     // ── Server / channel management ──
-
     /// A server was updated.
     ServerUpdated {
         server_id: Uuid,
@@ -323,10 +279,7 @@ pub enum ServerEvent {
     },
 
     /// A channel was deleted.
-    ChannelDeleted {
-        server_id: Uuid,
-        channel_id: Uuid,
-    },
+    ChannelDeleted { server_id: Uuid, channel_id: Uuid },
 
     /// A channel was updated.
     ChannelUpdated {
@@ -348,7 +301,6 @@ pub enum ServerEvent {
     },
 
     // ── User profile ──
-
     /// A user's profile was updated.
     ProfileUpdated {
         user_id: Uuid,
@@ -357,7 +309,6 @@ pub enum ServerEvent {
     },
 
     // ── DM history ──
-
     /// DM message history response.
     DirectMessageHistory {
         friend_id: Uuid,
@@ -366,7 +317,6 @@ pub enum ServerEvent {
     },
 
     // ── Friend / DM / E2E relay ──
-
     /// Own public key was saved.
     PublicKeyAcknowledged,
 
@@ -404,13 +354,9 @@ pub enum ServerEvent {
     },
 
     /// A friend's presence changed.
-    FriendPresenceUpdate {
-        user_id: Uuid,
-        status: UserStatus,
-    },
+    FriendPresenceUpdate { user_id: Uuid, status: UserStatus },
 
     // ── Search ──
-
     /// Search results for a query.
     SearchResults {
         query: String,
@@ -419,7 +365,6 @@ pub enum ServerEvent {
     },
 
     // ── Custom emojis ──
-
     /// A custom emoji was added to a server.
     CustomEmojiAdded {
         server_id: Uuid,
@@ -427,10 +372,7 @@ pub enum ServerEvent {
     },
 
     /// A custom emoji was removed from a server.
-    CustomEmojiRemoved {
-        server_id: Uuid,
-        emoji_id: Uuid,
-    },
+    CustomEmojiRemoved { server_id: Uuid, emoji_id: Uuid },
 
     /// Custom emojis list for a server.
     CustomEmojiList {
@@ -536,7 +478,11 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let parsed: ClientEvent = serde_json::from_str(&json).unwrap();
         match parsed {
-            ClientEvent::SendMessage { channel_id, content, .. } => {
+            ClientEvent::SendMessage {
+                channel_id,
+                content,
+                ..
+            } => {
                 assert_eq!(channel_id, Uuid::nil());
                 assert_eq!(content, "hello");
             }
@@ -660,7 +606,11 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let parsed: ServerEvent = serde_json::from_str(&json).unwrap();
         match parsed {
-            ServerEvent::SearchResults { query, total_count, messages } => {
+            ServerEvent::SearchResults {
+                query,
+                total_count,
+                messages,
+            } => {
                 assert_eq!(query, "hello");
                 assert_eq!(total_count, 0);
                 assert!(messages.is_empty());

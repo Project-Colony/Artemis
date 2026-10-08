@@ -3,8 +3,8 @@ use iced::widget::{button, container, row, scrollable, text, Column, Space};
 use iced::{Border, Element, Length, Padding};
 use uuid::Uuid;
 
-use artemis_core::protocol::ServerPayload;
 use crate::theme::{colors, icons};
+use artemis_core::protocol::ServerPayload;
 
 #[derive(Debug, Clone)]
 pub enum ChannelSidebarMsg {
