@@ -1,101 +1,62 @@
 # Artemis
 
-A decentralized, privacy-first chat application built in Rust with a hybrid P2P and relay architecture.
+**A chat application in Rust: an iced desktop client and an Axum + PostgreSQL relay server.**
 
-## Features
+Artemis aims to be a Discord/Revolt-style chat with servers, channels, friends and
+end-to-end encrypted direct messages, signed in with a GitHub account.
 
-- **GitHub OAuth** authentication (Device Flow for desktop)
-- **Real-time messaging** via WebSocket relay
-- **End-to-end encrypted DMs** using X25519 + ChaCha20-Poly1305
-- **P2P connections** via QUIC transport with GitHub Gist-based signaling
-- **Server/channel organization** (Discord/Revolt-style)
-- **Friend system** with requests, presence, and encrypted direct messages
-- **Desktop GUI** built with [iced](https://iced.rs) (dark theme, Revolt-style)
+## Status
 
-## Architecture
+Early prototype, not ready for use. What works and what does not:
+
+- The desktop client runs and has a demo mode with sample servers, channels and messages.
+- Signing in from the desktop client does not reach a working session yet. The client
+  sends its GitHub token to the relay, but the relay only accepts the tokens it issues
+  through its own web OAuth callback.
+- The relay URL is fixed to `http://localhost:3000` (plain WebSocket, no TLS).
+- A new encryption key pair is generated at every sign-in, so older direct messages
+  cannot be decrypted after a restart.
+- A direct message is sent unencrypted when the friend has not published a public key.
+- The `artemis-p2p` crate (QUIC transport, GitHub Gist signaling) is not wired into the
+  client. Only its key exchange and encryption code is used.
+
+## Layout
 
 ```
 crates/
-  artemis-client/    # Desktop GUI (iced)
-  artemis-server/    # Backend API + WebSocket relay (Axum + PostgreSQL)
-  artemis-core/      # Shared models and protocol definitions
-  artemis-auth/      # GitHub OAuth integration
-  artemis-p2p/       # P2P networking (QUIC, crypto, signaling)
+  artemis-client/    desktop client (iced), binary "artemis"
+  artemis-server/    relay server (Axum + PostgreSQL), binary "artemis-server"
+  artemis-core/      shared models and wire protocol
+  artemis-auth/      GitHub OAuth
+  artemis-p2p/       P2P networking and encryption (mostly unused)
 ```
 
-**Hybrid model:** Messages can be relayed through the server or sent directly peer-to-peer. DMs are always end-to-end encrypted regardless of transport.
+## Build from source
 
-## Prerequisites
-
-- [Rust](https://rustup.rs/) (stable)
-- [PostgreSQL](https://www.postgresql.org/) 16+ (or Docker)
-- A [GitHub OAuth App](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app) (for authentication)
-
-## Quick Start
-
-### 1. Database
-
-Start PostgreSQL with Docker:
+Requires a stable [Rust](https://rustup.rs/) toolchain.
 
 ```bash
-docker compose up -d
+cargo build --release --workspace
 ```
 
-Or configure your own instance and set `DATABASE_URL`.
-
-### 2. Environment
-
-```bash
-cp .env.example .env
-# Edit .env with your GitHub OAuth credentials
-```
-
-### 3. Server
-
-```bash
-cargo run --bin artemis-server
-```
-
-### 4. Client
+The client runs on its own:
 
 ```bash
 cargo run --bin artemis
 ```
 
-## Configuration
+The relay server needs PostgreSQL 16 or later (`docker compose up -d` starts one) and
+reads its settings from environment variables (see `.env.example`): `DATABASE_URL`,
+`BIND_ADDR`, `BASE_URL`, `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET`.
 
-| Variable | Default | Description |
-|---|---|---|
-| `DATABASE_URL` | `postgres://artemis:artemis@localhost:5432/artemis` | PostgreSQL connection string |
-| `BIND_ADDR` | `0.0.0.0:3000` | Server listen address |
-| `BASE_URL` | `http://localhost:3000` | Public server URL |
-| `GITHUB_CLIENT_ID` | — | GitHub OAuth App client ID |
-| `GITHUB_CLIENT_SECRET` | — | GitHub OAuth App client secret |
-
-## API
-
-### REST
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/health` | Health check |
-| `GET` | `/auth/github` | GitHub OAuth redirect |
-| `GET` | `/api/v1/servers` | List user's servers |
-| `POST` | `/api/v1/servers` | Create a server |
-| `GET` | `/api/v1/channels/{id}/messages` | Fetch message history |
-| `GET` | `/api/v1/me` | Current user profile |
-
-### WebSocket
-
-Connect to `/ws` with an auth token. See `crates/artemis-core/src/protocol.rs` for the full event protocol.
-
-## Tech Stack
-
-- **Backend:** Axum, PostgreSQL, SQLx, Tokio
-- **Frontend:** iced (Rust GUI framework)
-- **P2P:** QUIC (quinn), rustls, X25519-dalek, ChaCha20-Poly1305
-- **Auth:** GitHub OAuth 2.0 Device Flow
+```bash
+cargo run --bin artemis-server
+```
 
 ## License
 
-[MIT](LICENSE)
+Artemis is free software, licensed under the
+[GNU General Public License v3.0 or later](LICENSE).
+
+The bundled JetBrains Mono Nerd Font files in `crates/artemis-client/assets/fonts/`
+are distributed under the SIL Open Font License 1.1.
