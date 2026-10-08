@@ -36,9 +36,9 @@ pub fn view(state: &LoginState) -> Element<'_, LoginMsg> {
 
     let mut form = column![
         title,
-        Space::with_height(4),
+        Space::new().height(4),
         subtitle,
-        Space::with_height(32),
+        Space::new().height(32),
     ]
     .align_x(Horizontal::Center)
     .width(400);
@@ -78,7 +78,7 @@ pub fn view(state: &LoginState) -> Element<'_, LoginMsg> {
             });
 
             form = form.push(github_btn);
-            form = form.push(Space::with_height(12));
+            form = form.push(Space::new().height(12));
 
             let mock_btn = button(
                 container(
@@ -111,7 +111,7 @@ pub fn view(state: &LoginState) -> Element<'_, LoginMsg> {
 
             form = form.push(mock_btn);
 
-            form = form.push(Space::with_height(20));
+            form = form.push(Space::new().height(20));
             form = form.push(
                 text(format!(
                     "{} No server needed \u{2014} connect directly with friends",
@@ -131,7 +131,7 @@ pub fn view(state: &LoginState) -> Element<'_, LoginMsg> {
                     .size(14)
                     .color(colors::TEXT_MUTED),
             );
-            form = form.push(Space::with_height(16));
+            form = form.push(Space::new().height(16));
             form = form.push(
                 container(
                     text(user_code)
@@ -151,19 +151,19 @@ pub fn view(state: &LoginState) -> Element<'_, LoginMsg> {
                     ..container::Style::default()
                 }),
             );
-            form = form.push(Space::with_height(12));
+            form = form.push(Space::new().height(12));
             form = form.push(
                 text(format!("{} Go to: {}", icons::GLOBE, verification_uri))
                     .size(12)
                     .color(colors::ACCENT),
             );
-            form = form.push(Space::with_height(8));
+            form = form.push(Space::new().height(8));
             form = form.push(
                 text("Your browser should open automatically...")
                     .size(11)
                     .color(colors::TEXT_TIMESTAMP),
             );
-            form = form.push(Space::with_height(16));
+            form = form.push(Space::new().height(16));
             form = form.push(
                 text("Waiting for authorization...")
                     .size(13)
@@ -185,7 +185,7 @@ pub fn view(state: &LoginState) -> Element<'_, LoginMsg> {
                     .size(14)
                     .color(colors::ACCENT),
             );
-            form = form.push(Space::with_height(8));
+            form = form.push(Space::new().height(8));
             form = form.push(
                 text("Generating keys & configuring signaling")
                     .size(12)
@@ -195,7 +195,7 @@ pub fn view(state: &LoginState) -> Element<'_, LoginMsg> {
 
         LoginState::Error(err) => {
             form = form.push(text(err).size(13).color(iced::color!(0xEF, 0x44, 0x44)));
-            form = form.push(Space::with_height(16));
+            form = form.push(Space::new().height(16));
 
             let retry_btn = button(
                 container(

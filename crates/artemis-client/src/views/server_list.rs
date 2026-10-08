@@ -68,7 +68,7 @@ fn home_button<'a>(is_home: bool) -> Element<'a, ServerListMsg> {
 
 fn separator<'a>() -> Element<'a, ServerListMsg> {
     container(
-        container(Space::with_height(0))
+        container(Space::new().height(0))
             .width(40)
             .height(2)
             .style(|_| container::Style {

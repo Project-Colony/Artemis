@@ -33,7 +33,7 @@ pub fn view(members: &[artemis_core::ServerMember]) -> Element<'_, MemberListMsg
         for member in &founders {
             content = content.push(member_entry(member, colors::ROLE_FOUNDER));
         }
-        content = content.push(Space::with_height(8));
+        content = content.push(Space::new().height(8));
     }
 
     if !moderators.is_empty() {
@@ -41,7 +41,7 @@ pub fn view(members: &[artemis_core::ServerMember]) -> Element<'_, MemberListMsg
         for member in &moderators {
             content = content.push(member_entry(member, colors::ROLE_MODERATOR));
         }
-        content = content.push(Space::with_height(8));
+        content = content.push(Space::new().height(8));
     }
 
     if !online_members.is_empty() {
@@ -139,9 +139,9 @@ fn member_entry<'a>(
 
     let entry = row![
         avatar,
-        Space::with_width(8),
+        Space::new().width(8),
         name_col,
-        Space::with_width(Length::Fill),
+        Space::new().width(Length::Fill),
         status_dot,
     ]
     .align_y(Vertical::Center)

@@ -177,6 +177,7 @@ pub fn artemis_theme() -> Theme {
             text: colors::TEXT_PRIMARY,
             primary: colors::ACCENT,
             success: colors::STATUS_ONLINE,
+            warning: colors::STATUS_IDLE,
             danger: color!(0xEF, 0x44, 0x44),
         },
     )
