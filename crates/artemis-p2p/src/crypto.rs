@@ -21,7 +21,9 @@ impl Identity {
 
     /// Restore identity from a stored secret key (32 bytes, base64-encoded).
     pub fn from_secret_b64(secret_b64: &str) -> Result<Self, CryptoError> {
-        let bytes = B64.decode(secret_b64).map_err(|_| CryptoError::InvalidKey)?;
+        let bytes = B64
+            .decode(secret_b64)
+            .map_err(|_| CryptoError::InvalidKey)?;
         if bytes.len() != 32 {
             return Err(CryptoError::InvalidKey);
         }
@@ -49,7 +51,11 @@ impl Identity {
 
     /// Derive a shared secret with another peer's public key,
     /// then encrypt a message using ChaCha20-Poly1305.
-    pub fn encrypt_for(&self, recipient_pub: &PublicKey, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    pub fn encrypt_for(
+        &self,
+        recipient_pub: &PublicKey,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
         let shared = self.secret.diffie_hellman(recipient_pub);
         let key = chacha20poly1305::Key::from_slice(shared.as_bytes());
         let cipher = ChaCha20Poly1305::new(key);
@@ -70,7 +76,11 @@ impl Identity {
     }
 
     /// Decrypt a message from a peer using their public key.
-    pub fn decrypt_from(&self, sender_pub: &PublicKey, data: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    pub fn decrypt_from(
+        &self,
+        sender_pub: &PublicKey,
+        data: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
         if data.len() < 12 {
             return Err(CryptoError::InvalidCiphertext);
         }
@@ -87,8 +97,14 @@ impl Identity {
     }
 
     /// Encrypt a message for a recipient (base64 public key), returning base64 ciphertext.
-    pub fn encrypt_for_b64(&self, recipient_pub_b64: &str, plaintext: &[u8]) -> Result<String, CryptoError> {
-        let pub_bytes = B64.decode(recipient_pub_b64).map_err(|_| CryptoError::InvalidKey)?;
+    pub fn encrypt_for_b64(
+        &self,
+        recipient_pub_b64: &str,
+        plaintext: &[u8],
+    ) -> Result<String, CryptoError> {
+        let pub_bytes = B64
+            .decode(recipient_pub_b64)
+            .map_err(|_| CryptoError::InvalidKey)?;
         if pub_bytes.len() != 32 {
             return Err(CryptoError::InvalidKey);
         }
@@ -100,15 +116,23 @@ impl Identity {
     }
 
     /// Decrypt base64 ciphertext from a sender (base64 public key).
-    pub fn decrypt_from_b64(&self, sender_pub_b64: &str, ciphertext_b64: &str) -> Result<Vec<u8>, CryptoError> {
-        let pub_bytes = B64.decode(sender_pub_b64).map_err(|_| CryptoError::InvalidKey)?;
+    pub fn decrypt_from_b64(
+        &self,
+        sender_pub_b64: &str,
+        ciphertext_b64: &str,
+    ) -> Result<Vec<u8>, CryptoError> {
+        let pub_bytes = B64
+            .decode(sender_pub_b64)
+            .map_err(|_| CryptoError::InvalidKey)?;
         if pub_bytes.len() != 32 {
             return Err(CryptoError::InvalidKey);
         }
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&pub_bytes);
         let sender_pub = PublicKey::from(arr);
-        let data = B64.decode(ciphertext_b64).map_err(|_| CryptoError::InvalidCiphertext)?;
+        let data = B64
+            .decode(ciphertext_b64)
+            .map_err(|_| CryptoError::InvalidCiphertext)?;
         self.decrypt_from(&sender_pub, &data)
     }
 }

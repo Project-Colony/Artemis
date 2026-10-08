@@ -2,8 +2,8 @@ use iced::alignment::{Horizontal, Vertical};
 use iced::widget::{column, container, row, scrollable, text, Column, Space};
 use iced::{Border, Element, Length, Padding};
 
-use artemis_core::models::user::{MemberRole, UserStatus};
 use crate::theme::{colors, icons};
+use artemis_core::models::user::{MemberRole, UserStatus};
 
 #[derive(Debug, Clone)]
 pub enum MemberListMsg {
@@ -25,10 +25,7 @@ pub fn view(members: &[artemis_core::ServerMember]) -> Element<'_, MemberListMsg
         .collect();
     let online_members: Vec<_> = members
         .iter()
-        .filter(|m| {
-            m.role == MemberRole::Member
-                && m.user.status != UserStatus::Offline
-        })
+        .filter(|m| m.role == MemberRole::Member && m.user.status != UserStatus::Offline)
         .collect();
 
     if !founders.is_empty() {
@@ -50,8 +47,7 @@ pub fn view(members: &[artemis_core::ServerMember]) -> Element<'_, MemberListMsg
     if !online_members.is_empty() {
         content = content.push(role_header("Online", online_members.len()));
         for member in &online_members {
-            content =
-                content.push(member_entry(member, colors::TEXT_PRIMARY));
+            content = content.push(member_entry(member, colors::TEXT_PRIMARY));
         }
     }
 
@@ -137,9 +133,7 @@ fn member_entry<'a>(
         text(member.user.username.clone())
             .size(13)
             .color(name_color),
-        text(status_text)
-            .size(11)
-            .color(colors::TEXT_TIMESTAMP),
+        text(status_text).size(11).color(colors::TEXT_TIMESTAMP),
     ]
     .spacing(1);
 

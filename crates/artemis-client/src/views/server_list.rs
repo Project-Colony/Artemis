@@ -2,8 +2,8 @@ use iced::alignment::{Horizontal, Vertical};
 use iced::widget::{button, container, scrollable, text, Column, Space};
 use iced::{Border, Element, Length, Padding};
 
-use artemis_core::protocol::ServerPayload;
 use crate::theme::{colors, icons};
+use artemis_core::protocol::ServerPayload;
 
 #[derive(Debug, Clone)]
 pub enum ServerListMsg {
@@ -31,7 +31,12 @@ fn home_button<'a>(is_home: bool) -> Element<'a, ServerListMsg> {
         container(label)
             .width(48)
             .height(48)
-            .padding(Padding { top: 0.0, right: 0.0, bottom: 0.0, left: 2.0 })
+            .padding(Padding {
+                top: 0.0,
+                right: 0.0,
+                bottom: 0.0,
+                left: 2.0,
+            })
             .align_x(Horizontal::Center)
             .align_y(Vertical::Center),
     )

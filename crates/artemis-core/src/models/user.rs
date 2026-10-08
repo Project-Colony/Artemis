@@ -15,18 +15,13 @@ pub struct User {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UserStatus {
     Online,
     Idle,
     DoNotDisturb,
+    #[default]
     Offline,
-}
-
-impl Default for UserStatus {
-    fn default() -> Self {
-        Self::Offline
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

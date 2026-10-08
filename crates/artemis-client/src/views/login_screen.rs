@@ -23,15 +23,25 @@ pub enum LoginState {
 }
 
 pub fn view(state: &LoginState) -> Element<'_, LoginMsg> {
-    let title = text(format!("{} Artemis", icons::CHAT)).size(40).color(colors::ACCENT);
+    let title = text(format!("{} Artemis", icons::CHAT))
+        .size(40)
+        .color(colors::ACCENT);
 
-    let subtitle = text(format!("{} Peer-to-peer messaging via GitHub", icons::GLOBE))
-        .size(14)
-        .color(colors::TEXT_MUTED);
+    let subtitle = text(format!(
+        "{} Peer-to-peer messaging via GitHub",
+        icons::GLOBE
+    ))
+    .size(14)
+    .color(colors::TEXT_MUTED);
 
-    let mut form = column![title, Space::with_height(4), subtitle, Space::with_height(32),]
-        .align_x(Horizontal::Center)
-        .width(400);
+    let mut form = column![
+        title,
+        Space::with_height(4),
+        subtitle,
+        Space::with_height(32),
+    ]
+    .align_x(Horizontal::Center)
+    .width(400);
 
     match state {
         LoginState::Idle => {
@@ -103,9 +113,12 @@ pub fn view(state: &LoginState) -> Element<'_, LoginMsg> {
 
             form = form.push(Space::with_height(20));
             form = form.push(
-                text(format!("{} No server needed \u{2014} connect directly with friends", icons::LOCK))
-                    .size(11)
-                    .color(colors::TEXT_TIMESTAMP),
+                text(format!(
+                    "{} No server needed \u{2014} connect directly with friends",
+                    icons::LOCK
+                ))
+                .size(11)
+                .color(colors::TEXT_TIMESTAMP),
             );
         }
 
@@ -211,18 +224,14 @@ pub fn view(state: &LoginState) -> Element<'_, LoginMsg> {
         }
     }
 
-    container(
-        container(form)
-            .padding(40)
-            .style(|_| container::Style {
-                background: Some(iced::Background::Color(colors::BG_DARK)),
-                border: Border {
-                    radius: 12.0.into(),
-                    ..Border::default()
-                },
-                ..container::Style::default()
-            }),
-    )
+    container(container(form).padding(40).style(|_| container::Style {
+        background: Some(iced::Background::Color(colors::BG_DARK)),
+        border: Border {
+            radius: 12.0.into(),
+            ..Border::default()
+        },
+        ..container::Style::default()
+    }))
     .width(Length::Fill)
     .height(Length::Fill)
     .align_x(Horizontal::Center)

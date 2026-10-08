@@ -1,11 +1,11 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use quinn::{ClientConfig, Endpoint, ServerConfig, Connection, RecvStream, SendStream};
+use quinn::{ClientConfig, Connection, Endpoint, RecvStream, SendStream, ServerConfig};
 use rcgen::CertifiedKey;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::sync::mpsc;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 use crate::protocol::PeerMessage;
 
@@ -111,10 +111,7 @@ impl QuicTransport {
     }
 
     /// Run the accept loop, sending new peer connections to the channel.
-    pub async fn accept_loop(
-        &self,
-        tx: mpsc::UnboundedSender<PeerConnection>,
-    ) {
+    pub async fn accept_loop(&self, tx: mpsc::UnboundedSender<PeerConnection>) {
         loop {
             match self.accept_peer().await {
                 Ok(conn) => {
@@ -131,8 +128,7 @@ impl QuicTransport {
 
     /// Close the transport.
     pub fn close(&self) {
-        self.endpoint
-            .close(quinn::VarInt::from_u32(0), b"shutdown");
+        self.endpoint.close(quinn::VarInt::from_u32(0), b"shutdown");
     }
 }
 
@@ -148,9 +144,7 @@ impl PeerConnection {
     }
 
     /// Open a bidirectional stream for sending/receiving messages.
-    pub async fn open_stream(
-        &self,
-    ) -> Result<(PeerSender, PeerReceiver), TransportError> {
+    pub async fn open_stream(&self) -> Result<(PeerSender, PeerReceiver), TransportError> {
         let (send, recv) = self
             .connection
             .open_bi()
@@ -161,9 +155,7 @@ impl PeerConnection {
     }
 
     /// Accept a bidirectional stream from the peer.
-    pub async fn accept_stream(
-        &self,
-    ) -> Result<(PeerSender, PeerReceiver), TransportError> {
+    pub async fn accept_stream(&self) -> Result<(PeerSender, PeerReceiver), TransportError> {
         let (send, recv) = self
             .connection
             .accept_bi()
@@ -228,8 +220,7 @@ impl PeerConnection {
 
     /// Close this connection.
     pub fn close(&self) {
-        self.connection
-            .close(quinn::VarInt::from_u32(0), b"bye");
+        self.connection.close(quinn::VarInt::from_u32(0), b"bye");
     }
 }
 
@@ -278,8 +269,8 @@ impl PeerReceiver {
             .read_exact(&mut buf)
             .await
             .map_err(|e| TransportError::Stream(e.to_string()))?;
-        let msg = serde_json::from_slice(&buf)
-            .map_err(|e| TransportError::Deserialize(e.to_string()))?;
+        let msg =
+            serde_json::from_slice(&buf).map_err(|e| TransportError::Deserialize(e.to_string()))?;
         Ok(Some(msg))
     }
 }

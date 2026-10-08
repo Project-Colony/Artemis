@@ -2,9 +2,9 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use uuid::Uuid;
 
+use crate::protocol::PeerProfile;
 use artemis_core::models::message::Message;
 use artemis_core::models::user::UserStatus;
-use crate::protocol::PeerProfile;
 
 /// Local SQLite storage for messages, friends, and identity.
 pub struct LocalStore {
@@ -287,9 +287,7 @@ impl LocalStore {
                 .map_err(|e| StorageError::Query(e.to_string()))?;
 
             let messages = stmt
-                .query_map(params![channel_str, limit], |row| {
-                    Self::row_to_message(row)
-                })
+                .query_map(params![channel_str, limit], Self::row_to_message)
                 .map_err(|e| StorageError::Query(e.to_string()))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| StorageError::Query(e.to_string()))?;
@@ -312,23 +310,17 @@ impl LocalStore {
     // ── Channels ──
 
     /// Create or get a DM channel with a peer.
-    pub fn get_or_create_dm_channel(
-        &self,
-        peer_username: &str,
-    ) -> Result<Uuid, StorageError> {
+    pub fn get_or_create_dm_channel(&self, peer_username: &str) -> Result<Uuid, StorageError> {
         // Check if DM channel already exists
         let mut stmt = self
             .conn
             .prepare("SELECT id FROM channels WHERE peer_username = ?1 AND channel_type = 'dm'")
             .map_err(|e| StorageError::Query(e.to_string()))?;
 
-        if let Some(id_str) = stmt
-            .query_row(params![peer_username], |row| {
-                let s: String = row.get(0)?;
-                Ok(s)
-            })
-            .ok()
-        {
+        if let Ok(id_str) = stmt.query_row(params![peer_username], |row| {
+            let s: String = row.get(0)?;
+            Ok(s)
+        }) {
             return Uuid::parse_str(&id_str).map_err(|e| StorageError::Query(e.to_string()));
         }
 

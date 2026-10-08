@@ -66,9 +66,9 @@ async fn github_callback(
         &format!("{}/auth/github/callback", state.base_url),
     );
 
+    use oauth2::basic::BasicTokenResponse;
     use oauth2::reqwest::async_http_client;
     use oauth2::{AuthorizationCode, TokenResponse};
-    use oauth2::basic::BasicTokenResponse;
 
     // Exchange code for token
     let token_result: Result<BasicTokenResponse, _> = oauth
@@ -161,21 +161,38 @@ async fn get_me(
             "username": user.username,
         }))
         .into_response(),
-        _ => (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid token" }))).into_response(),
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Invalid token" })),
+        )
+            .into_response(),
     }
 }
 
-async fn list_servers(State(state): State<AppState>, Query(auth): Query<AuthHeader>) -> impl IntoResponse {
+async fn list_servers(
+    State(state): State<AppState>,
+    Query(auth): Query<AuthHeader>,
+) -> impl IntoResponse {
     let user = match db::find_user_by_token(&state.db, &auth.token).await {
         Ok(Some(u)) => u,
-        _ => return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid token" }))).into_response(),
+        _ => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "Invalid token" })),
+            )
+                .into_response()
+        }
     };
 
     match db::get_user_servers(&state.db, user.id).await {
         Ok(servers) => Json(json!({ "servers": servers })).into_response(),
         Err(e) => {
             tracing::error!("Failed to list servers: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB error" }))).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "DB error" })),
+            )
+                .into_response()
         }
     }
 }
@@ -192,7 +209,13 @@ async fn create_server(
 ) -> impl IntoResponse {
     let user = match db::find_user_by_token(&state.db, &auth.token).await {
         Ok(Some(u)) => u,
-        _ => return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid token" }))).into_response(),
+        _ => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "Invalid token" })),
+            )
+                .into_response()
+        }
     };
 
     let invite_code: String = Uuid::new_v4().to_string()[..8].to_string();
@@ -200,10 +223,15 @@ async fn create_server(
         Ok(server_id) => Json(json!({
             "server_id": server_id,
             "invite_code": invite_code,
-        })).into_response(),
+        }))
+        .into_response(),
         Err(e) => {
             tracing::error!("Failed to create server: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB error" }))).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "DB error" })),
+            )
+                .into_response()
         }
     }
 }
@@ -222,7 +250,13 @@ async fn list_messages(
 ) -> impl IntoResponse {
     let _user = match db::find_user_by_token(&state.db, &query.token).await {
         Ok(Some(u)) => u,
-        _ => return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "Invalid token" }))).into_response(),
+        _ => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "Invalid token" })),
+            )
+                .into_response()
+        }
     };
 
     let limit = query.limit.unwrap_or(50).min(100);
@@ -230,7 +264,11 @@ async fn list_messages(
         Ok(messages) => Json(json!({ "messages": messages })).into_response(),
         Err(e) => {
             tracing::error!("Failed to list messages: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "DB error" }))).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "DB error" })),
+            )
+                .into_response()
         }
     }
 }

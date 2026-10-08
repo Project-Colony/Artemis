@@ -118,7 +118,10 @@ impl GistSignaling {
     }
 
     /// Look up a peer's profile by their GitHub username.
-    pub async fn lookup_peer(&self, github_username: &str) -> Result<Option<ProfileGist>, SignalingError> {
+    pub async fn lookup_peer(
+        &self,
+        github_username: &str,
+    ) -> Result<Option<ProfileGist>, SignalingError> {
         let url = format!("{}/users/{}/gists", GITHUB_API, github_username);
         let resp = self
             .client
@@ -165,8 +168,8 @@ impl GistSignaling {
         peer_public_key: &str,
         conn_info: &ConnectionInfo,
     ) -> Result<(), SignalingError> {
-        let info_json = serde_json::to_string(conn_info)
-            .map_err(|e| SignalingError::Parse(e.to_string()))?;
+        let info_json =
+            serde_json::to_string(conn_info).map_err(|e| SignalingError::Parse(e.to_string()))?;
 
         let encrypted = identity
             .encrypt_for_b64(peer_public_key, info_json.as_bytes())
@@ -178,8 +181,7 @@ impl GistSignaling {
             timestamp: Utc::now(),
         };
 
-        let body = serde_json::to_string(&msg)
-            .map_err(|e| SignalingError::Parse(e.to_string()))?;
+        let body = serde_json::to_string(&msg).map_err(|e| SignalingError::Parse(e.to_string()))?;
 
         self.post_comment(peer_signaling_gist_id, &body).await?;
         info!("Sent connection request to peer's signaling Gist");
@@ -218,7 +220,10 @@ impl GistSignaling {
                                 }
                             }
                             Err(e) => {
-                                warn!("Failed to decrypt connection request from {}: {}", from_username, e);
+                                warn!(
+                                    "Failed to decrypt connection request from {}: {}",
+                                    from_username, e
+                                );
                             }
                         }
                     }
@@ -260,8 +265,7 @@ impl GistSignaling {
             timestamp: Utc::now(),
         };
 
-        let body = serde_json::to_string(&msg)
-            .map_err(|e| SignalingError::Parse(e.to_string()))?;
+        let body = serde_json::to_string(&msg).map_err(|e| SignalingError::Parse(e.to_string()))?;
 
         self.post_comment(peer_signaling_gist_id, &body).await?;
         Ok(())
@@ -355,7 +359,7 @@ impl GistSignaling {
 
         let resp = self
             .client
-            .post(&format!("{}/gists", GITHUB_API))
+            .post(format!("{}/gists", GITHUB_API))
             .header(AUTHORIZATION, format!("Bearer {}", self.token))
             .header(USER_AGENT, "Artemis")
             .header(ACCEPT, "application/vnd.github+json")
@@ -390,7 +394,7 @@ impl GistSignaling {
 
         let resp = self
             .client
-            .post(&format!("{}/gists", GITHUB_API))
+            .post(format!("{}/gists", GITHUB_API))
             .header(AUTHORIZATION, format!("Bearer {}", self.token))
             .header(USER_AGENT, "Artemis")
             .header(ACCEPT, "application/vnd.github+json")
@@ -410,7 +414,7 @@ impl GistSignaling {
     async fn get_gist(&self, gist_id: &str) -> Result<GistResponse, SignalingError> {
         let resp = self
             .client
-            .get(&format!("{}/gists/{}", GITHUB_API, gist_id))
+            .get(format!("{}/gists/{}", GITHUB_API, gist_id))
             .header(AUTHORIZATION, format!("Bearer {}", self.token))
             .header(USER_AGENT, "Artemis")
             .header(ACCEPT, "application/vnd.github+json")
@@ -426,7 +430,7 @@ impl GistSignaling {
     async fn get_comments(&self, gist_id: &str) -> Result<Vec<GistComment>, SignalingError> {
         let resp = self
             .client
-            .get(&format!("{}/gists/{}/comments", GITHUB_API, gist_id))
+            .get(format!("{}/gists/{}/comments", GITHUB_API, gist_id))
             .header(AUTHORIZATION, format!("Bearer {}", self.token))
             .header(USER_AGENT, "Artemis")
             .header(ACCEPT, "application/vnd.github+json")
@@ -445,7 +449,7 @@ impl GistSignaling {
         };
 
         self.client
-            .post(&format!("{}/gists/{}/comments", GITHUB_API, gist_id))
+            .post(format!("{}/gists/{}/comments", GITHUB_API, gist_id))
             .header(AUTHORIZATION, format!("Bearer {}", self.token))
             .header(USER_AGENT, "Artemis")
             .header(ACCEPT, "application/vnd.github+json")

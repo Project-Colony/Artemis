@@ -31,10 +31,7 @@ pub fn sample_data() -> (Vec<Server>, Vec<Message>, Vec<ServerMember>) {
                             id: general_id,
                             name: "General".to_string(),
                             channel_type: ChannelType::Text,
-                            topic: Some(
-                                "Welcome to Artemis! General chat goes here."
-                                    .to_string(),
-                            ),
+                            topic: Some("Welcome to Artemis! General chat goes here.".to_string()),
                             icon: Some("\u{f292}".to_string()),
                         },
                         Channel {
@@ -144,7 +141,7 @@ pub fn sample_data() -> (Vec<Server>, Vec<Message>, Vec<ServerMember>) {
     let user_charlie = User {
         id: Uuid::new_v4(),
         username: "Charlie".to_string(),
-        display_name: Some("Charlie").map(String::from),
+        display_name: Some(String::from("Charlie")),
         avatar_url: None,
         github_id: None,
         public_key: None,
@@ -242,8 +239,7 @@ pub fn sample_data() -> (Vec<Server>, Vec<Message>, Vec<ServerMember>) {
             author_id: user_bot.id,
             author_name: "ArtemisBot".to_string(),
             author_avatar: None,
-            content: "Welcome to #General! Remember to check the rules."
-                .to_string(),
+            content: "Welcome to #General! Remember to check the rules.".to_string(),
             attachments: vec![],
             timestamp: Utc::now() - chrono::Duration::minutes(1),
             edited_at: None,
