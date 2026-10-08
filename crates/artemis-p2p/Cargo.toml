@@ -26,4 +26,5 @@ x25519-dalek = { workspace = true }
 chacha20poly1305 = { workspace = true }
 hkdf = { workspace = true }
 sha2 = { workspace = true }
+zeroize = { workspace = true }
 rusqlite = { workspace = true }

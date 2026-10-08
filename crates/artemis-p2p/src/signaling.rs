@@ -3,7 +3,7 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::crypto::Identity;
+use crate::crypto::{Identity, Purpose};
 use crate::protocol::{ConnectionInfo, ProfileGist, SignalingMessage};
 
 const GITHUB_API: &str = "https://api.github.com";
@@ -172,7 +172,7 @@ impl GistSignaling {
             serde_json::to_string(conn_info).map_err(|e| SignalingError::Parse(e.to_string()))?;
 
         let encrypted = identity
-            .encrypt_for_b64(peer_public_key, info_json.as_bytes())
+            .encrypt_for_b64(Purpose::Signaling, peer_public_key, info_json.as_bytes())
             .map_err(|e| SignalingError::Crypto(e.to_string()))?;
 
         let msg = SignalingMessage::ConnectRequest {
@@ -211,7 +211,11 @@ impl GistSignaling {
                     // We need the sender's public key to decrypt.
                     // Look up their profile first.
                     if let Ok(Some(profile)) = self.lookup_peer(&from_username).await {
-                        match identity.decrypt_from_b64(&profile.public_key, &encrypted_info) {
+                        match identity.decrypt_from_b64(
+                            Purpose::Signaling,
+                            &profile.public_key,
+                            &encrypted_info,
+                        ) {
                             Ok(plaintext) => {
                                 if let Ok(conn_info) =
                                     serde_json::from_slice::<ConnectionInfo>(&plaintext)
