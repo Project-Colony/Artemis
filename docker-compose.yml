@@ -3,10 +3,12 @@ services:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: artemis
-      POSTGRES_PASSWORD: artemis
+      # Set in .env (see .env.example); compose refuses to start without it.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: artemis
+    # Loopback only: a published port bypasses host firewall input rules.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - artemis_pgdata:/var/lib/postgresql/data
 
