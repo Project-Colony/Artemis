@@ -1,9 +1,19 @@
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use chacha20poly1305::aead::{Aead, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Nonce};
-use rand::RngCore;
+use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use hkdf::Hkdf;
+use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
+
+/// HKDF `info` label that scopes derived keys to Artemis direct messages.
+///
+/// A public protocol constant for domain separation, not a secret: every
+/// client must use the same bytes, and changing them changes every key.
+const DM_KEY_LABEL: &[u8] = b"artemis-p2p v1 dm key";
+
+/// ChaCha20-Poly1305 nonce length. Every ciphertext starts with its nonce.
+const NONCE_LEN: usize = 12;
 
 /// Cryptographic identity for a peer — X25519 keypair for key exchange.
 pub struct Identity {
@@ -12,24 +22,16 @@ pub struct Identity {
 }
 
 impl Identity {
-    /// Generate a new random identity.
+    /// Generate a new random identity from the OS CSPRNG.
     pub fn generate() -> Self {
-        let secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let secret = StaticSecret::random_from_rng(OsRng);
         let public = PublicKey::from(&secret);
         Self { secret, public }
     }
 
     /// Restore identity from a stored secret key (32 bytes, base64-encoded).
     pub fn from_secret_b64(secret_b64: &str) -> Result<Self, CryptoError> {
-        let bytes = B64
-            .decode(secret_b64)
-            .map_err(|_| CryptoError::InvalidKey)?;
-        if bytes.len() != 32 {
-            return Err(CryptoError::InvalidKey);
-        }
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
-        let secret = StaticSecret::from(arr);
+        let secret = StaticSecret::from(decode_key(secret_b64)?);
         let public = PublicKey::from(&secret);
         Ok(Self { secret, public })
     }
@@ -49,30 +51,39 @@ impl Identity {
         &self.public
     }
 
-    /// Derive a shared secret with another peer's public key,
-    /// then encrypt a message using ChaCha20-Poly1305.
+    /// Derive the ChaCha20-Poly1305 cipher shared with `peer`.
+    ///
+    /// The raw X25519 output is never used as the key: HKDF-SHA256 derives
+    /// one from it, bound to both public keys (sorted, so both sides derive the
+    /// same key). A low-order peer key is refused, because it makes the shared
+    /// secret all zeros and the key a constant anyone can compute.
+    fn cipher_for(&self, peer: &PublicKey) -> Result<ChaCha20Poly1305, CryptoError> {
+        let shared = self.secret.diffie_hellman(peer);
+        if !shared.was_contributory() {
+            return Err(CryptoError::InvalidKey);
+        }
+        let (a, b) = (self.public.as_bytes(), peer.as_bytes());
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        let mut key = Key::default();
+        Hkdf::<Sha256>::new(None, shared.as_bytes())
+            .expand_multi_info(&[DM_KEY_LABEL, lo, hi], &mut key)
+            .expect("32 bytes is a valid HKDF-SHA256 output length");
+        Ok(ChaCha20Poly1305::new(&key))
+    }
+
+    /// Encrypt a message for a peer. The output is a fresh random nonce from
+    /// the OS CSPRNG followed by the ciphertext.
     pub fn encrypt_for(
         &self,
         recipient_pub: &PublicKey,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
-        let shared = self.secret.diffie_hellman(recipient_pub);
-        let key = chacha20poly1305::Key::from_slice(shared.as_bytes());
-        let cipher = ChaCha20Poly1305::new(key);
-
-        let mut nonce_bytes = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
-
-        let ciphertext = cipher
-            .encrypt(nonce, plaintext)
+        let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let ciphertext = self
+            .cipher_for(recipient_pub)?
+            .encrypt(&nonce, plaintext)
             .map_err(|_| CryptoError::EncryptionFailed)?;
-
-        // Prepend nonce to ciphertext
-        let mut result = Vec::with_capacity(12 + ciphertext.len());
-        result.extend_from_slice(&nonce_bytes);
-        result.extend_from_slice(&ciphertext);
-        Ok(result)
+        Ok([nonce.as_slice(), &ciphertext].concat())
     }
 
     /// Decrypt a message from a peer using their public key.
@@ -81,18 +92,12 @@ impl Identity {
         sender_pub: &PublicKey,
         data: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
-        if data.len() < 12 {
+        if data.len() < NONCE_LEN {
             return Err(CryptoError::InvalidCiphertext);
         }
-        let shared = self.secret.diffie_hellman(sender_pub);
-        let key = chacha20poly1305::Key::from_slice(shared.as_bytes());
-        let cipher = ChaCha20Poly1305::new(key);
-
-        let nonce = Nonce::from_slice(&data[..12]);
-        let ciphertext = &data[12..];
-
-        cipher
-            .decrypt(nonce, ciphertext)
+        let (nonce, ciphertext) = data.split_at(NONCE_LEN);
+        self.cipher_for(sender_pub)?
+            .decrypt(Nonce::from_slice(nonce), ciphertext)
             .map_err(|_| CryptoError::DecryptionFailed)
     }
 
@@ -102,15 +107,7 @@ impl Identity {
         recipient_pub_b64: &str,
         plaintext: &[u8],
     ) -> Result<String, CryptoError> {
-        let pub_bytes = B64
-            .decode(recipient_pub_b64)
-            .map_err(|_| CryptoError::InvalidKey)?;
-        if pub_bytes.len() != 32 {
-            return Err(CryptoError::InvalidKey);
-        }
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&pub_bytes);
-        let recipient_pub = PublicKey::from(arr);
+        let recipient_pub = PublicKey::from(decode_key(recipient_pub_b64)?);
         let encrypted = self.encrypt_for(&recipient_pub, plaintext)?;
         Ok(B64.encode(encrypted))
     }
@@ -121,20 +118,20 @@ impl Identity {
         sender_pub_b64: &str,
         ciphertext_b64: &str,
     ) -> Result<Vec<u8>, CryptoError> {
-        let pub_bytes = B64
-            .decode(sender_pub_b64)
-            .map_err(|_| CryptoError::InvalidKey)?;
-        if pub_bytes.len() != 32 {
-            return Err(CryptoError::InvalidKey);
-        }
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&pub_bytes);
-        let sender_pub = PublicKey::from(arr);
+        let sender_pub = PublicKey::from(decode_key(sender_pub_b64)?);
         let data = B64
             .decode(ciphertext_b64)
             .map_err(|_| CryptoError::InvalidCiphertext)?;
         self.decrypt_from(&sender_pub, &data)
     }
+}
+
+/// Decode a base64 X25519 key, which must be exactly 32 bytes.
+fn decode_key(b64: &str) -> Result<[u8; 32], CryptoError> {
+    B64.decode(b64)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or(CryptoError::InvalidKey)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -219,6 +216,27 @@ mod tests {
         assert!(Identity::from_secret_b64("not-valid-base64!!!").is_err());
         // Valid base64 but wrong length
         assert!(Identity::from_secret_b64("AQID").is_err());
+    }
+
+    #[test]
+    fn low_order_peer_key_rejected() {
+        let alice = Identity::generate();
+        // u = 0 is a low-order point: the shared secret would be all zeros.
+        let low_order = PublicKey::from(<[u8; 32]>::default());
+        assert!(matches!(
+            alice.encrypt_for(&low_order, b"secret"),
+            Err(CryptoError::InvalidKey)
+        ));
+    }
+
+    #[test]
+    fn each_message_gets_a_fresh_nonce() {
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let first = alice.encrypt_for(bob.public_key(), b"same").unwrap();
+        let second = alice.encrypt_for(bob.public_key(), b"same").unwrap();
+        assert_ne!(first[..NONCE_LEN], second[..NONCE_LEN]);
+        assert_ne!(first, second);
     }
 
     #[test]
