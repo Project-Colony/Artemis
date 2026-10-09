@@ -67,14 +67,30 @@ async fn github_callback(
     );
 
     use oauth2::basic::BasicTokenResponse;
-    use oauth2::reqwest::async_http_client;
     use oauth2::{AuthorizationCode, TokenResponse};
+
+    // No redirects: the oauth2 crate recommends this to keep the token request
+    // from being bounced to another host (SSRF).
+    let http_client = match oauth2::reqwest::ClientBuilder::new()
+        .redirect(oauth2::reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Failed to build the HTTP client: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "OAuth failed" })),
+            )
+                .into_response();
+        }
+    };
 
     // Exchange code for token
     let token_result: Result<BasicTokenResponse, _> = oauth
         .client()
         .exchange_code(AuthorizationCode::new(params.code))
-        .request_async(async_http_client)
+        .request_async(&http_client)
         .await;
 
     let token: BasicTokenResponse = match token_result {

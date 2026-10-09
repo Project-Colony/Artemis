@@ -31,7 +31,7 @@ pub fn view<'a>(
             text(format!("{} Friends", icons::MEMBERS))
                 .size(16)
                 .color(colors::TEXT_PRIMARY),
-            Space::with_width(Length::Fill),
+            Space::new().width(Length::Fill),
             button(text(icons::USER_PLUS).size(14).color(colors::STATUS_ONLINE))
                 .on_press(FriendListMsg::ToggleAddFriend)
                 .padding(Padding::from([2, 8]))
@@ -83,7 +83,7 @@ pub fn view<'a>(
                 ..button::Style::default()
             });
 
-        let form = container(row![input, Space::with_width(4), add_btn].align_y(Vertical::Center))
+        let form = container(row![input, Space::new().width(4), add_btn].align_y(Vertical::Center))
             .padding(Padding::from([8, 12]))
             .width(Length::Fill)
             .style(|_| container::Style {
@@ -94,7 +94,7 @@ pub fn view<'a>(
         content = content.push(form);
     }
 
-    content = content.push(Space::with_height(4));
+    content = content.push(Space::new().height(4));
 
     // Pending friend requests
     if !pending_requests.is_empty() {
@@ -115,7 +115,7 @@ pub fn view<'a>(
             content = content.push(friend_request_entry(req));
         }
 
-        content = content.push(Space::with_height(8));
+        content = content.push(Space::new().height(8));
     }
 
     // Online friends
@@ -147,7 +147,7 @@ pub fn view<'a>(
             content = content.push(friend_entry(friend, is_active));
         }
 
-        content = content.push(Space::with_height(8));
+        content = content.push(Space::new().height(8));
     }
 
     if !offline.is_empty() {
@@ -171,7 +171,7 @@ pub fn view<'a>(
     }
 
     if friends.is_empty() && pending_requests.is_empty() {
-        content = content.push(Space::with_height(20));
+        content = content.push(Space::new().height(20));
         content = content.push(
             container(
                 column![
@@ -179,7 +179,7 @@ pub fn view<'a>(
                         .size(13)
                         .color(colors::TEXT_MUTED)
                         .align_x(Horizontal::Center),
-                    Space::with_height(4),
+                    Space::new().height(4),
                     text("Click + to add by GitHub username")
                         .size(11)
                         .color(colors::TEXT_TIMESTAMP)
@@ -267,9 +267,9 @@ fn friend_entry<'a>(friend: &FriendPayload, is_active: bool) -> Element<'a, Frie
 
     let entry_row = row![
         avatar,
-        Space::with_width(8),
+        Space::new().width(8),
         name_col,
-        Space::with_width(Length::Fill),
+        Space::new().width(Length::Fill),
         status_dot,
     ]
     .align_y(Vertical::Center);
@@ -373,11 +373,11 @@ fn friend_request_entry<'a>(req: &FriendRequestPayload) -> Element<'a, FriendLis
 
     let entry_row = row![
         avatar,
-        Space::with_width(8),
+        Space::new().width(8),
         name_col,
-        Space::with_width(Length::Fill),
+        Space::new().width(Length::Fill),
         accept_btn,
-        Space::with_width(4),
+        Space::new().width(4),
         decline_btn,
     ]
     .align_y(Vertical::Center);

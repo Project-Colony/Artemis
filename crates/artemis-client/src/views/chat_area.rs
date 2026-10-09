@@ -48,7 +48,7 @@ pub fn view_with_payload<'a>(
     // ── Top bar ──
     let mut top_row = row![
         text(icons::CHANNEL_TEXT).size(16).color(colors::TEXT_MUTED),
-        Space::with_width(6),
+        Space::new().width(6),
         text(channel_name).size(16).color(colors::TEXT_PRIMARY),
     ]
     .spacing(0)
@@ -56,15 +56,15 @@ pub fn view_with_payload<'a>(
 
     if let Some(topic) = channel_topic {
         top_row = top_row
-            .push(Space::with_width(12))
+            .push(Space::new().width(12))
             .push(text(icons::DIVIDER).size(14).color(colors::TEXT_TIMESTAMP))
-            .push(Space::with_width(12))
+            .push(Space::new().width(12))
             .push(text(topic).size(13).color(colors::TEXT_MUTED));
     }
 
     // Search bar in top row
     let search_placeholder = format!("{} Search messages...", icons::SEARCH);
-    top_row = top_row.push(Space::with_width(Length::Fill)).push(
+    top_row = top_row.push(Space::new().width(Length::Fill)).push(
         text_input(&search_placeholder, search_query)
             .on_input(ChatAreaMsg::SearchInputChanged)
             .on_submit(ChatAreaMsg::SubmitSearch)
@@ -128,7 +128,7 @@ pub fn view_with_payload<'a>(
             }
         });
         msg_column = msg_column.push(load_btn);
-        msg_column = msg_column.push(Space::with_height(8));
+        msg_column = msg_column.push(Space::new().height(8));
     }
 
     let mut prev_author: Option<&Uuid> = None;
@@ -148,13 +148,13 @@ pub fn view_with_payload<'a>(
                     replied_msg.content.clone()
                 };
                 let reply_row = row![
-                    Space::with_width(48),
+                    Space::new().width(48),
                     text(icons::THREAD).size(12).color(colors::TEXT_TIMESTAMP),
-                    Space::with_width(4),
+                    Space::new().width(4),
                     text(&replied_msg.author_name)
                         .size(11)
                         .color(colors::ROLE_MODERATOR),
-                    Space::with_width(6),
+                    Space::new().width(6),
                     text(reply_preview).size(11).color(colors::TEXT_MUTED),
                 ]
                 .spacing(0)
@@ -178,18 +178,18 @@ pub fn view_with_payload<'a>(
 
         if is_continuation {
             let mut content_col: Column<'_, ChatAreaMsg> = Column::new().spacing(2);
-            content_col = content_col.push(render_rich_content(&msg.content, 14));
+            content_col = content_col.push(render_rich_content(&msg.content, 14.0));
 
             // Reactions for continuation messages
             if !msg.reactions.is_empty() {
                 content_col = content_col.push(render_reactions(msg.id, &msg.reactions));
             }
 
-            let msg_row = row![Space::with_width(48), content_col,];
+            let msg_row = row![Space::new().width(48), content_col,];
             msg_column = msg_column.push(msg_row);
         } else {
             if prev_author.is_some() {
-                msg_column = msg_column.push(Space::with_height(8));
+                msg_column = msg_column.push(Space::new().height(8));
             }
 
             let avatar_initial: String = msg
@@ -221,7 +221,7 @@ pub fn view_with_payload<'a>(
 
             let mut header = row![
                 text(&msg.author_name).size(14).color(colors::ROLE_FOUNDER),
-                Space::with_width(8),
+                Space::new().width(8),
                 text(timestamp).size(11).color(colors::TEXT_TIMESTAMP),
             ]
             .align_y(Vertical::Center);
@@ -229,18 +229,18 @@ pub fn view_with_payload<'a>(
             // Pin indicator
             if msg.pinned {
                 header = header
-                    .push(Space::with_width(6))
+                    .push(Space::new().width(6))
                     .push(text(icons::PIN).size(11).color(colors::STATUS_IDLE));
             }
 
             // Edited indicator
             if msg.edited_at.is_some() {
                 header = header
-                    .push(Space::with_width(6))
+                    .push(Space::new().width(6))
                     .push(text("(edited)").size(10).color(colors::TEXT_TIMESTAMP));
             }
 
-            let body = render_rich_content(&msg.content, 14);
+            let body = render_rich_content(&msg.content, 14.0);
 
             // Action buttons row (reply, pin, react)
             let msg_id = msg.id;
@@ -331,7 +331,7 @@ pub fn view_with_payload<'a>(
 
             msg_content = msg_content.push(actions);
 
-            let msg_row = row![avatar, Space::with_width(12), msg_content].align_y(Vertical::Top);
+            let msg_row = row![avatar, Space::new().width(12), msg_content].align_y(Vertical::Top);
 
             msg_column = msg_column.push(msg_row);
         }
@@ -374,7 +374,7 @@ pub fn view_with_payload<'a>(
                     .color(colors::ROLE_MODERATOR),
                 text(": ").size(12).color(colors::TEXT_MUTED),
                 text(reply_preview).size(12).color(colors::TEXT_MUTED),
-                Space::with_width(Length::Fill),
+                Space::new().width(Length::Fill),
                 button(text(icons::CLOSE).size(12).color(colors::TEXT_MUTED))
                     .on_press(ChatAreaMsg::CancelReply)
                     .padding(Padding::from([2, 6]))
@@ -428,7 +428,7 @@ pub fn view_with_payload<'a>(
     });
 
     let input_bar =
-        container(row![input, Space::with_width(8), send_btn,].align_y(Vertical::Center))
+        container(row![input, Space::new().width(8), send_btn,].align_y(Vertical::Center))
             .padding(Padding::from([8, 16]))
             .width(Length::Fill)
             .style(|_| container::Style {
@@ -449,7 +449,7 @@ pub fn view_with_payload<'a>(
 }
 
 /// Render message content with @mention highlighting.
-fn render_rich_content(content: &str, size: u16) -> Element<'_, ChatAreaMsg> {
+fn render_rich_content(content: &str, size: f32) -> Element<'_, ChatAreaMsg> {
     let mut parts: Row<'_, ChatAreaMsg> = Row::new().spacing(0);
     let mut current = String::new();
 

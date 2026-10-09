@@ -3,6 +3,7 @@ mod net;
 mod theme;
 mod views;
 
+use futures::channel::mpsc::Sender;
 use futures::SinkExt;
 use iced::widget::{container, row};
 use iced::{Element, Font, Length, Task as IcedTask};
@@ -46,13 +47,14 @@ const DEFAULT_SERVER_URL: &str = "http://localhost:3000";
 fn main() -> iced::Result {
     tracing_subscriber::fmt::init();
 
-    iced::application("Artemis", Artemis::update, Artemis::view)
-        .theme(|_| theme::artemis_theme())
+    iced::application(Artemis::new, Artemis::update, Artemis::view)
+        .title("Artemis")
+        .theme(theme::artemis_theme())
         .default_font(FONT_REGULAR)
         .font(JETBRAINS_MONO_REGULAR)
         .font(JETBRAINS_MONO_BOLD)
         .window_size((1280.0, 720.0))
-        .run_with(Artemis::new)
+        .run()
 }
 
 enum AppScreen {
@@ -209,7 +211,7 @@ impl Artemis {
                 let dc = device_code.clone();
 
                 return IcedTask::run(
-                    iced::stream::channel(8, move |mut output| async move {
+                    iced::stream::channel(8, move |mut output: Sender<AppMessage>| async move {
                         let poll_interval = std::time::Duration::from_secs(interval.max(5));
                         loop {
                             tokio::time::sleep(poll_interval).await;
@@ -319,7 +321,7 @@ impl Artemis {
                 let pk = public_key;
 
                 return IcedTask::run(
-                    iced::stream::channel(64, move |mut output| async move {
+                    iced::stream::channel(64, move |mut output: Sender<AppMessage>| async move {
                         match net::connect(&server_url, tk).await {
                             Ok((tx, mut rx)) => {
                                 // Publish public key

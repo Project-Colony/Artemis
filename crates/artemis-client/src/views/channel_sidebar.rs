@@ -32,7 +32,7 @@ pub fn view_from_payload<'a>(
     let header = container(
         row![
             text(&server.name).size(16).color(colors::TEXT_PRIMARY),
-            Space::with_width(Length::Fill),
+            Space::new().width(Length::Fill),
         ]
         .padding(Padding::from([0, 4]))
         .align_y(Vertical::Center),
@@ -45,13 +45,13 @@ pub fn view_from_payload<'a>(
     });
 
     content = content.push(header);
-    content = content.push(Space::with_height(4));
+    content = content.push(Space::new().height(4));
 
     for category in &server.categories {
         let cat_header = button(
             row![
                 text(icons::CHEVRON_DOWN).size(10).color(colors::TEXT_MUTED),
-                Space::with_width(4),
+                Space::new().width(4),
                 text(&category.name).size(11).color(colors::TEXT_MUTED),
             ]
             .align_y(Vertical::Center),
@@ -85,7 +85,7 @@ pub fn view_from_payload<'a>(
             let chan_btn = button(
                 row![
                     text(icon_str).size(14).color(colors::TEXT_MUTED),
-                    Space::with_width(6),
+                    Space::new().width(6),
                     text(&channel.name).size(14).color(name_color),
                 ]
                 .align_y(Vertical::Center),
@@ -118,7 +118,7 @@ pub fn view_from_payload<'a>(
             content = content.push(container(chan_btn).padding(Padding::from([0, 8])));
         }
 
-        content = content.push(Space::with_height(4));
+        content = content.push(Space::new().height(4));
     }
 
     let scrollable_content = scrollable(content).height(Length::Fill);

@@ -1,5 +1,5 @@
 use oauth2::basic::BasicClient;
-use oauth2::{AuthUrl, ClientId, ClientSecret, RedirectUrl, TokenUrl};
+use oauth2::{AuthUrl, ClientId, ClientSecret, EndpointNotSet, EndpointSet, RedirectUrl, TokenUrl};
 use serde::{Deserialize, Serialize};
 
 const GITHUB_AUTH_URL: &str = "https://github.com/login/oauth/authorize";
@@ -17,25 +17,27 @@ pub struct GitHubUser {
     pub email: Option<String>,
 }
 
+/// An OAuth client with the authorization and token endpoints set.
+pub type GitHubClient =
+    BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
+
 /// GitHub OAuth client configuration (for server-side flow).
 pub struct GitHubOAuth {
-    client: BasicClient,
+    client: GitHubClient,
 }
 
 impl GitHubOAuth {
     pub fn new(client_id: &str, client_secret: &str, redirect_url: &str) -> Self {
-        let client = BasicClient::new(
-            ClientId::new(client_id.to_string()),
-            Some(ClientSecret::new(client_secret.to_string())),
-            AuthUrl::new(GITHUB_AUTH_URL.to_string()).unwrap(),
-            Some(TokenUrl::new(GITHUB_TOKEN_URL.to_string()).unwrap()),
-        )
-        .set_redirect_uri(RedirectUrl::new(redirect_url.to_string()).unwrap());
+        let client = BasicClient::new(ClientId::new(client_id.to_string()))
+            .set_client_secret(ClientSecret::new(client_secret.to_string()))
+            .set_auth_uri(AuthUrl::new(GITHUB_AUTH_URL.to_string()).unwrap())
+            .set_token_uri(TokenUrl::new(GITHUB_TOKEN_URL.to_string()).unwrap())
+            .set_redirect_uri(RedirectUrl::new(redirect_url.to_string()).unwrap());
 
         Self { client }
     }
 
-    pub fn client(&self) -> &BasicClient {
+    pub fn client(&self) -> &GitHubClient {
         &self.client
     }
 
