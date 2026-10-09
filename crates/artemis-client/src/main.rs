@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use artemis_core::models::message::Message;
-use artemis_core::models::user::{ServerMember, User, UserStatus};
+use artemis_core::models::user::{MemberRole, ServerMember, User, UserStatus};
 use artemis_core::protocol::{
     ClientEvent, FriendPayload, FriendRequestPayload, ServerEvent, ServerPayload,
 };
@@ -794,6 +794,16 @@ impl Artemis {
             .unwrap_or_else(|| "[This message could not be decrypted]".to_string())
     }
 
+    /// Whether the user may pin in the active server. The relay lets only
+    /// founders and moderators pin; the demo pins locally, so it always may.
+    fn can_pin(&self) -> bool {
+        self.is_mock
+            || self.members.iter().any(|m| {
+                Some(m.user.id) == self.user_id
+                    && matches!(m.role, MemberRole::Founder | MemberRole::Moderator)
+            })
+    }
+
     fn dm_channel_id(&self, other_user_id: Uuid) -> Uuid {
         let my_id = self.user_id.unwrap_or(Uuid::nil());
         let (a, b) = if my_id < other_user_id {
@@ -1287,6 +1297,8 @@ impl Artemis {
                         dm_channel,
                         reply_msg,
                         &self.search_query,
+                        // The relay pins channel messages only.
+                        false,
                     )
                     .map(AppMessage::ChatArea);
 
@@ -1314,6 +1326,7 @@ impl Artemis {
                         self.active_channel_id,
                         reply_msg,
                         &self.search_query,
+                        self.can_pin(),
                     )
                     .map(AppMessage::ChatArea);
 

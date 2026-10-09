@@ -38,6 +38,7 @@ pub fn view_with_payload<'a>(
     active_channel_id: Option<Uuid>,
     reply_to: Option<&'a artemis_core::Message>,
     search_query: &str,
+    can_pin: bool,
 ) -> Element<'a, ChatAreaMsg> {
     let channel_name = active_channel
         .map(|c| c.name.as_str())
@@ -289,7 +290,9 @@ pub fn view_with_payload<'a>(
             let mut action_row: Row<'_, ChatAreaMsg> =
                 Row::new().spacing(2).align_y(Vertical::Center);
             action_row = action_row.push(reply_btn);
-            action_row = action_row.push(pin_btn);
+            if can_pin {
+                action_row = action_row.push(pin_btn);
+            }
             for emoji in QUICK_REACTIONS {
                 let e = emoji.to_string();
                 action_row = action_row.push(
