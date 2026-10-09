@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use chrono::{DateTime, Utc};
 use sqlx::postgres::PgPool;
 use uuid::Uuid;
@@ -1023,6 +1025,30 @@ pub async fn leave_server(
         .execute(pool)
         .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// Everyone in `server_id`.
+pub async fn member_ids(pool: &DbPool, server_id: Uuid) -> Result<HashSet<Uuid>, sqlx::Error> {
+    let rows: Vec<Uuid> =
+        sqlx::query_scalar("SELECT user_id FROM server_members WHERE server_id = $1")
+            .bind(server_id)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// Everyone who shares at least one server with `user_id`, not counting them.
+pub async fn co_member_ids(pool: &DbPool, user_id: Uuid) -> Result<HashSet<Uuid>, sqlx::Error> {
+    let rows: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT theirs.user_id
+         FROM server_members mine
+         JOIN server_members theirs ON theirs.server_id = mine.server_id
+         WHERE mine.user_id = $1 AND theirs.user_id <> $1",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().collect())
 }
 
 pub async fn get_invite_code(

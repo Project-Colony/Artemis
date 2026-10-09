@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -27,6 +27,8 @@ const MEMBER: Uuid = Uuid::from_u128(0xa2);
 /// Founder of server B, not a member of server A. One of their messages is
 /// still in A, as if they had left it.
 const OUTSIDER: Uuid = Uuid::from_u128(0xb1);
+/// In no server, with no friends.
+const STRANGER: Uuid = Uuid::from_u128(0xd1);
 
 const SERVER_A: Uuid = Uuid::from_u128(0x5a);
 const SERVER_B: Uuid = Uuid::from_u128(0x5b);
@@ -46,7 +48,8 @@ async fn seed(pool: &DbPool) {
         "INSERT INTO users (id, username, github_id, auth_token) VALUES
             ('{FOUNDER}', 'founder', 1, 'founder-token'),
             ('{MEMBER}', 'member', 2, 'member-token'),
-            ('{OUTSIDER}', 'outsider', 3, 'outsider-token');
+            ('{OUTSIDER}', 'outsider', 3, 'outsider-token'),
+            ('{STRANGER}', 'stranger', 4, 'stranger-token');
          INSERT INTO servers (id, name, owner_id, invite_code) VALUES
             ('{SERVER_A}', 'A', '{FOUNDER}', 'invite-a'),
             ('{SERVER_B}', 'B', '{OUTSIDER}', 'invite-b');
@@ -116,6 +119,13 @@ async fn recv(ws: &mut Client) -> Value {
         if let Message::Text(text) = frame {
             return serde_json::from_str(text.as_str()).unwrap();
         }
+    }
+}
+
+/// Fails if the relay sends anything within 500 ms.
+async fn assert_silent(ws: &mut Client) {
+    if let Ok(frame) = tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
+        panic!("expected nothing, got {frame:?}");
     }
 }
 
@@ -392,6 +402,247 @@ async fn channels_are_created_only_in_a_category_of_their_server(pool: DbPool) {
             .await
             .unwrap();
     assert_eq!(in_b, 2);
+}
+
+/// Signs in a stranger, server B's founder, A's member and A's founder, in
+/// that order, and takes the member's notice that the founder came online.
+async fn sign_in_everyone(addr: SocketAddr) -> [Client; 4] {
+    let stranger = sign_in(addr, "stranger-token").await;
+    let outsider = sign_in(addr, "outsider-token").await;
+    let mut member = sign_in(addr, "member-token").await;
+    let founder = sign_in(addr, "founder-token").await;
+    assert_eq!(recv(&mut member).await["type"], "PresenceUpdate");
+    [stranger, outsider, member, founder]
+}
+
+#[sqlx::test(migrator = "crate::db::MIGRATOR")]
+#[ignore = "needs DATABASE_URL"]
+async fn server_events_reach_its_members_only(pool: DbPool) {
+    seed(&pool).await;
+    let [mut stranger, mut outsider, mut member, mut founder] =
+        sign_in_everyone(serve(pool).await).await;
+
+    let events = [
+        (
+            ClientEvent::SendMessage {
+                channel_id: CHANNEL_A,
+                content: "hi".to_string(),
+                reply_to_id: None,
+            },
+            "MessageReceived",
+        ),
+        (
+            ClientEvent::EditMessage {
+                message_id: FOUNDER_MESSAGE,
+                content: "edited".to_string(),
+            },
+            "MessageEdited",
+        ),
+        (
+            ClientEvent::AddReaction {
+                message_id: MEMBER_MESSAGE,
+                emoji: "+1".to_string(),
+            },
+            "ReactionAdded",
+        ),
+        (
+            ClientEvent::RemoveReaction {
+                message_id: MEMBER_MESSAGE,
+                emoji: "+1".to_string(),
+            },
+            "ReactionRemoved",
+        ),
+        (
+            ClientEvent::PinMessage {
+                message_id: MEMBER_MESSAGE,
+            },
+            "MessagePinned",
+        ),
+        (
+            ClientEvent::UnpinMessage {
+                message_id: FOUNDER_MESSAGE,
+            },
+            "MessageUnpinned",
+        ),
+        (
+            ClientEvent::DeleteMessage {
+                message_id: FOUNDER_MESSAGE,
+            },
+            "MessageDeleted",
+        ),
+        (
+            ClientEvent::CreateCategory {
+                server_id: SERVER_A,
+                name: "MORE".to_string(),
+            },
+            "CategoryCreated",
+        ),
+        (
+            ClientEvent::CreateChannel {
+                server_id: SERVER_A,
+                name: "new".to_string(),
+                category_id: None,
+            },
+            "ChannelCreated",
+        ),
+        (
+            ClientEvent::EditChannel {
+                channel_id: CHANNEL_A,
+                name: Some("renamed".to_string()),
+                topic: None,
+            },
+            "ChannelUpdated",
+        ),
+        (
+            ClientEvent::EditServer {
+                server_id: SERVER_A,
+                name: Some("A2".to_string()),
+                icon_url: None,
+            },
+            "ServerUpdated",
+        ),
+        (
+            ClientEvent::AddCustomEmoji {
+                server_id: SERVER_A,
+                name: "wave".to_string(),
+                image_url: "https://example.com/wave.png".to_string(),
+            },
+            "CustomEmojiAdded",
+        ),
+    ];
+    for (event, kind) in &events {
+        let reply = call(&mut founder, event).await;
+        assert_eq!(reply["type"], *kind, "{event:?} got {reply}");
+        assert_eq!(recv(&mut member).await["type"], *kind, "{event:?}");
+    }
+
+    // Typing goes to the other members, then the channel goes.
+    let typing = ClientEvent::StartTyping {
+        channel_id: CHANNEL_A,
+    };
+    send(&mut founder, &typing).await;
+    assert_eq!(recv(&mut member).await["type"], "UserTyping");
+    let delete = ClientEvent::DeleteChannel {
+        channel_id: CHANNEL_A,
+    };
+    assert_eq!(call(&mut founder, &delete).await["type"], "ChannelDeleted");
+    assert_eq!(recv(&mut member).await["type"], "ChannelDeleted");
+
+    tokio::join!(assert_silent(&mut stranger), assert_silent(&mut outsider));
+}
+
+#[sqlx::test(migrator = "crate::db::MIGRATOR")]
+#[ignore = "needs DATABASE_URL"]
+async fn server_deleted_reaches_every_former_member(pool: DbPool) {
+    seed(&pool).await;
+    let [mut stranger, mut outsider, mut member, mut founder] =
+        sign_in_everyone(serve(pool).await).await;
+
+    let delete = ClientEvent::DeleteServer {
+        server_id: SERVER_A,
+    };
+    let deleted = json!({"type": "ServerDeleted", "data": {"server_id": SERVER_A}});
+    assert_eq!(call(&mut founder, &delete).await, deleted);
+    assert_eq!(recv(&mut member).await, deleted);
+
+    tokio::join!(assert_silent(&mut stranger), assert_silent(&mut outsider));
+}
+
+#[sqlx::test(migrator = "crate::db::MIGRATOR")]
+#[ignore = "needs DATABASE_URL"]
+async fn member_left_reaches_the_leaver_and_the_remaining_members(pool: DbPool) {
+    seed(&pool).await;
+    let [mut stranger, mut outsider, mut member, mut founder] =
+        sign_in_everyone(serve(pool).await).await;
+
+    let leave = ClientEvent::LeaveServer {
+        server_id: SERVER_A,
+    };
+    let left = json!({"type": "MemberLeft", "data": {"server_id": SERVER_A, "user_id": MEMBER}});
+    assert_eq!(call(&mut member, &leave).await, left);
+    assert_eq!(recv(&mut founder).await, left);
+
+    // From then on the leaver hears nothing from the server.
+    let post = ClientEvent::SendMessage {
+        channel_id: CHANNEL_A,
+        content: "still here".to_string(),
+        reply_to_id: None,
+    };
+    assert_eq!(call(&mut founder, &post).await["type"], "MessageReceived");
+
+    tokio::join!(
+        assert_silent(&mut stranger),
+        assert_silent(&mut outsider),
+        assert_silent(&mut member),
+    );
+}
+
+#[sqlx::test(migrator = "crate::db::MIGRATOR")]
+#[ignore = "needs DATABASE_URL"]
+async fn presence_reaches_co_members_and_friends_only(pool: DbPool) {
+    seed(&pool).await;
+    // The member shares server A with the founder and is friends with the
+    // outsider, who is not in A.
+    sqlx::query("INSERT INTO friendships (user_a, user_b) VALUES ($1, $2)")
+        .bind(MEMBER)
+        .bind(OUTSIDER)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let addr = serve(pool).await;
+    let mut stranger = sign_in(addr, "stranger-token").await;
+    let mut founder = sign_in(addr, "founder-token").await;
+    let mut outsider = sign_in(addr, "outsider-token").await;
+    let mut member = sign_in(addr, "member-token").await;
+
+    let about_member = |kind: &str, status: &str| json!({"type": kind, "data": {"user_id": MEMBER, "status": status}});
+    assert_eq!(
+        recv(&mut founder).await,
+        about_member("PresenceUpdate", "Online")
+    );
+    assert_eq!(
+        recv(&mut outsider).await,
+        about_member("FriendPresenceUpdate", "Online")
+    );
+
+    let idle = ClientEvent::UpdatePresence {
+        status: artemis_core::models::user::UserStatus::Idle,
+    };
+    send(&mut member, &idle).await;
+    assert_eq!(
+        recv(&mut founder).await,
+        about_member("PresenceUpdate", "Idle")
+    );
+    assert_eq!(
+        recv(&mut outsider).await,
+        about_member("FriendPresenceUpdate", "Idle")
+    );
+
+    // A profile change goes to co-members only.
+    let profile = ClientEvent::UpdateProfile {
+        display_name: Some("Bob".to_string()),
+        custom_status: None,
+    };
+    send(&mut member, &profile).await;
+    let updated = recv(&mut founder).await;
+    assert_eq!(updated["type"], "ProfileUpdated");
+    assert_eq!(updated["data"]["user_id"], MEMBER.to_string());
+
+    member.close(None).await.unwrap();
+    assert_eq!(
+        recv(&mut founder).await,
+        about_member("PresenceUpdate", "Offline")
+    );
+    assert_eq!(
+        recv(&mut outsider).await,
+        about_member("FriendPresenceUpdate", "Offline")
+    );
+
+    tokio::join!(
+        assert_silent(&mut stranger),
+        assert_silent(&mut outsider),
+        assert_silent(&mut founder),
+    );
 }
 
 #[tokio::test]
