@@ -158,10 +158,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             continue;
                         };
 
-                        let server = db::channel_server(&state.db, channel_id)
-                            .await
-                            .ok()
-                            .flatten();
+                        let server = found(db::channel_server(&state.db, channel_id).await);
                         if !authorize(&state, &sender, uid, server, Need::Member).await {
                             continue;
                         }
@@ -182,7 +179,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         match db::create_message(&state.db, channel_id, uid, &content, reply_to_id)
                             .await
                         {
-                            Ok(message) => {
+                            Ok(None) => {
+                                let _ = send_event(
+                                    &sender,
+                                    &ServerEvent::Error {
+                                        message: "The message you reply to is not in this channel"
+                                            .to_string(),
+                                    },
+                                )
+                                .await;
+                            }
+                            Ok(Some(message)) => {
                                 // Track @mentions for unread state
                                 if !mentioned_usernames.is_empty() {
                                     if let Some(server_id) = server {
@@ -233,10 +240,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     } => {
                         let Some(uid) = user_id else { continue };
 
-                        let server = db::message_channel(&state.db, message_id)
-                            .await
-                            .ok()
-                            .flatten()
+                        let server = found(db::message_channel(&state.db, message_id).await)
                             .map(|(_, server)| server);
                         if !authorize(&state, &sender, uid, server, Need::Member).await {
                             continue;
@@ -261,10 +265,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     ClientEvent::DeleteMessage { message_id } => {
                         let Some(uid) = user_id else { continue };
 
-                        let server = db::message_channel(&state.db, message_id)
-                            .await
-                            .ok()
-                            .flatten()
+                        let server = found(db::message_channel(&state.db, message_id).await)
                             .map(|(_, server)| server);
                         if !authorize(&state, &sender, uid, server, Need::Member).await {
                             continue;
@@ -287,10 +288,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     } => {
                         let Some(uid) = user_id else { continue };
 
-                        let server = db::channel_server(&state.db, channel_id)
-                            .await
-                            .ok()
-                            .flatten();
+                        let server = found(db::channel_server(&state.db, channel_id).await);
                         if !authorize(&state, &sender, uid, server, Need::Member).await {
                             continue;
                         }
@@ -316,20 +314,24 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
 
                     ClientEvent::StartTyping { channel_id } => {
-                        if let Some(uid) = user_id {
-                            let uname =
-                                username_cache.clone().unwrap_or_else(|| "User".to_string());
-                            broadcast_event(
-                                &state,
-                                &ServerEvent::UserTyping {
-                                    channel_id,
-                                    user_id: uid,
-                                    username: uname,
-                                },
-                                Some(uid),
-                            )
-                            .await;
+                        let Some(uid) = user_id else { continue };
+
+                        let server = found(db::channel_server(&state.db, channel_id).await);
+                        if !authorize(&state, &sender, uid, server, Need::Member).await {
+                            continue;
                         }
+
+                        let uname = username_cache.clone().unwrap_or_else(|| "User".to_string());
+                        broadcast_event(
+                            &state,
+                            &ServerEvent::UserTyping {
+                                channel_id,
+                                user_id: uid,
+                                username: uname,
+                            },
+                            Some(uid),
+                        )
+                        .await;
                     }
 
                     ClientEvent::UpdatePresence { status } => {
@@ -434,10 +436,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     ClientEvent::AddReaction { message_id, emoji } => {
                         let Some(uid) = user_id else { continue };
 
-                        let server = db::message_channel(&state.db, message_id)
-                            .await
-                            .ok()
-                            .flatten()
+                        let server = found(db::message_channel(&state.db, message_id).await)
                             .map(|(_, server)| server);
                         if !authorize(&state, &sender, uid, server, Need::Member).await {
                             continue;
@@ -461,10 +460,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     ClientEvent::RemoveReaction { message_id, emoji } => {
                         let Some(uid) = user_id else { continue };
 
-                        let server = db::message_channel(&state.db, message_id)
-                            .await
-                            .ok()
-                            .flatten()
+                        let server = found(db::message_channel(&state.db, message_id).await)
                             .map(|(_, server)| server);
                         if !authorize(&state, &sender, uid, server, Need::Member).await {
                             continue;
@@ -490,10 +486,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     ClientEvent::PinMessage { message_id } => {
                         let Some(uid) = user_id else { continue };
 
-                        let place = db::message_channel(&state.db, message_id)
-                            .await
-                            .ok()
-                            .flatten();
+                        let place = found(db::message_channel(&state.db, message_id).await);
                         let server = place.map(|(_, server)| server);
                         if !authorize(&state, &sender, uid, server, Need::Moderator).await {
                             continue;
@@ -521,10 +514,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     ClientEvent::UnpinMessage { message_id } => {
                         let Some(uid) = user_id else { continue };
 
-                        let place = db::message_channel(&state.db, message_id)
-                            .await
-                            .ok()
-                            .flatten();
+                        let place = found(db::message_channel(&state.db, message_id).await);
                         let server = place.map(|(_, server)| server);
                         if !authorize(&state, &sender, uid, server, Need::Moderator).await {
                             continue;
@@ -550,10 +540,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     ClientEvent::FetchPinnedMessages { channel_id } => {
                         let Some(uid) = user_id else { continue };
 
-                        let server = db::channel_server(&state.db, channel_id)
-                            .await
-                            .ok()
-                            .flatten();
+                        let server = found(db::channel_server(&state.db, channel_id).await);
                         if !authorize(&state, &sender, uid, server, Need::Member).await {
                             continue;
                         }
@@ -579,6 +566,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         message_id,
                     } => {
                         let Some(uid) = user_id else { continue };
+
+                        // The message must be in the channel it marks as read.
+                        let server = found(db::message_channel(&state.db, message_id).await)
+                            .filter(|(channel, _)| *channel == channel_id)
+                            .map(|(_, server)| server);
+                        if !authorize(&state, &sender, uid, server, Need::Member).await {
+                            continue;
+                        }
+
                         let _ = db::ack_message(&state.db, uid, channel_id, message_id).await;
                     }
 
@@ -618,12 +614,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         let Some(uid) = user_id else { continue };
 
                         // Founder only
-                        if db::get_server_owner(&state.db, server_id)
-                            .await
-                            .ok()
-                            .flatten()
-                            != Some(uid)
-                        {
+                        if found(db::get_server_owner(&state.db, server_id).await) != Some(uid) {
                             let _ = send_event(
                                 &sender,
                                 &ServerEvent::Error {
@@ -667,10 +658,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     ClientEvent::DeleteChannel { channel_id } => {
                         let Some(uid) = user_id else { continue };
 
-                        let server = db::channel_server(&state.db, channel_id)
-                            .await
-                            .ok()
-                            .flatten();
+                        let server = found(db::channel_server(&state.db, channel_id).await);
                         if !authorize(&state, &sender, uid, server, Need::Moderator).await {
                             continue;
                         }
@@ -696,10 +684,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     } => {
                         let Some(uid) = user_id else { continue };
 
-                        let server = db::channel_server(&state.db, channel_id)
-                            .await
-                            .ok()
-                            .flatten();
+                        let server = found(db::channel_server(&state.db, channel_id).await);
                         if !authorize(&state, &sender, uid, server, Need::Moderator).await {
                             continue;
                         }
@@ -727,12 +712,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         let Some(uid) = user_id else { continue };
 
                         // Check not founder
-                        if db::get_server_owner(&state.db, server_id)
-                            .await
-                            .ok()
-                            .flatten()
-                            == Some(uid)
-                        {
+                        if found(db::get_server_owner(&state.db, server_id).await) == Some(uid) {
                             let _ = send_event(&sender, &ServerEvent::Error {
                                 message: "Server founder cannot leave. Transfer ownership or delete the server.".to_string(),
                             }).await;
@@ -838,10 +818,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                         // A channel search stays inside the server it names.
                         let scope = match channel_id {
-                            Some(channel) => db::channel_server(&state.db, channel)
-                                .await
-                                .ok()
-                                .flatten()
+                            Some(channel) => found(db::channel_server(&state.db, channel).await)
                                 .filter(|server| *server == server_id),
                             None => Some(server_id),
                         };
@@ -1265,10 +1242,7 @@ async fn authorize(
     need: Need,
 ) -> bool {
     let role = match server {
-        Some(server) => db::get_member_role(&state.db, user, server)
-            .await
-            .ok()
-            .flatten(),
+        Some(server) => found(db::get_member_role(&state.db, user, server).await),
         None => None,
     };
     let refusal = match role.as_deref() {
@@ -1285,6 +1259,15 @@ async fn authorize(
     )
     .await;
     false
+}
+
+/// The row a lookup found. A database error is logged and counts as not
+/// found, so the event it guards is refused rather than let through.
+fn found<T>(lookup: Result<Option<T>, sqlx::Error>) -> Option<T> {
+    lookup.unwrap_or_else(|e| {
+        tracing::error!("Database lookup failed: {}", e);
+        None
+    })
 }
 
 pub struct ConnectedUser {

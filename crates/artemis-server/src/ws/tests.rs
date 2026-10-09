@@ -33,6 +33,7 @@ const SERVER_B: Uuid = Uuid::from_u128(0x5b);
 const CATEGORY_A: Uuid = Uuid::from_u128(0xca);
 const CATEGORY_B: Uuid = Uuid::from_u128(0xcb);
 const CHANNEL_A: Uuid = Uuid::from_u128(0xc0a);
+const CHANNEL_B: Uuid = Uuid::from_u128(0xc0b);
 
 /// Pinned in CHANNEL_A.
 const FOUNDER_MESSAGE: Uuid = Uuid::from_u128(0xe1);
@@ -57,7 +58,8 @@ async fn seed(pool: &DbPool) {
             ('{CATEGORY_A}', '{SERVER_A}', 'GENERAL'),
             ('{CATEGORY_B}', '{SERVER_B}', 'GENERAL');
          INSERT INTO channels (id, category_id, server_id, name) VALUES
-            ('{CHANNEL_A}', '{CATEGORY_A}', '{SERVER_A}', 'general');
+            ('{CHANNEL_A}', '{CATEGORY_A}', '{SERVER_A}', 'general'),
+            ('{CHANNEL_B}', '{CATEGORY_B}', '{SERVER_B}', 'general');
          INSERT INTO messages (id, channel_id, author_id, content) VALUES
             ('{FOUNDER_MESSAGE}', '{CHANNEL_A}', '{FOUNDER}', 'hello from the founder'),
             ('{MEMBER_MESSAGE}', '{CHANNEL_A}', '{MEMBER}', 'hello from a member'),
@@ -79,6 +81,7 @@ async fn snapshot(pool: &DbPool) -> String {
              FROM messages),
             (SELECT string_agg(message_id::text, ', ' ORDER BY message_id) FROM pinned_messages),
             (SELECT COUNT(*) FROM message_reactions),
+            (SELECT COUNT(*) FROM channel_read_state),
             (SELECT string_agg(id::text, ', ' ORDER BY id) FROM channels))",
     )
     .fetch_one(pool)
@@ -116,9 +119,13 @@ async fn recv(ws: &mut Client) -> Value {
     }
 }
 
-async fn call(ws: &mut Client, event: &ClientEvent) -> Value {
+async fn send(ws: &mut Client, event: &ClientEvent) {
     let json = serde_json::to_string(event).unwrap();
     ws.send(Message::Text(json.into())).await.unwrap();
+}
+
+async fn call(ws: &mut Client, event: &ClientEvent) -> Value {
+    send(ws, event).await;
     recv(ws).await
 }
 
@@ -150,6 +157,14 @@ fn member_events(own_message: Uuid) -> Vec<(ClientEvent, &'static str)> {
                 channel_id: CHANNEL_A,
                 content: "hi".to_string(),
                 reply_to_id: None,
+            },
+            "MessageReceived",
+        ),
+        (
+            ClientEvent::SendMessage {
+                channel_id: CHANNEL_A,
+                content: "a reply".to_string(),
+                reply_to_id: Some(FOUNDER_MESSAGE),
             },
             "MessageReceived",
         ),
@@ -215,12 +230,41 @@ fn member_events(own_message: Uuid) -> Vec<(ClientEvent, &'static str)> {
 #[ignore = "needs DATABASE_URL"]
 async fn members_read_and_write_in_their_server(pool: DbPool) {
     seed(&pool).await;
-    let mut member = sign_in(serve(pool).await, "member-token").await;
+    let mut member = sign_in(serve(pool.clone()).await, "member-token").await;
 
     for (event, answer) in member_events(MEMBER_MESSAGE) {
         let reply = call(&mut member, &event).await;
         assert_eq!(reply["type"], answer, "{event:?} got {reply}");
     }
+
+    // Typing and read marks get no answer, so the sentinel's answer comes
+    // next, and the read mark is stored.
+    send(
+        &mut member,
+        &ClientEvent::StartTyping {
+            channel_id: CHANNEL_A,
+        },
+    )
+    .await;
+    send(
+        &mut member,
+        &ClientEvent::AckMessage {
+            channel_id: CHANNEL_A,
+            message_id: FOUNDER_MESSAGE,
+        },
+    )
+    .await;
+    assert_eq!(
+        call(&mut member, &ClientEvent::FetchFriends).await["type"],
+        "FriendList"
+    );
+    let read_marks: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM channel_read_state WHERE user_id = $1")
+            .bind(MEMBER)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(read_marks, 1);
 }
 
 #[sqlx::test(migrator = "crate::db::MIGRATOR")]
@@ -241,6 +285,24 @@ async fn non_members_get_an_error_and_nothing_is_read_or_written(pool: DbPool) {
             channel_id: Some(CHANNEL_A),
             query: "hello".to_string(),
             limit: 10,
+        },
+        // A reply in the outsider's own server to a message of A.
+        ClientEvent::SendMessage {
+            channel_id: CHANNEL_B,
+            content: "a reply".to_string(),
+            reply_to_id: Some(MEMBER_MESSAGE),
+        },
+        ClientEvent::StartTyping {
+            channel_id: CHANNEL_A,
+        },
+        ClientEvent::AckMessage {
+            channel_id: CHANNEL_A,
+            message_id: FOUNDER_MESSAGE,
+        },
+        // A read mark in the outsider's own channel for a message of A.
+        ClientEvent::AckMessage {
+            channel_id: CHANNEL_B,
+            message_id: FOUNDER_MESSAGE,
         },
         ClientEvent::PinMessage {
             message_id: MEMBER_MESSAGE,
@@ -323,11 +385,12 @@ async fn channels_are_created_only_in_a_category_of_their_server(pool: DbPool) {
         assert_eq!(reply["type"], "ChannelCreated", "{event:?} got {reply}");
         assert_eq!(reply["data"]["category_id"], CATEGORY_B.to_string());
     }
-    let in_b: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM channels WHERE category_id = $1")
-        .bind(CATEGORY_B)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let in_b: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM channels WHERE category_id = $1 AND name = 'new'")
+            .bind(CATEGORY_B)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(in_b, 2);
 }
 

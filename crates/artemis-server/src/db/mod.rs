@@ -150,53 +150,6 @@ pub async fn get_user_servers(
     Ok(payloads)
 }
 
-// Unused until clients can create a server over the WebSocket. The REST route
-// that called it took the session token in the query string.
-#[allow(dead_code)]
-pub async fn create_server(
-    pool: &DbPool,
-    name: &str,
-    owner_id: Uuid,
-    invite_code: &str,
-) -> Result<Uuid, sqlx::Error> {
-    let row: (Uuid,) = sqlx::query_as(
-        "INSERT INTO servers (name, owner_id, invite_code) VALUES ($1, $2, $3) RETURNING id",
-    )
-    .bind(name)
-    .bind(owner_id)
-    .bind(invite_code)
-    .fetch_one(pool)
-    .await?;
-
-    let server_id = row.0;
-
-    // Add owner as founder member
-    sqlx::query("INSERT INTO server_members (user_id, server_id, role) VALUES ($1, $2, 'founder')")
-        .bind(owner_id)
-        .bind(server_id)
-        .execute(pool)
-        .await?;
-
-    // Create default category + channel
-    let cat_id: (Uuid,) = sqlx::query_as(
-        "INSERT INTO categories (server_id, name, position) VALUES ($1, 'GENERAL', 0) RETURNING id",
-    )
-    .bind(server_id)
-    .fetch_one(pool)
-    .await?;
-
-    sqlx::query(
-        "INSERT INTO channels (category_id, server_id, name, channel_type, topic, position)
-         VALUES ($1, $2, 'general', 'text', 'Welcome!', 0)",
-    )
-    .bind(cat_id.0)
-    .bind(server_id)
-    .execute(pool)
-    .await?;
-
-    Ok(server_id)
-}
-
 pub async fn join_server_by_invite(
     pool: &DbPool,
     user_id: Uuid,
@@ -288,24 +241,31 @@ async fn get_server_members(
 
 // ── Message queries ──
 
+/// Returns None, and inserts nothing, when `reply_to_id` names a message that
+/// is not in `channel_id`.
 pub async fn create_message(
     pool: &DbPool,
     channel_id: Uuid,
     author_id: Uuid,
     content: &str,
     reply_to_id: Option<Uuid>,
-) -> Result<Message, sqlx::Error> {
-    let row = sqlx::query_as::<_, MessageRow>(
+) -> Result<Option<Message>, sqlx::Error> {
+    let Some(row) = sqlx::query_as::<_, MessageRow>(
         "INSERT INTO messages (channel_id, author_id, content, reply_to_id)
-         VALUES ($1, $2, $3, $4)
+         SELECT $1, $2, $3, $4
+         WHERE $4::uuid IS NULL
+            OR EXISTS (SELECT 1 FROM messages WHERE id = $4 AND channel_id = $1)
          RETURNING id, channel_id, author_id, content, edited_at, created_at, reply_to_id",
     )
     .bind(channel_id)
     .bind(author_id)
     .bind(content)
     .bind(reply_to_id)
-    .fetch_one(pool)
-    .await?;
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(None);
+    };
 
     let author = sqlx::query_as::<_, (String, Option<String>)>(
         "SELECT username, avatar_url FROM users WHERE id = $1",
@@ -314,7 +274,7 @@ pub async fn create_message(
     .fetch_one(pool)
     .await?;
 
-    Ok(Message {
+    Ok(Some(Message {
         id: row.id,
         channel_id: row.channel_id,
         author_id: row.author_id,
@@ -327,7 +287,7 @@ pub async fn create_message(
         reply_to_id: row.reply_to_id,
         pinned: false,
         reactions: vec![],
-    })
+    }))
 }
 
 pub async fn get_messages(
