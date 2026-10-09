@@ -1,0 +1,4 @@
+# Keep secrets and build output out of the docker build context.
+.env
+.git
+target

@@ -20,6 +20,18 @@ pub async fn connect(database_url: &str) -> Result<DbPool, sqlx::Error> {
 /// always a new numbered file, never an edit to an existing one.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+/// Readies the database before the relay opens its listener: applies pending
+/// migrations, then sets every user offline. Nobody is connected yet, and a
+/// relay that stopped without running its disconnect cleanup would otherwise
+/// keep showing its last users online.
+pub async fn prepare(pool: &DbPool) -> Result<(), sqlx::Error> {
+    MIGRATOR.run(pool).await?;
+    sqlx::query("UPDATE users SET status = 'offline' WHERE status <> 'offline'")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 // ── User queries ──
 
 pub async fn find_user_by_github_id(
@@ -1480,5 +1492,19 @@ mod tests {
         MIGRATOR.run(&pool).await.unwrap();
 
         assert_eq!(recorded_migrations(&pool).await, MIGRATOR.iter().count());
+    }
+
+    #[sqlx::test(migrator = "MIGRATOR")]
+    #[ignore = "needs DATABASE_URL"]
+    async fn startup_sets_users_left_online_offline(pool: DbPool) {
+        sqlx::query("INSERT INTO users (username, github_id, status) VALUES ('ada', 1, 'online')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        prepare(&pool).await.unwrap();
+
+        let user = find_user_by_github_id(&pool, 1).await.unwrap().unwrap();
+        assert_eq!(user.status, "offline");
     }
 }

@@ -49,15 +49,26 @@ The client runs on its own:
 cargo run --bin artemis
 ```
 
-The relay server needs PostgreSQL 16 or later and reads its settings from environment
-variables (see `.env.example`): `DATABASE_URL`, `BIND_ADDR`, `BASE_URL`,
-`GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET`. To start a local database, copy
-`.env.example` to `.env`, choose a `POSTGRES_PASSWORD`, and run `docker compose up -d`;
-it listens on `127.0.0.1:5432` only.
+The relay server needs PostgreSQL 16 or later and a GitHub OAuth app. It reads its
+settings from the environment and from a `.env` file (see `.env.example`):
+
+1. Copy `.env.example` to `.env`.
+2. Choose a database password of letters and digits, and set it as `POSTGRES_PASSWORD`
+   and in `DATABASE_URL`. Other characters need quoting in `.env` and percent-encoding
+   in the URL.
+3. Create an OAuth app at <https://github.com/settings/developers> with the callback
+   URL `http://localhost:3000/auth/github/callback`, then set `GITHUB_CLIENT_ID` and
+   `GITHUB_CLIENT_SECRET`.
+4. Start the database, which listens on `127.0.0.1:5432` only, then the relay:
 
 ```bash
+docker compose up -d
 cargo run --bin artemis-server
 ```
+
+The relay refuses to start while `DATABASE_URL`, `GITHUB_CLIENT_ID` or
+`GITHUB_CLIENT_SECRET` is missing. It listens on `127.0.0.1:3000` unless `BIND_ADDR`
+says otherwise, and logs at `info` unless `RUST_LOG` says otherwise.
 
 ## License
 
