@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use futures::{Sink, SinkExt, StreamExt};
-use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::AbortHandle;
 use tokio::time::{interval_at, sleep, timeout, Instant};
 use uuid::Uuid;
@@ -47,9 +47,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
     tokio::pin!(deadline);
     let mut bucket = EventBucket::new();
     let (sink, mut receiver) = socket.split();
-    // Every frame to this socket, the replies below and the fan-out alike,
-    // goes through this queue, so they reach the client in the order sent.
-    let (sender, queue) = mpsc::channel(SEND_QUEUE);
+    let (sender, queue) = Outbox::new();
     let ponged = Arc::new(AtomicBool::new(true));
     let mut writer = tokio::spawn(write_frames(sink, queue, ponged.clone()));
 
@@ -1381,24 +1379,78 @@ impl EventBucket {
 /// Frames a socket may have waiting. Enough for a burst of events; a client
 /// that falls this far behind is dropped by the fan-out.
 const SEND_QUEUE: usize = 256;
+/// Bytes a socket may have waiting, so a client that stops reading cannot
+/// pin a queue of large replies.
+const SEND_QUEUE_BYTES: usize = 2 * 1024 * 1024;
+
 /// The longest one frame may take to go out before the socket is dropped.
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the relay pings a socket. A socket that has not answered the
 /// previous ping by the next one is dropped.
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 
+/// A frame in a socket's queue, with the bytes of the queue it takes up.
+type Queued = (Utf8Bytes, OwnedSemaphorePermit);
+
+/// A socket's send queue. Every frame to the socket, its own replies and the
+/// fan-out alike, goes through it, so they reach the client in the order sent.
+/// It holds at most SEND_QUEUE frames and SEND_QUEUE_BYTES bytes.
+#[derive(Clone)]
+pub struct Outbox {
+    frames: mpsc::Sender<Queued>,
+    /// A permit for each byte. A frame holds its own until the writer takes
+    /// it, or until the queue is dropped with it.
+    room: Arc<Semaphore>,
+}
+
+impl Outbox {
+    fn new() -> (Self, mpsc::Receiver<Queued>) {
+        let (frames, queue) = mpsc::channel(SEND_QUEUE);
+        let room = Arc::new(Semaphore::new(SEND_QUEUE_BYTES));
+        (Self { frames, room }, queue)
+    }
+
+    /// The permits `text` takes. A frame larger than the whole budget takes
+    /// all of it, so it still goes out once the queue is empty.
+    fn cost(text: &Utf8Bytes) -> u32 {
+        text.len().min(SEND_QUEUE_BYTES) as u32
+    }
+
+    /// Queues `text`, waiting while the queue is full.
+    async fn send(&self, text: Utf8Bytes) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let room = self
+            .room
+            .clone()
+            .acquire_many_owned(Self::cost(&text))
+            .await?;
+        self.frames.send((text, room)).await?;
+        Ok(())
+    }
+
+    /// Queues `text`, or returns false at once when the queue is full.
+    fn try_send(&self, text: Utf8Bytes) -> bool {
+        self.room
+            .clone()
+            .try_acquire_many_owned(Self::cost(&text))
+            .is_ok_and(|room| self.frames.try_send((text, room)).is_ok())
+    }
+}
+
 /// Writes a socket's queued frames and pings it. Stops when the queue closes,
 /// when a frame takes longer than SEND_TIMEOUT, or when a ping got no pong.
 async fn write_frames(
     mut sink: impl Sink<WsMessage> + Unpin,
-    mut queue: mpsc::Receiver<Utf8Bytes>,
+    mut queue: mpsc::Receiver<Queued>,
     ponged: Arc<AtomicBool>,
 ) {
     let mut ping = interval_at(Instant::now() + PING_INTERVAL, PING_INTERVAL);
     loop {
         let frame = tokio::select! {
-            text = queue.recv() => match text {
-                Some(text) => WsMessage::Text(text),
+            // The frame gives its room back as it leaves the queue, so a
+            // socket holds at most the budget, or one larger frame, plus the
+            // frame being written.
+            queued = queue.recv() => match queued {
+                Some((text, _)) => WsMessage::Text(text),
                 None => return,
             },
             _ = ping.tick() => {
@@ -1428,7 +1480,7 @@ enum Need {
 /// in, so a non-member cannot probe which ids exist.
 async fn authorize(
     state: &AppState,
-    sender: &mpsc::Sender<Utf8Bytes>,
+    sender: &Outbox,
     user: Uuid,
     server: Option<Uuid>,
     need: Need,
@@ -1474,7 +1526,7 @@ fn listed(lookup: Result<HashSet<Uuid>, sqlx::Error>) -> HashSet<Uuid> {
 pub struct ConnectedUser {
     pub user_id: Uuid,
     /// The socket's send queue.
-    pub queue: mpsc::Sender<Utf8Bytes>,
+    pub queue: Outbox,
     /// Stops the socket's writer, which ends its connection.
     pub writer: AbortHandle,
 }
@@ -1488,11 +1540,10 @@ pub fn new_connection_map() -> ConnectionMap {
 /// Queue an event for this socket, behind everything queued before it. Waits
 /// while the queue is full, which only ever holds up this socket's own reader.
 async fn send_event(
-    sender: &mpsc::Sender<Utf8Bytes>,
+    sender: &Outbox,
     event: &ServerEvent,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    sender.send(serde_json::to_string(event)?.into()).await?;
-    Ok(())
+    sender.send(serde_json::to_string(event)?.into()).await
 }
 
 /// Send an event to every open socket of `users`. The queues are copied out
@@ -1503,7 +1554,7 @@ async fn send_to_users(state: &AppState, users: &HashSet<Uuid>, event: &ServerEv
         return;
     };
     let text = Utf8Bytes::from(json);
-    let queues: Vec<(Uuid, mpsc::Sender<Utf8Bytes>)> = state
+    let queues: Vec<(Uuid, Outbox)> = state
         .connections
         .read()
         .await
@@ -1513,7 +1564,7 @@ async fn send_to_users(state: &AppState, users: &HashSet<Uuid>, event: &ServerEv
         .collect();
     let behind: Vec<Uuid> = queues
         .into_iter()
-        .filter(|(_, queue)| queue.try_send(text.clone()).is_err())
+        .filter(|(_, queue)| !queue.try_send(text.clone()))
         .map(|(id, _)| id)
         .collect();
     if behind.is_empty() {

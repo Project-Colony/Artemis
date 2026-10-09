@@ -848,15 +848,14 @@ async fn a_client_that_stops_reading_holds_up_nobody(pool: DbPool) {
 
 #[tokio::test]
 async fn a_full_queue_drops_only_its_socket() {
-    use super::ConnectedUser;
-    use tokio::sync::mpsc;
+    use super::{ConnectedUser, Outbox};
 
     let state = app_state(unused_pool());
     let users = [1, 2, 3].map(Uuid::from_u128);
     let mut queues = Vec::new();
     let mut writers = Vec::new();
     for (conn, user_id) in users.into_iter().enumerate() {
-        let (queue, rx) = mpsc::channel(1);
+        let (queue, rx) = Outbox::new();
         let writer = tokio::spawn(std::future::pending::<()>());
         let entry = ConnectedUser {
             user_id,
@@ -871,18 +870,18 @@ async fn a_full_queue_drops_only_its_socket() {
         queues.push(rx);
         writers.push(writer);
     }
-    // The third socket has not taken its last frame yet.
+    // The third socket has not taken a frame as large as its whole queue.
     let third = state.connections.read().await[&Uuid::from_u128(2)]
         .queue
         .clone();
-    third.try_send("earlier".into()).unwrap();
+    assert!(third.try_send("x".repeat(super::SEND_QUEUE_BYTES).into()));
 
     let event = artemis_core::protocol::ServerEvent::PublicKeyAcknowledged;
     super::send_to_users(&state, &users.into(), &event).await;
 
     let frame = serde_json::to_string(&event).unwrap();
     for rx in &mut queues[..2] {
-        assert_eq!(rx.try_recv().unwrap().as_str(), frame);
+        assert_eq!(rx.try_recv().unwrap().0.as_str(), frame);
     }
     let connections = state.connections.read().await;
     let mut left: Vec<_> = connections.keys().map(|id| id.as_u128()).collect();
@@ -895,12 +894,36 @@ async fn a_full_queue_drops_only_its_socket() {
     assert!(writers.iter().all(|writer| !writer.is_finished()));
 }
 
+#[tokio::test]
+async fn a_send_queue_holds_at_most_its_byte_budget() {
+    let (outbox, mut queue) = super::Outbox::new();
+    let half = || "x".repeat(super::SEND_QUEUE_BYTES / 2).into();
+    assert!(outbox.try_send(half()));
+    assert!(outbox.try_send(half()));
+    // Two frames, far from SEND_QUEUE, but every byte is taken. The fan-out
+    // gives up and the socket's own reader waits.
+    assert!(!outbox.try_send("x".into()));
+    let wait = tokio::time::timeout(Duration::from_millis(100), outbox.send("x".into()));
+    assert!(wait.await.is_err(), "a reply was queued past the budget");
+
+    // A frame gives its room back as the writer takes it.
+    drop(queue.recv().await.unwrap());
+    outbox.send("x".into()).await.unwrap();
+
+    // A frame larger than the whole budget goes in once the queue is empty.
+    let too_large = || "x".repeat(super::SEND_QUEUE_BYTES * 3).into();
+    assert!(!outbox.try_send(too_large()));
+    drop(queue.recv().await.unwrap());
+    drop(queue.recv().await.unwrap());
+    assert!(outbox.try_send(too_large()));
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_socket_that_misses_a_ping_is_dropped() {
     // The writer on its own, since a socket that has not signed in is closed
     // long before the first ping. The test reads what it sends.
     let (sink, mut sent) = futures::channel::mpsc::unbounded();
-    let (_queue, frames) = tokio::sync::mpsc::channel(1);
+    let (_queue, frames) = super::Outbox::new();
     let ponged = Arc::new(AtomicBool::new(true));
     let writer = tokio::spawn(super::write_frames(sink, frames, ponged.clone()));
     let is_ping = |frame| matches!(frame, Some(axum::extract::ws::Message::Ping(_)));
@@ -966,7 +989,7 @@ async fn a_client_that_answers_pings_stays_connected(pool: DbPool) {
 async fn a_frame_that_cannot_go_out_in_time_ends_the_writer() {
     // A sink that never takes the frame, like a client whose buffers are full.
     let (sink, _never_read) = futures::channel::mpsc::channel::<axum::extract::ws::Message>(0);
-    let (queue, frames) = tokio::sync::mpsc::channel(1);
+    let (queue, frames) = super::Outbox::new();
     let writer = tokio::spawn(super::write_frames(sink, frames, Default::default()));
     queue.send("stuck".into()).await.unwrap();
     let start = tokio::time::Instant::now();
