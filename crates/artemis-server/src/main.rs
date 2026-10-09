@@ -26,7 +26,8 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::connect(&database_url).await?;
 
     // Run migrations
-    db::run_migrations(&pool).await?;
+    db::MIGRATOR.run(&pool).await?;
+    tracing::info!("Database migrations applied");
 
     let app_state = AppState {
         db: pool,

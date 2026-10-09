@@ -15,18 +15,10 @@ pub async fn connect(database_url: &str) -> Result<DbPool, sqlx::Error> {
     Ok(pool)
 }
 
-pub async fn run_migrations(pool: &DbPool) -> Result<(), sqlx::Error> {
-    let migration = include_str!("../../migrations/001_init.sql");
-    sqlx::raw_sql(migration).execute(pool).await?;
-    let migration2 = include_str!("../../migrations/002_friends_and_dms.sql");
-    sqlx::raw_sql(migration2).execute(pool).await?;
-    let migration3 = include_str!("../../migrations/003_reactions_replies_pins_unread.sql");
-    sqlx::raw_sql(migration3).execute(pool).await?;
-    let migration4 = include_str!("../../migrations/004_attachments_search_emojis.sql");
-    sqlx::raw_sql(migration4).execute(pool).await?;
-    tracing::info!("Database migrations applied");
-    Ok(())
-}
+/// Every file in `migrations/`, each applied once and recorded in
+/// `_sqlx_migrations`. sqlx checksums applied files, so a schema change is
+/// always a new numbered file, never an edit to an existing one.
+pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 // ── User queries ──
 
@@ -1422,4 +1414,71 @@ pub async fn resolve_mentions(
         }
     }
     Ok(results)
+}
+
+// The ignored tests need a Postgres server: set DATABASE_URL and run
+// `cargo test -p artemis-server -- --include-ignored`. sqlx::test gives each
+// test its own empty database. CI runs them in the relay-db job.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn recorded_migrations(pool: &DbPool) -> usize {
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE success")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        rows as usize
+    }
+
+    #[test]
+    fn applied_migrations_are_unchanged() {
+        // SHA-384 of each file as shipped. Deployed relays recorded these, and
+        // an edited file stops them at startup with VersionMismatch.
+        let frozen = [
+            (1, "094404878e8a015a4798f1e22487f9fbe9c344c647c27423fd78448669e4a512c08d89efabe3ca64fad34343dcd58599"),
+            (2, "d022f78b6bb03d6b61718df629fd94010bb9499a28805751272f180c5e57c58bb3bd6f06fe2069c3888c17abf9ba9c20"),
+            (3, "4d64e9c20652479599559c08ce106762bb2c86661cce7da9981882c5ae87487c09634cd060c7a2306424989c927d4d3e"),
+            (4, "9abcb7c84c0c61a8e77dfecec6819cd70409f6615579a2de5b6bcf014863809a9d5af6a74fa838730baa2c126de3cb72"),
+        ];
+        for (version, expected) in frozen {
+            let migration = MIGRATOR.iter().find(|m| m.version == version).unwrap();
+            let actual: String = migration
+                .checksum
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            assert_eq!(
+                actual, expected,
+                "migration {version} changed after release; revert it and put the change in a new numbered file"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "needs DATABASE_URL"]
+    async fn migrator_adopts_a_database_built_by_the_old_startup(pool: DbPool) {
+        // Before the migrator, every start ran 001 to 004 with raw_sql and
+        // recorded nothing, so those databases have no _sqlx_migrations table.
+        for migration in MIGRATOR.iter().filter(|m| m.version <= 4) {
+            sqlx::raw_sql(migration.sql.clone())
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        MIGRATOR.run(&pool).await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+
+        assert_eq!(recorded_migrations(&pool).await, MIGRATOR.iter().count());
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "needs DATABASE_URL"]
+    async fn migrator_runs_twice_on_an_empty_database(pool: DbPool) {
+        MIGRATOR.run(&pool).await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+
+        assert_eq!(recorded_migrations(&pool).await, MIGRATOR.iter().count());
+    }
 }

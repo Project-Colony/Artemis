@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS friend_requests (
     UNIQUE(from_user_id, to_user_id)
 );
 
--- Accepted friendships (bidirectional — stored once, smaller user_id first)
+-- Accepted friendships (bidirectional, stored once, smaller user_id first)
 CREATE TABLE IF NOT EXISTS friendships (
     user_a UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     user_b UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,

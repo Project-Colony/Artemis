@@ -1,13 +1,6 @@
--- File attachments
-CREATE TABLE IF NOT EXISTS attachments (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    message_id UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-    filename VARCHAR(512) NOT NULL,
-    url TEXT NOT NULL,
-    content_type VARCHAR(128) NOT NULL DEFAULT 'application/octet-stream',
-    size_bytes BIGINT NOT NULL DEFAULT 0,
-    uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
+-- File attachments: 001 already creates the table, so only the upload time
+-- is new here.
+ALTER TABLE attachments ADD COLUMN IF NOT EXISTS uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 
 CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
 
