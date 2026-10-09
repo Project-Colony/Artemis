@@ -1047,6 +1047,20 @@ async fn a_frame_over_64_kib_closes_the_socket() {
     assert!(closed(&end), "{end:?}");
 }
 
+#[test]
+fn a_message_at_the_character_cap_fits_in_a_frame() {
+    use artemis_core::protocol::MAX_MESSAGE_CHARS;
+    // Control characters are escaped as six bytes each, the most any
+    // character takes in JSON.
+    let event = ClientEvent::SendMessage {
+        channel_id: CHANNEL_A,
+        content: "\u{1}".repeat(MAX_MESSAGE_CHARS),
+        reply_to_id: Some(FOUNDER_MESSAGE),
+    };
+    let frame = serde_json::to_string(&event).unwrap();
+    assert!(frame.len() < super::MAX_MESSAGE, "{} bytes", frame.len());
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_socket_that_does_not_sign_in_is_closed_after_the_deadline() {
     // The paused clock jumps to the next timer whenever the runtime idles,
@@ -1254,4 +1268,34 @@ async fn a_sixth_socket_for_one_user_is_refused(pool: DbPool) {
         call(&mut sixth, &event).await,
         json!({"type": "AuthError", "data": {"reason": "Too many connections for this account"}})
     );
+}
+
+#[sqlx::test(migrator = "crate::db::MIGRATOR")]
+#[ignore = "needs DATABASE_URL"]
+async fn messages_over_the_character_cap_are_refused(pool: DbPool) {
+    use artemis_core::protocol::MAX_MESSAGE_CHARS;
+    seed(&pool).await;
+    let mut member = sign_in(serve(pool.clone()).await, "member-token").await;
+    let before = snapshot(&pool).await;
+
+    // Counted in characters: each of these is two bytes.
+    let over = "\u{e9}".repeat(MAX_MESSAGE_CHARS + 1);
+    let post = |content: String| ClientEvent::SendMessage {
+        channel_id: CHANNEL_A,
+        content,
+        reply_to_id: None,
+    };
+    let edit = ClientEvent::EditMessage {
+        message_id: MEMBER_MESSAGE,
+        content: over.clone(),
+    };
+    let refused = json!({"type": "Error", "data": {"message": format!(
+        "A message may have at most {MAX_MESSAGE_CHARS} characters"
+    )}});
+    assert_eq!(call(&mut member, &post(over)).await, refused);
+    assert_eq!(call(&mut member, &edit).await, refused);
+    assert_eq!(snapshot(&pool).await, before);
+
+    let at_cap = post("\u{e9}".repeat(MAX_MESSAGE_CHARS));
+    assert_eq!(call(&mut member, &at_cap).await["type"], "MessageReceived");
 }

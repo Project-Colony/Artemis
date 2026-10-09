@@ -15,7 +15,9 @@ use tokio::task::AbortHandle;
 use tokio::time::{interval_at, sleep, timeout, Instant};
 use uuid::Uuid;
 
-use artemis_core::protocol::{ClientEvent, FriendPayload, FriendRequestPayload, ServerEvent};
+use artemis_core::protocol::{
+    ClientEvent, FriendPayload, FriendRequestPayload, ServerEvent, MAX_MESSAGE_CHARS,
+};
 
 use crate::db;
 use crate::state::AppState;
@@ -223,6 +225,9 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                         reply_to_id,
                     } => {
                         let Some(uid) = user_id else { continue };
+                        if too_long(&sender, &content).await {
+                            continue;
+                        }
 
                         let server = found(db::channel_server(&state.db, channel_id).await);
                         let Some(server_id) =
@@ -305,6 +310,9 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                         content,
                     } => {
                         let Some(uid) = user_id else { continue };
+                        if too_long(&sender, &content).await {
+                            continue;
+                        }
 
                         let server = found(db::message_channel(&state.db, message_id).await)
                             .map(|(_, server)| server);
@@ -1503,6 +1511,21 @@ async fn authorize(
     )
     .await;
     None
+}
+
+/// True, after telling the socket, when `content` is over MAX_MESSAGE_CHARS.
+async fn too_long(sender: &Outbox, content: &str) -> bool {
+    if content.chars().count() <= MAX_MESSAGE_CHARS {
+        return false;
+    }
+    let _ = send_event(
+        sender,
+        &ServerEvent::Error {
+            message: format!("A message may have at most {MAX_MESSAGE_CHARS} characters"),
+        },
+    )
+    .await;
+    true
 }
 
 /// The row a lookup found. A database error is logged and counts as not

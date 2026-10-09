@@ -13,7 +13,7 @@ use uuid::Uuid;
 use artemis_core::models::message::Message;
 use artemis_core::models::user::{MemberRole, ServerMember, User, UserStatus};
 use artemis_core::protocol::{
-    ClientEvent, FriendPayload, FriendRequestPayload, ServerEvent, ServerPayload,
+    ClientEvent, FriendPayload, FriendRequestPayload, ServerEvent, ServerPayload, MAX_MESSAGE_CHARS,
 };
 
 use artemis_p2p::crypto::{Identity, Purpose};
@@ -557,7 +557,9 @@ impl Artemis {
             AppMessage::ChannelSidebar(ChannelSidebarMsg::ToggleCategory(_cat_id)) => {}
 
             AppMessage::ChatArea(ChatAreaMsg::InputChanged(val)) => {
-                self.message_input = val;
+                // The relay refuses longer messages, so a long paste is cut
+                // here, where it shows, instead of failing once sent.
+                self.message_input = val.chars().take(MAX_MESSAGE_CHARS).collect();
             }
             AppMessage::ChatArea(ChatAreaMsg::SendMessage) => {
                 if !self.message_input.trim().is_empty() {
