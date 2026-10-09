@@ -42,7 +42,7 @@ impl QuicTransport {
 
         let cert = CertificateDer::from(certified_key.cert.der().to_vec());
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-            certified_key.key_pair.serialize_der(),
+            certified_key.signing_key.serialize_der(),
         ));
         let cert_fingerprint = hex_fingerprint(&cert);
         let provider = Arc::new(rustls::crypto::ring::default_provider());
