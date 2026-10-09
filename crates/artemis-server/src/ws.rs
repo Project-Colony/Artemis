@@ -5,13 +5,14 @@ use std::time::Duration;
 
 use axum::extract::ws::{Message as WsMessage, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
-use axum::response::IntoResponse;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use futures::{Sink, SinkExt, StreamExt};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock};
 use tokio::task::AbortHandle;
-use tokio::time::{interval_at, timeout, Instant};
+use tokio::time::{interval_at, sleep, timeout, Instant};
 use uuid::Uuid;
 
 use artemis_core::protocol::{ClientEvent, FriendPayload, FriendRequestPayload, ServerEvent};
@@ -23,11 +24,27 @@ pub fn ws_routes() -> Router<AppState> {
     Router::new().route("/ws", get(ws_handler))
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
+    // The socket holds the permit until it signs in, so the cap counts open
+    // sockets rather than handshakes in flight.
+    // ponytail: one cap for every address, so a flood of silent sockets can
+    // keep others out for AUTH_DEADLINE. No per-IP cap, because behind a
+    // proxy every peer shares one address; add ConnectInfo plus a trusted
+    // X-Forwarded-For if abuse appears.
+    let Ok(permit) = state.unauthenticated.clone().try_acquire_owned() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    ws.max_message_size(MAX_MESSAGE)
+        .max_frame_size(MAX_MESSAGE)
+        .on_upgrade(move |socket| handle_socket(socket, state, permit))
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState) {
+async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphorePermit) {
+    // Released once the socket signs in.
+    let mut unauthenticated = Some(permit);
+    let deadline = sleep(AUTH_DEADLINE);
+    tokio::pin!(deadline);
+    let mut bucket = EventBucket::new();
     let (sink, mut receiver) = socket.split();
     // Every frame to this socket, the replies below and the fan-out alike,
     // goes through this queue, so they reach the client in the order sent.
@@ -47,16 +64,31 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             },
             // The writer gave up on the socket, or the fan-out dropped it.
             _ = &mut writer => break,
+            _ = &mut deadline, if user_id.is_none() => {
+                tracing::debug!("Closing a socket that did not sign in in time");
+                break;
+            }
         };
+        if !bucket.take() {
+            tracing::warn!("Closing a socket that sent events too fast");
+            break;
+        }
         match msg {
             WsMessage::Text(txt) => {
-                let event: ClientEvent = match serde_json::from_str(&txt) {
-                    Ok(e) => e,
+                let event = serde_json::from_str::<ClientEvent>(&txt);
+                // Until it signs in, a socket may send nothing but Authenticate.
+                if user_id.is_none() && !matches!(event, Ok(ClientEvent::Authenticate { .. })) {
+                    break;
+                }
+                let event = match event {
+                    Ok(event) => event,
                     Err(e) => {
+                        // The error can quote the frame, so it is never sent back.
+                        tracing::debug!("Invalid event: {}", e);
                         let _ = send_event(
                             &sender,
                             &ServerEvent::Error {
-                                message: format!("Invalid event: {}", e),
+                                message: "Invalid event".to_string(),
                             },
                         )
                         .await;
@@ -66,29 +98,56 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                 match event {
                     ClientEvent::Authenticate { token } => {
+                        if user_id.is_some() {
+                            let _ = send_event(
+                                &sender,
+                                &ServerEvent::Error {
+                                    message: "Already authenticated".to_string(),
+                                },
+                            )
+                            .await;
+                            continue;
+                        }
                         match db::find_user_by_token(&state.db, &token).await {
                             Ok(Some(user)) => {
-                                user_id = Some(user.id);
-                                username_cache = Some(user.username.clone());
-
-                                // Register the socket. The user's first one
+                                // Register the socket unless the user has as
+                                // many open as they may. The user's first one
                                 // brings them online; later ones keep the
                                 // status they already have, Idle or DND too.
                                 let presence = state.presence.lock().await;
                                 let first = {
                                     let mut connections = state.connections.write().await;
-                                    let first =
-                                        !connections.values().any(|conn| conn.user_id == user.id);
-                                    connections.insert(
-                                        conn_id,
-                                        ConnectedUser {
-                                            user_id: user.id,
-                                            queue: sender.clone(),
-                                            writer: writer.abort_handle(),
-                                        },
-                                    );
-                                    first
+                                    let open = connections
+                                        .values()
+                                        .filter(|conn| conn.user_id == user.id)
+                                        .count();
+                                    (open < MAX_SOCKETS_PER_USER).then(|| {
+                                        connections.insert(
+                                            conn_id,
+                                            ConnectedUser {
+                                                user_id: user.id,
+                                                queue: sender.clone(),
+                                                writer: writer.abort_handle(),
+                                            },
+                                        );
+                                        open == 0
+                                    })
                                 };
+                                let Some(first) = first else {
+                                    drop(presence);
+                                    let _ = send_event(
+                                        &sender,
+                                        &ServerEvent::AuthError {
+                                            reason: "Too many connections for this account"
+                                                .to_string(),
+                                        },
+                                    )
+                                    .await;
+                                    continue;
+                                };
+                                user_id = Some(user.id);
+                                username_cache = Some(user.username.clone());
+                                drop(unauthenticated.take());
                                 if first {
                                     let _ =
                                         db::update_user_status(&state.db, user.id, "online").await;
@@ -153,16 +212,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         content,
                         reply_to_id,
                     } => {
-                        let Some(uid) = user_id else {
-                            let _ = send_event(
-                                &sender,
-                                &ServerEvent::Error {
-                                    message: "Not authenticated".to_string(),
-                                },
-                            )
-                            .await;
-                            continue;
-                        };
+                        let Some(uid) = user_id else { continue };
 
                         let server = found(db::channel_server(&state.db, channel_id).await);
                         let Some(server_id) =
@@ -1271,6 +1321,49 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         announce_presence(&state, uid, artemis_core::models::user::UserStatus::Offline).await;
     }
     tracing::info!("User {} disconnected", uid);
+}
+
+/// The largest frame, and the largest message, a client may send. A frame
+/// over it closes the socket before its payload is read.
+const MAX_MESSAGE: usize = 64 * 1024;
+/// How long a new socket has to sign in before it is closed.
+const AUTH_DEADLINE: Duration = Duration::from_secs(10);
+/// Sockets open at once that have not signed in yet.
+pub const MAX_UNAUTHENTICATED: usize = 512;
+/// Sockets one user may have signed in at once.
+const MAX_SOCKETS_PER_USER: usize = 5;
+/// Frames a socket may send each second, on average.
+const EVENTS_PER_SECOND: f64 = 20.0;
+/// Frames a socket may send at once after a quiet spell.
+const EVENT_BURST: f64 = 40.0;
+
+/// A token bucket over the frames one socket sends. A socket that empties it
+/// is closed.
+struct EventBucket {
+    tokens: f64,
+    last: Instant,
+}
+
+impl EventBucket {
+    fn new() -> Self {
+        Self {
+            tokens: EVENT_BURST,
+            last: Instant::now(),
+        }
+    }
+
+    /// Takes a token for one frame, or returns false when none is left.
+    fn take(&mut self) -> bool {
+        let now = Instant::now();
+        let refill = now.duration_since(self.last).as_secs_f64() * EVENTS_PER_SECOND;
+        self.tokens = (self.tokens + refill).min(EVENT_BURST);
+        self.last = now;
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
 }
 
 /// Frames a socket may have waiting. Enough for a burst of events; a client

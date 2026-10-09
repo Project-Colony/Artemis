@@ -6,11 +6,14 @@
 //! relay-db job.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use uuid::Uuid;
@@ -97,6 +100,7 @@ fn app_state(db: DbPool) -> AppState {
         db,
         connections: super::new_connection_map(),
         presence: Default::default(),
+        unauthenticated: Arc::new(Semaphore::new(super::MAX_UNAUTHENTICATED)),
         github_client_id: String::new(),
         github_client_secret: String::new(),
         base_url: "http://127.0.0.1".to_string(),
@@ -152,10 +156,14 @@ async fn call(ws: &mut Client, event: &ClientEvent) -> Value {
     recv(ws).await
 }
 
+async fn connect(addr: SocketAddr) -> tokio_tungstenite::tungstenite::Result<Client> {
+    Ok(tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await?
+        .0)
+}
+
 async fn sign_in(addr: SocketAddr, token: &str) -> Client {
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
-        .await
-        .unwrap();
+    let mut ws = connect(addr).await.unwrap();
     let event = ClientEvent::Authenticate {
         token: token.to_string(),
     };
@@ -790,7 +798,16 @@ async fn a_client_that_stops_reading_holds_up_nobody(pool: DbPool) {
     // The member signs in, then never reads again.
     let _stuck = sign_in(addr, "member-token").await;
     let mut watcher = sign_in(addr, "stranger-token").await;
-    let mut poster = sign_in(addr, "founder-token").await;
+    // A socket may send EVENTS_PER_SECOND events, so the founder posts from
+    // as many sockets as one user may open, in turn, each at that rate.
+    let mut posters = Vec::new();
+    for _ in 0..super::MAX_SOCKETS_PER_USER {
+        posters.push(sign_in(addr, "founder-token").await);
+    }
+    let mut pace = tokio::time::interval(Duration::from_secs_f64(
+        1.0 / (super::EVENTS_PER_SECOND * posters.len() as f64),
+    ));
+    pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     assert_eq!(recv(&mut watcher).await["type"], "PresenceUpdate");
 
     // Large messages fill the stuck socket's buffers, then its queue. Once
@@ -805,8 +822,11 @@ async fn a_client_that_stops_reading_holds_up_nobody(pool: DbPool) {
         json!({"type": "PresenceUpdate", "data": {"user_id": MEMBER, "status": "Offline"}});
     let mut dropped = false;
     for sent in 1..=2000 {
-        send(&mut poster, &post).await;
-        until_message(&mut poster).await;
+        pace.tick().await;
+        send(&mut posters[sent % super::MAX_SOCKETS_PER_USER], &post).await;
+        for poster in &mut posters {
+            until_message(poster).await;
+        }
         dropped |= until_message(&mut watcher).await.contains(&offline);
         if sent % 64 == 0 {
             // Signing in is not held up either. The outsider shares no server
@@ -871,46 +891,28 @@ async fn a_full_queue_drops_only_its_socket() {
     assert!(writers.iter().all(|writer| !writer.is_finished()));
 }
 
-/// Pings that reach `ws` until `until`. Reading answers each one, as a live
-/// client does. Panics if the socket closes.
-async fn pings_until(ws: &mut Client, until: tokio::time::Instant) -> usize {
-    let mut pings = 0;
-    while let Ok(frame) = tokio::time::timeout_at(until, ws.next()).await {
-        match frame {
-            Some(Ok(Message::Ping(_))) => pings += 1,
-            other => panic!("expected a ping, got {other:?}"),
-        }
-    }
-    pings
-}
-
 #[tokio::test(start_paused = true)]
 async fn a_socket_that_misses_a_ping_is_dropped() {
-    // The paused clock jumps to the next timer whenever the runtime idles,
-    // even while a frame is on its way. A 10 ms ticker keeps the jumps short,
-    // so a pong reaches the relay long before the next ping.
-    tokio::spawn(async {
-        let mut tick = tokio::time::interval(Duration::from_millis(10));
-        loop {
-            tick.tick().await;
-        }
-    });
-    let addr = serve(unused_pool()).await;
-    let connect = || tokio_tungstenite::connect_async(format!("ws://{addr}/ws"));
-    let (mut reading, _) = connect().await.unwrap();
-    let (mut stopped, _) = connect().await.unwrap();
-    let start = tokio::time::Instant::now();
+    // The writer on its own, since a socket that has not signed in is closed
+    // long before the first ping. The test reads what it sends.
+    let (sink, mut sent) = futures::channel::mpsc::unbounded();
+    let (_queue, frames) = tokio::sync::mpsc::channel(1);
+    let ponged = Arc::new(AtomicBool::new(true));
+    let writer = tokio::spawn(super::write_frames(sink, frames, ponged.clone()));
+    let is_ping = |frame| matches!(frame, Some(axum::extract::ws::Message::Ping(_)));
 
-    // Pings go out at 30 s and 60 s. The client that stopped reading never
-    // answered the first, so the relay drops it at the second.
-    let after = |secs| start + Duration::from_secs(secs);
-    assert_eq!(pings_until(&mut reading, after(65)).await, 2);
-    assert!(matches!(stopped.next().await, Some(Ok(Message::Ping(_)))));
-    let end = stopped.next().await;
-    assert!(matches!(end, None | Some(Err(_))), "still open: {end:?}");
-
-    // The client that reads stays through two more pings.
-    assert_eq!(pings_until(&mut reading, after(125)).await, 2);
+    // A client that answers every ping, as the reader records each pong,
+    // stays connected through four of them.
+    for _ in 0..4 {
+        assert!(is_ping(sent.next().await));
+        ponged.store(true, Ordering::Relaxed);
+    }
+    // Once it stops answering, the next ping finds the last one unanswered.
+    assert!(is_ping(sent.next().await));
+    let missed = tokio::time::Instant::now();
+    writer.await.unwrap();
+    assert_eq!(missed.elapsed(), super::PING_INTERVAL);
+    assert_eq!(sent.next().await, None);
 }
 
 #[tokio::test(start_paused = true)]
@@ -950,4 +952,198 @@ async fn rest_routes_that_took_the_token_in_the_query_are_gone() {
 
     let health = http.get(format!("http://{addr}/health")).send().await;
     assert_eq!(health.unwrap().status(), 200);
+}
+
+/// The relay closed `ws`: it ended, failed, or got a close frame.
+fn closed(frame: &Option<tokio_tungstenite::tungstenite::Result<Message>>) -> bool {
+    matches!(frame, None | Some(Err(_)) | Some(Ok(Message::Close(_))))
+}
+
+#[tokio::test]
+async fn a_frame_over_64_kib_closes_the_socket() {
+    let mut ws = connect(serve(unused_pool()).await).await.unwrap();
+    // A well-formed Authenticate, so only its size can close the socket.
+    // Read in full, it would get an AuthError, or wait on a database that is
+    // not there.
+    let event = ClientEvent::Authenticate {
+        token: "t".repeat(128 * 1024),
+    };
+    let json = serde_json::to_string(&event).unwrap();
+    // The relay may close the socket before the frame is fully written.
+    let _ = ws.send(Message::Text(json.into())).await;
+
+    let end = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("the socket is still open");
+    assert!(closed(&end), "{end:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_socket_that_does_not_sign_in_is_closed_after_the_deadline() {
+    // The paused clock jumps to the next timer whenever the runtime idles,
+    // even while a frame is on its way. A 10 ms ticker keeps the jumps short.
+    tokio::spawn(async {
+        let mut tick = tokio::time::interval(Duration::from_millis(10));
+        loop {
+            tick.tick().await;
+        }
+    });
+    let addr = serve(unused_pool()).await;
+    let start = tokio::time::Instant::now();
+    let mut ws = connect(addr).await.unwrap();
+
+    // Closed, not pinged: the first ping would come at 30 seconds.
+    let end = ws.next().await;
+    assert!(closed(&end), "{end:?}");
+    assert!(start.elapsed() >= super::AUTH_DEADLINE);
+}
+
+#[tokio::test]
+async fn sockets_over_the_unauthenticated_cap_are_refused() {
+    let state = AppState {
+        unauthenticated: Arc::new(Semaphore::new(1)),
+        ..app_state(unused_pool())
+    };
+    let addr = serve_state(state).await;
+    let first = connect(addr).await.unwrap();
+
+    let refused = connect(addr).await.err().unwrap();
+    assert!(
+        matches!(&refused, tokio_tungstenite::tungstenite::Error::Http(response) if response.status() == 503),
+        "{refused:?}"
+    );
+
+    // Closing the first socket gives its place back.
+    drop(first);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while connect(addr).await.is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the closed socket kept its place");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_event_bucket_allows_a_burst_then_its_rate() {
+    let mut bucket = super::EventBucket::new();
+    let burst = (0..1000).filter(|_| bucket.take()).count();
+    assert_eq!(burst, super::EVENT_BURST as usize);
+
+    // A client that keeps to the rate is never cut off.
+    for _ in 0..10 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let second = (0..1000).filter(|_| bucket.take()).count();
+        assert_eq!(second, super::EVENTS_PER_SECOND as usize);
+    }
+}
+
+#[sqlx::test(migrator = "crate::db::MIGRATOR")]
+#[ignore = "needs DATABASE_URL"]
+async fn an_invalid_event_is_answered_without_quoting_it(pool: DbPool) {
+    seed(&pool).await;
+    let mut member = sign_in(serve(pool).await, "member-token").await;
+
+    // A string where serde expects a struct, which its error quotes in full,
+    // and text that is not JSON at all. Both stay under the size cap.
+    let quoted = format!("quote-me-{}", "x".repeat(60 * 1024));
+    let frames = [
+        json!({"type": "SendMessage", "data": quoted}).to_string(),
+        format!("not json {quoted}"),
+    ];
+    for frame in frames {
+        member.send(Message::Text(frame.into())).await.unwrap();
+        assert_eq!(
+            recv(&mut member).await,
+            json!({"type": "Error", "data": {"message": "Invalid event"}})
+        );
+    }
+    // The socket stays open.
+    assert_eq!(
+        call(&mut member, &ClientEvent::FetchFriends).await["type"],
+        "FriendList"
+    );
+}
+
+#[sqlx::test(migrator = "crate::db::MIGRATOR")]
+#[ignore = "needs DATABASE_URL"]
+async fn a_second_authenticate_changes_nothing(pool: DbPool) {
+    seed(&pool).await;
+    let mut member = sign_in(serve(pool.clone()).await, "member-token").await;
+
+    let again = ClientEvent::Authenticate {
+        token: "founder-token".to_string(),
+    };
+    assert_eq!(
+        call(&mut member, &again).await,
+        json!({"type": "Error", "data": {"message": "Already authenticated"}})
+    );
+
+    // The socket still speaks for the member, and the founder never came
+    // online.
+    let post = ClientEvent::SendMessage {
+        channel_id: CHANNEL_A,
+        content: "who am I".to_string(),
+        reply_to_id: None,
+    };
+    let posted = call(&mut member, &post).await;
+    assert_eq!(posted["data"]["message"]["author_id"], MEMBER.to_string());
+    let founder: String = sqlx::query_scalar("SELECT status FROM users WHERE id = $1")
+        .bind(FOUNDER)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(founder, "offline");
+}
+
+#[sqlx::test(migrator = "crate::db::MIGRATOR")]
+#[ignore = "needs DATABASE_URL"]
+async fn two_hundred_events_in_a_second_close_the_socket(pool: DbPool) {
+    seed(&pool).await;
+    let mut stranger = sign_in(serve(pool).await, "stranger-token").await;
+
+    let fetch = serde_json::to_string(&ClientEvent::FetchFriends).unwrap();
+    for _ in 0..200 {
+        // The relay may close the socket before the last ones are written.
+        let _ = stranger.feed(Message::Text(fetch.clone().into())).await;
+    }
+    let _ = stranger.flush().await;
+
+    let mut answered = 0;
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(10), stranger.next())
+            .await
+            .expect("the socket is still open");
+        if closed(&frame) {
+            break;
+        }
+        answered += 1;
+    }
+    assert!(answered < 200, "{answered} events answered");
+}
+
+#[sqlx::test(migrator = "crate::db::MIGRATOR")]
+#[ignore = "needs DATABASE_URL"]
+async fn a_sixth_socket_for_one_user_is_refused(pool: DbPool) {
+    seed(&pool).await;
+    // Room for one socket that has not signed in, so each sign-in below has
+    // to give its place back for the next socket to connect.
+    let state = AppState {
+        unauthenticated: Arc::new(Semaphore::new(1)),
+        ..app_state(pool)
+    };
+    let addr = serve_state(state).await;
+    let mut open = Vec::new();
+    for _ in 0..super::MAX_SOCKETS_PER_USER {
+        open.push(sign_in(addr, "member-token").await);
+    }
+
+    let mut sixth = connect(addr).await.unwrap();
+    let event = ClientEvent::Authenticate {
+        token: "member-token".to_string(),
+    };
+    assert_eq!(
+        call(&mut sixth, &event).await,
+        json!({"type": "AuthError", "data": {"reason": "Too many connections for this account"}})
+    );
 }
