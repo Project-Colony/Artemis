@@ -158,6 +158,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             continue;
                         };
 
+                        let server = db::channel_server(&state.db, channel_id)
+                            .await
+                            .ok()
+                            .flatten();
+                        if !authorize(&state, &sender, uid, server, Need::Member).await {
+                            continue;
+                        }
+
                         // Parse @mentions before sending
                         let mentioned_usernames: Vec<String> = content
                             .split_whitespace()
@@ -177,9 +185,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             Ok(message) => {
                                 // Track @mentions for unread state
                                 if !mentioned_usernames.is_empty() {
-                                    if let Ok(Some(server_id)) =
-                                        db::get_channel_server(&state.db, channel_id).await
-                                    {
+                                    if let Some(server_id) = server {
                                         if let Ok(resolved) = db::resolve_mentions(
                                             &state.db,
                                             server_id,
@@ -227,6 +233,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     } => {
                         let Some(uid) = user_id else { continue };
 
+                        let server = db::message_channel(&state.db, message_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|(_, server)| server);
+                        if !authorize(&state, &sender, uid, server, Need::Member).await {
+                            continue;
+                        }
+
                         if let Ok(Some(edited_at)) =
                             db::edit_message(&state.db, message_id, uid, &content).await
                         {
@@ -246,6 +261,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     ClientEvent::DeleteMessage { message_id } => {
                         let Some(uid) = user_id else { continue };
 
+                        let server = db::message_channel(&state.db, message_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|(_, server)| server);
+                        if !authorize(&state, &sender, uid, server, Need::Member).await {
+                            continue;
+                        }
+
                         if let Ok(true) = db::delete_message(&state.db, message_id, uid).await {
                             broadcast_event(
                                 &state,
@@ -261,7 +285,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         before,
                         limit,
                     } => {
-                        let Some(_uid) = user_id else { continue };
+                        let Some(uid) = user_id else { continue };
+
+                        let server = db::channel_server(&state.db, channel_id)
+                            .await
+                            .ok()
+                            .flatten();
+                        if !authorize(&state, &sender, uid, server, Need::Member).await {
+                            continue;
+                        }
 
                         let limit = limit.min(100);
                         match db::get_messages(&state.db, channel_id, before, limit).await {
@@ -365,29 +397,30 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     } => {
                         let Some(uid) = user_id else { continue };
 
-                        // Permission check: founder or moderator
-                        if !has_mod_perms(&state.db, uid, server_id).await {
-                            let _ = send_event(
-                                &sender,
-                                &ServerEvent::Error {
-                                    message: "Insufficient permissions".to_string(),
-                                },
-                            )
-                            .await;
+                        if !authorize(&state, &sender, uid, Some(server_id), Need::Moderator).await
+                        {
                             continue;
                         }
 
                         match db::create_channel(&state.db, server_id, category_id, &name).await {
-                            Ok(channel) => {
-                                let cat_id = category_id.unwrap_or(Uuid::nil());
+                            Ok(Some((category_id, channel))) => {
                                 broadcast_event(
                                     &state,
                                     &ServerEvent::ChannelCreated {
                                         server_id,
-                                        category_id: cat_id,
+                                        category_id,
                                         channel,
                                     },
                                     None,
+                                )
+                                .await;
+                            }
+                            Ok(None) => {
+                                let _ = send_event(
+                                    &sender,
+                                    &ServerEvent::Error {
+                                        message: "No such category in this server".to_string(),
+                                    },
                                 )
                                 .await;
                             }
@@ -400,6 +433,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     // ── Reactions ──
                     ClientEvent::AddReaction { message_id, emoji } => {
                         let Some(uid) = user_id else { continue };
+
+                        let server = db::message_channel(&state.db, message_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|(_, server)| server);
+                        if !authorize(&state, &sender, uid, server, Need::Member).await {
+                            continue;
+                        }
 
                         if let Ok(true) = db::add_reaction(&state.db, message_id, uid, &emoji).await
                         {
@@ -418,6 +460,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                     ClientEvent::RemoveReaction { message_id, emoji } => {
                         let Some(uid) = user_id else { continue };
+
+                        let server = db::message_channel(&state.db, message_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|(_, server)| server);
+                        if !authorize(&state, &sender, uid, server, Need::Member).await {
+                            continue;
+                        }
 
                         if let Ok(true) =
                             db::remove_reaction(&state.db, message_id, uid, &emoji).await
@@ -439,50 +490,73 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     ClientEvent::PinMessage { message_id } => {
                         let Some(uid) = user_id else { continue };
 
-                        if let Ok(Some(channel_id)) =
-                            db::get_message_channel(&state.db, message_id).await
+                        let place = db::message_channel(&state.db, message_id)
+                            .await
+                            .ok()
+                            .flatten();
+                        let server = place.map(|(_, server)| server);
+                        if !authorize(&state, &sender, uid, server, Need::Moderator).await {
+                            continue;
+                        }
+                        let Some((channel_id, _)) = place else {
+                            continue;
+                        };
+
+                        if let Ok(true) =
+                            db::pin_message(&state.db, channel_id, message_id, uid).await
                         {
-                            if let Ok(true) =
-                                db::pin_message(&state.db, channel_id, message_id, uid).await
-                            {
-                                broadcast_event(
-                                    &state,
-                                    &ServerEvent::MessagePinned {
-                                        channel_id,
-                                        message_id,
-                                        pinned_by: uid,
-                                    },
-                                    None,
-                                )
-                                .await;
-                            }
+                            broadcast_event(
+                                &state,
+                                &ServerEvent::MessagePinned {
+                                    channel_id,
+                                    message_id,
+                                    pinned_by: uid,
+                                },
+                                None,
+                            )
+                            .await;
                         }
                     }
 
                     ClientEvent::UnpinMessage { message_id } => {
-                        let Some(_uid) = user_id else { continue };
+                        let Some(uid) = user_id else { continue };
 
-                        if let Ok(Some(channel_id)) =
-                            db::get_message_channel(&state.db, message_id).await
+                        let place = db::message_channel(&state.db, message_id)
+                            .await
+                            .ok()
+                            .flatten();
+                        let server = place.map(|(_, server)| server);
+                        if !authorize(&state, &sender, uid, server, Need::Moderator).await {
+                            continue;
+                        }
+                        let Some((channel_id, _)) = place else {
+                            continue;
+                        };
+
+                        if let Ok(true) = db::unpin_message(&state.db, channel_id, message_id).await
                         {
-                            if let Ok(true) =
-                                db::unpin_message(&state.db, channel_id, message_id).await
-                            {
-                                broadcast_event(
-                                    &state,
-                                    &ServerEvent::MessageUnpinned {
-                                        channel_id,
-                                        message_id,
-                                    },
-                                    None,
-                                )
-                                .await;
-                            }
+                            broadcast_event(
+                                &state,
+                                &ServerEvent::MessageUnpinned {
+                                    channel_id,
+                                    message_id,
+                                },
+                                None,
+                            )
+                            .await;
                         }
                     }
 
                     ClientEvent::FetchPinnedMessages { channel_id } => {
-                        let Some(_uid) = user_id else { continue };
+                        let Some(uid) = user_id else { continue };
+
+                        let server = db::channel_server(&state.db, channel_id)
+                            .await
+                            .ok()
+                            .flatten();
+                        if !authorize(&state, &sender, uid, server, Need::Member).await {
+                            continue;
+                        }
 
                         match db::get_pinned_messages(&state.db, channel_id).await {
                             Ok(messages) => {
@@ -516,14 +590,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     } => {
                         let Some(uid) = user_id else { continue };
 
-                        if !has_mod_perms(&state.db, uid, server_id).await {
-                            let _ = send_event(
-                                &sender,
-                                &ServerEvent::Error {
-                                    message: "Insufficient permissions".to_string(),
-                                },
-                            )
-                            .await;
+                        if !authorize(&state, &sender, uid, Some(server_id), Need::Moderator).await
+                        {
                             continue;
                         }
 
@@ -575,14 +643,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     ClientEvent::CreateCategory { server_id, name } => {
                         let Some(uid) = user_id else { continue };
 
-                        if !has_mod_perms(&state.db, uid, server_id).await {
-                            let _ = send_event(
-                                &sender,
-                                &ServerEvent::Error {
-                                    message: "Insufficient permissions".to_string(),
-                                },
-                            )
-                            .await;
+                        if !authorize(&state, &sender, uid, Some(server_id), Need::Moderator).await
+                        {
                             continue;
                         }
 
@@ -605,31 +667,25 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     ClientEvent::DeleteChannel { channel_id } => {
                         let Some(uid) = user_id else { continue };
 
-                        if let Ok(Some(server_id)) =
-                            db::get_channel_server(&state.db, channel_id).await
-                        {
-                            if !has_mod_perms(&state.db, uid, server_id).await {
-                                let _ = send_event(
-                                    &sender,
-                                    &ServerEvent::Error {
-                                        message: "Insufficient permissions".to_string(),
-                                    },
-                                )
-                                .await;
-                                continue;
-                            }
+                        let server = db::channel_server(&state.db, channel_id)
+                            .await
+                            .ok()
+                            .flatten();
+                        if !authorize(&state, &sender, uid, server, Need::Moderator).await {
+                            continue;
+                        }
 
-                            if let Ok(Some(_)) = db::delete_channel(&state.db, channel_id).await {
-                                broadcast_event(
-                                    &state,
-                                    &ServerEvent::ChannelDeleted {
-                                        server_id,
-                                        channel_id,
-                                    },
-                                    None,
-                                )
-                                .await;
-                            }
+                        if let Ok(Some(server_id)) = db::delete_channel(&state.db, channel_id).await
+                        {
+                            broadcast_event(
+                                &state,
+                                &ServerEvent::ChannelDeleted {
+                                    server_id,
+                                    channel_id,
+                                },
+                                None,
+                            )
+                            .await;
                         }
                     }
 
@@ -640,38 +696,31 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     } => {
                         let Some(uid) = user_id else { continue };
 
-                        if let Ok(Some(server_id)) =
-                            db::get_channel_server(&state.db, channel_id).await
-                        {
-                            if !has_mod_perms(&state.db, uid, server_id).await {
-                                let _ = send_event(
-                                    &sender,
-                                    &ServerEvent::Error {
-                                        message: "Insufficient permissions".to_string(),
-                                    },
-                                )
-                                .await;
-                                continue;
-                            }
-
-                            let _ = db::edit_channel(
-                                &state.db,
-                                channel_id,
-                                name.as_deref(),
-                                topic.as_deref(),
-                            )
-                            .await;
-                            broadcast_event(
-                                &state,
-                                &ServerEvent::ChannelUpdated {
-                                    channel_id,
-                                    name,
-                                    topic,
-                                },
-                                None,
-                            )
-                            .await;
+                        let server = db::channel_server(&state.db, channel_id)
+                            .await
+                            .ok()
+                            .flatten();
+                        if !authorize(&state, &sender, uid, server, Need::Moderator).await {
+                            continue;
                         }
+
+                        let _ = db::edit_channel(
+                            &state.db,
+                            channel_id,
+                            name.as_deref(),
+                            topic.as_deref(),
+                        )
+                        .await;
+                        broadcast_event(
+                            &state,
+                            &ServerEvent::ChannelUpdated {
+                                channel_id,
+                                name,
+                                topic,
+                            },
+                            None,
+                        )
+                        .await;
                     }
 
                     ClientEvent::LeaveServer { server_id } => {
@@ -704,7 +753,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
 
                     ClientEvent::GetInviteCode { server_id } => {
-                        let Some(_uid) = user_id else { continue };
+                        let Some(uid) = user_id else { continue };
+
+                        if !authorize(&state, &sender, uid, Some(server_id), Need::Member).await {
+                            continue;
+                        }
 
                         if let Ok(Some(invite_code)) =
                             db::get_invite_code(&state.db, server_id).await
@@ -781,7 +834,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         query,
                         limit,
                     } => {
-                        let Some(_uid) = user_id else { continue };
+                        let Some(uid) = user_id else { continue };
+
+                        // A channel search stays inside the server it names.
+                        let scope = match channel_id {
+                            Some(channel) => db::channel_server(&state.db, channel)
+                                .await
+                                .ok()
+                                .flatten()
+                                .filter(|server| *server == server_id),
+                            None => Some(server_id),
+                        };
+                        if !authorize(&state, &sender, uid, scope, Need::Member).await {
+                            continue;
+                        }
 
                         let limit = limit.min(50);
                         match db::search_messages(&state.db, server_id, channel_id, &query, limit)
@@ -815,14 +881,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     } => {
                         let Some(uid) = user_id else { continue };
 
-                        if !has_mod_perms(&state.db, uid, server_id).await {
-                            let _ = send_event(
-                                &sender,
-                                &ServerEvent::Error {
-                                    message: "Insufficient permissions".to_string(),
-                                },
-                            )
-                            .await;
+                        if !authorize(&state, &sender, uid, Some(server_id), Need::Moderator).await
+                        {
                             continue;
                         }
 
@@ -847,14 +907,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     } => {
                         let Some(uid) = user_id else { continue };
 
-                        if !has_mod_perms(&state.db, uid, server_id).await {
-                            let _ = send_event(
-                                &sender,
-                                &ServerEvent::Error {
-                                    message: "Insufficient permissions".to_string(),
-                                },
-                            )
-                            .await;
+                        if !authorize(&state, &sender, uid, Some(server_id), Need::Moderator).await
+                        {
                             continue;
                         }
 
@@ -874,7 +928,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
 
                     ClientEvent::FetchCustomEmojis { server_id } => {
-                        let Some(_uid) = user_id else { continue };
+                        let Some(uid) = user_id else { continue };
+
+                        if !authorize(&state, &sender, uid, Some(server_id), Need::Member).await {
+                            continue;
+                        }
 
                         match db::get_custom_emojis(&state.db, server_id).await {
                             Ok(emojis) => {
@@ -1187,12 +1245,46 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     }
 }
 
-/// Check if user has moderator+ permissions on a server.
-async fn has_mod_perms(pool: &db::DbPool, user_id: Uuid, server_id: Uuid) -> bool {
-    match db::get_member_role(pool, user_id, server_id).await {
-        Ok(Some(role)) => matches!(role.as_str(), "founder" | "moderator"),
-        _ => false,
-    }
+/// The least role an event needs in the server it acts on.
+#[derive(Clone, Copy, PartialEq)]
+enum Need {
+    Member,
+    /// Founder or moderator.
+    Moderator,
+}
+
+/// Whether `user` holds `need` in `server`, telling the socket why not.
+/// `server` is None when the event named a channel or message that does not
+/// exist. That gets the same refusal as a server the user is not in, so a
+/// non-member cannot probe which ids exist.
+async fn authorize(
+    state: &AppState,
+    sender: &Arc<Mutex<SplitSink<WebSocket, WsMessage>>>,
+    user: Uuid,
+    server: Option<Uuid>,
+    need: Need,
+) -> bool {
+    let role = match server {
+        Some(server) => db::get_member_role(&state.db, user, server)
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+    let refusal = match role.as_deref() {
+        None => "Not a member of this server",
+        Some("founder" | "moderator") => return true,
+        Some(_) if need == Need::Member => return true,
+        Some(_) => "Insufficient permissions",
+    };
+    let _ = send_event(
+        sender,
+        &ServerEvent::Error {
+            message: refusal.to_string(),
+        },
+    )
+    .await;
+    false
 }
 
 pub struct ConnectedUser {
@@ -1268,3 +1360,6 @@ async fn broadcast_event(state: &AppState, event: &ServerEvent, exclude_user: Op
             .await;
     }
 }
+
+#[cfg(test)]
+mod tests;

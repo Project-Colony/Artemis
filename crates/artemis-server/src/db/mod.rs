@@ -150,6 +150,9 @@ pub async fn get_user_servers(
     Ok(payloads)
 }
 
+// Unused until clients can create a server over the WebSocket. The REST route
+// that called it took the session token in the query string.
+#[allow(dead_code)]
 pub async fn create_server(
     pool: &DbPool,
     name: &str,
@@ -432,42 +435,42 @@ pub async fn delete_message(
     Ok(result.rows_affected() > 0)
 }
 
+/// Adds a text channel to `category_id`, or to the server's first category
+/// when none is given, and returns the category it went into with the channel.
+/// Returns None, and inserts nothing, when the category is not in `server_id`.
 pub async fn create_channel(
     pool: &DbPool,
     server_id: Uuid,
     category_id: Option<Uuid>,
     name: &str,
-) -> Result<ChannelPayload, sqlx::Error> {
-    let cat_id = if let Some(cid) = category_id {
-        cid
-    } else {
-        // Get first category of the server
-        let row: (Uuid,) = sqlx::query_as(
-            "SELECT id FROM categories WHERE server_id = $1 ORDER BY position LIMIT 1",
-        )
-        .bind(server_id)
-        .fetch_one(pool)
-        .await?;
-        row.0
-    };
-
-    let row = sqlx::query_as::<_, (Uuid,)>(
+) -> Result<Option<(Uuid, ChannelPayload)>, sqlx::Error> {
+    let row = sqlx::query_as::<_, (Uuid, Uuid)>(
         "INSERT INTO channels (category_id, server_id, name, channel_type, position)
-         VALUES ($1, $2, $3, 'text', (SELECT COALESCE(MAX(position), 0) + 1 FROM channels WHERE category_id = $1))
-         RETURNING id"
+         SELECT c.id, c.server_id, $3, 'text',
+                (SELECT COALESCE(MAX(position), 0) + 1 FROM channels WHERE category_id = c.id)
+         FROM categories c
+         WHERE c.server_id = $1 AND ($2::uuid IS NULL OR c.id = $2)
+         ORDER BY c.position
+         LIMIT 1
+         RETURNING id, category_id",
     )
-    .bind(cat_id)
     .bind(server_id)
+    .bind(category_id)
     .bind(name)
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await?;
 
-    Ok(ChannelPayload {
-        id: row.0,
-        name: name.to_string(),
-        channel_type: ChannelType::Text,
-        topic: None,
-    })
+    Ok(row.map(|(id, category_id)| {
+        (
+            category_id,
+            ChannelPayload {
+                id,
+                name: name.to_string(),
+                channel_type: ChannelType::Text,
+                topic: None,
+            },
+        )
+    }))
 }
 
 // ── Row types ──
@@ -842,16 +845,21 @@ pub async fn get_pinned_messages(
     Ok(messages)
 }
 
-/// Get the channel_id for a message.
-pub async fn get_message_channel(
+/// The channel a message is in and that channel's server, as
+/// `(channel_id, server_id)`.
+pub async fn message_channel(
     pool: &DbPool,
     message_id: Uuid,
-) -> Result<Option<Uuid>, sqlx::Error> {
-    let row = sqlx::query_as::<_, (Uuid,)>("SELECT channel_id FROM messages WHERE id = $1")
-        .bind(message_id)
-        .fetch_optional(pool)
-        .await?;
-    Ok(row.map(|r| r.0))
+) -> Result<Option<(Uuid, Uuid)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT m.channel_id, c.server_id
+         FROM messages m
+         JOIN channels c ON c.id = m.channel_id
+         WHERE m.id = $1",
+    )
+    .bind(message_id)
+    .fetch_optional(pool)
+    .await
 }
 
 // ── Unread tracking ──
@@ -1036,10 +1044,7 @@ pub async fn edit_channel(
     Ok(())
 }
 
-pub async fn get_channel_server(
-    pool: &DbPool,
-    channel_id: Uuid,
-) -> Result<Option<Uuid>, sqlx::Error> {
+pub async fn channel_server(pool: &DbPool, channel_id: Uuid) -> Result<Option<Uuid>, sqlx::Error> {
     let row = sqlx::query_as::<_, (Uuid,)>("SELECT server_id FROM channels WHERE id = $1")
         .bind(channel_id)
         .fetch_optional(pool)

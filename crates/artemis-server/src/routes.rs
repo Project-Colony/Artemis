@@ -1,7 +1,7 @@
-use axum::extract::{Path, Query, State};
+use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect};
-use axum::routing::{get, post};
+use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
@@ -17,10 +17,6 @@ pub fn api_routes() -> Router<AppState> {
         .route("/health", get(health))
         .route("/auth/github", get(github_login))
         .route("/auth/github/callback", get(github_callback))
-        .route("/api/v1/servers", get(list_servers))
-        .route("/api/v1/servers", post(create_server))
-        .route("/api/v1/channels/{channel_id}/messages", get(list_messages))
-        .route("/api/v1/me", get(get_me))
 }
 
 async fn health() -> impl IntoResponse {
@@ -199,135 +195,6 @@ async fn github_callback(
         "avatar_url": gh_user.avatar_url,
     }))
     .into_response()
-}
-
-// ── API endpoints ──
-
-#[derive(Deserialize)]
-struct AuthHeader {
-    token: String,
-}
-
-async fn get_me(
-    State(state): State<AppState>,
-    Query(auth): Query<AuthHeader>,
-) -> impl IntoResponse {
-    match db::find_user_by_token(&state.db, &auth.token).await {
-        Ok(Some(user)) => Json(json!({
-            "id": user.id,
-            "username": user.username,
-        }))
-        .into_response(),
-        _ => (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "Invalid token" })),
-        )
-            .into_response(),
-    }
-}
-
-async fn list_servers(
-    State(state): State<AppState>,
-    Query(auth): Query<AuthHeader>,
-) -> impl IntoResponse {
-    let user = match db::find_user_by_token(&state.db, &auth.token).await {
-        Ok(Some(u)) => u,
-        _ => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "error": "Invalid token" })),
-            )
-                .into_response()
-        }
-    };
-
-    match db::get_user_servers(&state.db, user.id).await {
-        Ok(servers) => Json(json!({ "servers": servers })).into_response(),
-        Err(e) => {
-            tracing::error!("Failed to list servers: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "DB error" })),
-            )
-                .into_response()
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct CreateServerBody {
-    name: String,
-}
-
-async fn create_server(
-    State(state): State<AppState>,
-    Query(auth): Query<AuthHeader>,
-    Json(body): Json<CreateServerBody>,
-) -> impl IntoResponse {
-    let user = match db::find_user_by_token(&state.db, &auth.token).await {
-        Ok(Some(u)) => u,
-        _ => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "error": "Invalid token" })),
-            )
-                .into_response()
-        }
-    };
-
-    let invite_code: String = Uuid::new_v4().to_string()[..8].to_string();
-    match db::create_server(&state.db, &body.name, user.id, &invite_code).await {
-        Ok(server_id) => Json(json!({
-            "server_id": server_id,
-            "invite_code": invite_code,
-        }))
-        .into_response(),
-        Err(e) => {
-            tracing::error!("Failed to create server: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "DB error" })),
-            )
-                .into_response()
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct MessageQuery {
-    token: String,
-    before: Option<Uuid>,
-    limit: Option<u32>,
-}
-
-async fn list_messages(
-    State(state): State<AppState>,
-    Path(channel_id): Path<Uuid>,
-    Query(query): Query<MessageQuery>,
-) -> impl IntoResponse {
-    let _user = match db::find_user_by_token(&state.db, &query.token).await {
-        Ok(Some(u)) => u,
-        _ => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "error": "Invalid token" })),
-            )
-                .into_response()
-        }
-    };
-
-    let limit = query.limit.unwrap_or(50).min(100);
-    match db::get_messages(&state.db, channel_id, query.before, limit).await {
-        Ok(messages) => Json(json!({ "messages": messages })).into_response(),
-        Err(e) => {
-            tracing::error!("Failed to list messages: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "DB error" })),
-            )
-                .into_response()
-        }
-    }
 }
 
 #[cfg(test)]

@@ -77,6 +77,15 @@ fn dotenv_error(e: dotenvy::Error) -> anyhow::Error {
     }
 }
 
+/// Every route the relay serves.
+fn router(state: AppState) -> Router {
+    Router::new()
+        .merge(routes::api_routes())
+        .merge(ws::ws_routes())
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Values already in the environment win over the ones in .env.
@@ -106,11 +115,7 @@ async fn main() -> anyhow::Result<()> {
         base_url: config.base_url,
     };
 
-    let app = Router::new()
-        .merge(routes::api_routes())
-        .merge(ws::ws_routes())
-        .layer(TraceLayer::new_for_http())
-        .with_state(app_state);
+    let app = router(app_state);
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr)
         .await
