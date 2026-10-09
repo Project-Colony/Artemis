@@ -3,7 +3,7 @@
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- Users table
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     username VARCHAR(32) NOT NULL UNIQUE,
     display_name VARCHAR(64),
@@ -16,7 +16,7 @@ CREATE TABLE users (
 );
 
 -- Servers table
-CREATE TABLE servers (
+CREATE TABLE IF NOT EXISTS servers (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     name VARCHAR(64) NOT NULL,
     icon_url TEXT,
@@ -26,7 +26,7 @@ CREATE TABLE servers (
 );
 
 -- Categories table
-CREATE TABLE categories (
+CREATE TABLE IF NOT EXISTS categories (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     server_id UUID NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
     name VARCHAR(64) NOT NULL,
@@ -34,7 +34,7 @@ CREATE TABLE categories (
 );
 
 -- Channels table
-CREATE TABLE channels (
+CREATE TABLE IF NOT EXISTS channels (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     category_id UUID NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
     server_id UUID NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
@@ -46,7 +46,7 @@ CREATE TABLE channels (
 );
 
 -- Server members table
-CREATE TABLE server_members (
+CREATE TABLE IF NOT EXISTS server_members (
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     server_id UUID NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
     role VARCHAR(16) NOT NULL DEFAULT 'member',
@@ -55,7 +55,7 @@ CREATE TABLE server_members (
 );
 
 -- Messages table
-CREATE TABLE messages (
+CREATE TABLE IF NOT EXISTS messages (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     channel_id UUID NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
     author_id UUID NOT NULL REFERENCES users(id),
@@ -65,7 +65,7 @@ CREATE TABLE messages (
 );
 
 -- Attachments table
-CREATE TABLE attachments (
+CREATE TABLE IF NOT EXISTS attachments (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     message_id UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
     filename VARCHAR(256) NOT NULL,
@@ -75,10 +75,10 @@ CREATE TABLE attachments (
 );
 
 -- Indexes for performance
-CREATE INDEX idx_messages_channel_id ON messages(channel_id, created_at DESC);
-CREATE INDEX idx_messages_author_id ON messages(author_id);
-CREATE INDEX idx_channels_server_id ON channels(server_id);
-CREATE INDEX idx_server_members_server ON server_members(server_id);
-CREATE INDEX idx_server_members_user ON server_members(user_id);
-CREATE INDEX idx_users_github_id ON users(github_id);
-CREATE INDEX idx_users_auth_token ON users(auth_token);
+CREATE INDEX IF NOT EXISTS idx_messages_channel_id ON messages(channel_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_author_id ON messages(author_id);
+CREATE INDEX IF NOT EXISTS idx_channels_server_id ON channels(server_id);
+CREATE INDEX IF NOT EXISTS idx_server_members_server ON server_members(server_id);
+CREATE INDEX IF NOT EXISTS idx_server_members_user ON server_members(user_id);
+CREATE INDEX IF NOT EXISTS idx_users_github_id ON users(github_id);
+CREATE INDEX IF NOT EXISTS idx_users_auth_token ON users(auth_token);

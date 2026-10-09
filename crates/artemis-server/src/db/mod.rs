@@ -15,18 +15,10 @@ pub async fn connect(database_url: &str) -> Result<DbPool, sqlx::Error> {
     Ok(pool)
 }
 
-pub async fn run_migrations(pool: &DbPool) -> Result<(), sqlx::Error> {
-    let migration = include_str!("../../migrations/001_init.sql");
-    sqlx::raw_sql(migration).execute(pool).await?;
-    let migration2 = include_str!("../../migrations/002_friends_and_dms.sql");
-    sqlx::raw_sql(migration2).execute(pool).await?;
-    let migration3 = include_str!("../../migrations/003_reactions_replies_pins_unread.sql");
-    sqlx::raw_sql(migration3).execute(pool).await?;
-    let migration4 = include_str!("../../migrations/004_attachments_search_emojis.sql");
-    sqlx::raw_sql(migration4).execute(pool).await?;
-    tracing::info!("Database migrations applied");
-    Ok(())
-}
+/// Every file in `migrations/`, each applied once and recorded in
+/// `_sqlx_migrations`. sqlx checksums applied files, so a schema change is
+/// always a new numbered file, never an edit to an existing one.
+pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 // ── User queries ──
 
@@ -1422,4 +1414,47 @@ pub async fn resolve_mentions(
         }
     }
     Ok(results)
+}
+
+// These need a Postgres server: set DATABASE_URL and run
+// `cargo test -p artemis-server -- --include-ignored`. sqlx::test gives each
+// test its own empty database. CI runs them in the relay-db job.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn recorded_migrations(pool: &DbPool) -> usize {
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE success")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        rows as usize
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "needs DATABASE_URL"]
+    async fn migrator_adopts_a_database_built_by_the_old_startup(pool: DbPool) {
+        // Before the migrator, every start ran 001 to 004 with raw_sql and
+        // recorded nothing, so those databases have no _sqlx_migrations table.
+        for migration in MIGRATOR.iter().filter(|m| m.version <= 4) {
+            sqlx::raw_sql(migration.sql.clone())
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        MIGRATOR.run(&pool).await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+
+        assert_eq!(recorded_migrations(&pool).await, MIGRATOR.iter().count());
+    }
+
+    #[sqlx::test(migrations = false)]
+    #[ignore = "needs DATABASE_URL"]
+    async fn migrator_runs_twice_on_an_empty_database(pool: DbPool) {
+        MIGRATOR.run(&pool).await.unwrap();
+        MIGRATOR.run(&pool).await.unwrap();
+
+        assert_eq!(recorded_migrations(&pool).await, MIGRATOR.iter().count());
+    }
 }
