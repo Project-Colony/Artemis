@@ -2,37 +2,58 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use quinn::{ClientConfig, Connection, Endpoint, RecvStream, SendStream, ServerConfig};
-use rcgen::CertifiedKey;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::protocol::PeerMessage;
 
+/// Server name used in every peer handshake. Peers are identified by their
+/// certificate fingerprint, not by name.
+const PEER_SERVER_NAME: &str = "artemis-peer";
+
 /// QUIC transport layer for peer-to-peer connections.
+///
+/// Every peer has a fresh self-signed certificate. Peers exchange its SHA-256
+/// fingerprint through signaling, and a connection is trusted only when the
+/// other side proves it holds the key of the certificate with that
+/// fingerprint: the dialer pins the fingerprint in the handshake, and the
+/// listener requires a client certificate and exposes its fingerprint
+/// ([`PeerConnection::peer_fingerprint`]) for the caller to compare.
 pub struct QuicTransport {
     endpoint: Endpoint,
     cert_fingerprint: String,
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+    provider: Arc<CryptoProvider>,
 }
 
 impl QuicTransport {
     /// Create a new QUIC transport bound to the given address.
     /// Generates a self-signed certificate for TLS.
     pub fn bind(bind_addr: SocketAddr) -> Result<Self, TransportError> {
-        let certified_key = rcgen::generate_simple_self_signed(vec!["artemis-peer".to_string()])
+        let certified_key = rcgen::generate_simple_self_signed(vec![PEER_SERVER_NAME.to_string()])
             .map_err(|e| TransportError::CertGeneration(e.to_string()))?;
 
-        let cert_fingerprint = hex_fingerprint(&certified_key);
-
-        let cert_der = CertificateDer::from(certified_key.cert.der().to_vec());
-        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+        let cert = CertificateDer::from(certified_key.cert.der().to_vec());
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
             certified_key.key_pair.serialize_der(),
         ));
+        let cert_fingerprint = hex_fingerprint(&cert);
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
 
-        // Server config (accept incoming connections)
-        let server_crypto = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert_der.clone()], key_der.clone_key())
+        // Server side: a client certificate is mandatory and must sign the
+        // handshake; which certificate is acceptable is the caller's check.
+        let server_crypto = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|e| TransportError::TlsConfig(e.to_string()))?
+            .with_client_cert_verifier(Arc::new(PeerCertVerifier::any(&provider)))
+            .with_single_cert(vec![cert.clone()], key.clone_key())
             .map_err(|e| TransportError::TlsConfig(e.to_string()))?;
 
         let server_config = ServerConfig::with_crypto(Arc::new(
@@ -40,26 +61,18 @@ impl QuicTransport {
                 .map_err(|e| TransportError::TlsConfig(e.to_string()))?,
         ));
 
-        // Client config (skip cert verification since we use self-signed certs
-        // and verify via fingerprint exchanged through signaling)
-        let client_crypto = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
-            .with_no_client_auth();
-
-        let client_config = ClientConfig::new(Arc::new(
-            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
-                .map_err(|e| TransportError::TlsConfig(e.to_string()))?,
-        ));
-
-        let mut endpoint = Endpoint::server(server_config, bind_addr)
+        // No default client config: every outgoing connection pins the
+        // peer's fingerprint (see `connect_to_peer`).
+        let endpoint = Endpoint::server(server_config, bind_addr)
             .map_err(|e| TransportError::Bind(e.to_string()))?;
-        endpoint.set_default_client_config(client_config);
 
         info!("QUIC transport bound to {}", bind_addr);
         Ok(Self {
             endpoint,
             cert_fingerprint,
+            cert,
+            key,
+            provider,
         })
     }
 
@@ -75,14 +88,30 @@ impl QuicTransport {
         &self.cert_fingerprint
     }
 
-    /// Connect to a peer at the given address.
+    /// Connect to a peer at the given address. The handshake fails unless the
+    /// peer presents the certificate whose fingerprint it published through
+    /// signaling (`expected_fingerprint`) and proves it holds its key.
     pub async fn connect_to_peer(
         &self,
         addr: SocketAddr,
+        expected_fingerprint: &str,
     ) -> Result<PeerConnection, TransportError> {
+        let verifier = PeerCertVerifier::pinned(&self.provider, expected_fingerprint);
+        let client_crypto = rustls::ClientConfig::builder_with_provider(self.provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|e| TransportError::TlsConfig(e.to_string()))?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(verifier))
+            .with_client_auth_cert(vec![self.cert.clone()], self.key.clone_key())
+            .map_err(|e| TransportError::TlsConfig(e.to_string()))?;
+        let client_config = ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
+                .map_err(|e| TransportError::TlsConfig(e.to_string()))?,
+        ));
+
         let connection = self
             .endpoint
-            .connect(addr, "artemis-peer")
+            .connect_with(client_config, addr, PEER_SERVER_NAME)
             .map_err(|e| TransportError::Connect(e.to_string()))?
             .await
             .map_err(|e| TransportError::Connect(e.to_string()))?;
@@ -138,6 +167,20 @@ pub struct PeerConnection {
 }
 
 impl PeerConnection {
+    /// SHA-256 fingerprint of the certificate the peer proved it holds, in the
+    /// format of [`QuicTransport::cert_fingerprint`].
+    ///
+    /// On an accepted connection, compare it with the fingerprint from the
+    /// peer's signaling request before trusting anything it sends.
+    pub fn peer_fingerprint(&self) -> Option<String> {
+        let certs = self
+            .connection
+            .peer_identity()?
+            .downcast::<Vec<CertificateDer<'static>>>()
+            .ok()?;
+        certs.first().map(hex_fingerprint)
+    }
+
     /// Get the remote address of this peer.
     pub fn remote_addr(&self) -> SocketAddr {
         self.connection.remote_address()
@@ -275,121 +318,152 @@ impl PeerReceiver {
     }
 }
 
-/// Compute a hex SHA-256 fingerprint of a self-signed certificate.
-fn hex_fingerprint(ck: &CertifiedKey) -> String {
-    use std::fmt::Write;
-    let der = ck.cert.der();
-    let digest = ring_compat_sha256(der);
-    let mut s = String::with_capacity(digest.len() * 3);
-    for (i, b) in digest.iter().enumerate() {
-        if i > 0 {
-            s.push(':');
-        }
-        write!(s, "{:02X}", b).unwrap();
-    }
-    s
+/// Hex SHA-256 fingerprint of a certificate, as `AB:CD:...` (32 bytes).
+fn hex_fingerprint(cert: &CertificateDer<'_>) -> String {
+    Sha256::digest(cert)
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
-/// Simple SHA-256 using the same ring that rustls uses.
-fn ring_compat_sha256(data: &[u8]) -> Vec<u8> {
-    use std::io::Write;
-    // Use a simple hash. Since we already depend on rustls/ring indirectly,
-    // we can compute a basic fingerprint.
-    // For simplicity, use a basic hash of the DER bytes.
-    let mut hasher = Sha256::new();
-    hasher.write_all(data).unwrap();
-    hasher.finish()
-}
-
-/// Minimal SHA-256 for fingerprint (avoids adding another dependency).
-struct Sha256 {
-    data: Vec<u8>,
-}
-
-impl Sha256 {
-    fn new() -> Self {
-        Self { data: Vec::new() }
-    }
-
-    fn finish(self) -> Vec<u8> {
-        // Use a simple approach: hash via the rustls/ring backend
-        // This is just for display fingerprints, not security-critical
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut h = DefaultHasher::new();
-        self.data.hash(&mut h);
-        let v = h.finish();
-        // Repeat to get 32 bytes for display purposes
-        let mut result = Vec::with_capacity(32);
-        result.extend_from_slice(&v.to_be_bytes());
-        result.extend_from_slice(&v.to_le_bytes());
-        result.extend_from_slice(&(v.wrapping_mul(0x517cc1b727220a95)).to_be_bytes());
-        result.extend_from_slice(&(v.wrapping_mul(0x6c62272e07bb0142)).to_be_bytes());
-        result
-    }
-}
-
-impl std::io::Write for Sha256 {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.data.extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Skip server certificate verification (we verify via fingerprint in signaling).
+/// Certificate verifier for self-signed peer certificates.
+///
+/// There is no certificate authority: a peer is identified by the SHA-256
+/// fingerprint of its certificate. The handshake signature is always verified
+/// against the presented certificate, so the peer proves it holds the key.
 #[derive(Debug)]
-struct SkipServerVerification;
+struct PeerCertVerifier {
+    /// Fingerprint the certificate must have, or `None` to accept any
+    /// certificate and leave the check to the caller (listener side).
+    expected: Option<String>,
+    provider: Arc<CryptoProvider>,
+}
 
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
+impl PeerCertVerifier {
+    fn pinned(provider: &Arc<CryptoProvider>, fingerprint: &str) -> Self {
+        Self {
+            expected: Some(fingerprint.to_ascii_uppercase()),
+            provider: provider.clone(),
+        }
+    }
+
+    fn any(provider: &Arc<CryptoProvider>) -> Self {
+        Self {
+            expected: None,
+            provider: provider.clone(),
+        }
+    }
+
+    fn check(&self, cert: &CertificateDer<'_>) -> Result<(), rustls::Error> {
+        match &self.expected {
+            Some(expected) if *expected != hex_fingerprint(cert) => {
+                Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::ApplicationVerificationFailure,
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn tls12(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        let algorithms = &self.provider.signature_verification_algorithms;
+        verify_tls12_signature(message, cert, dss, algorithms)
+    }
+
+    fn tls13(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        let algorithms = &self.provider.signature_verification_algorithms;
+        verify_tls13_signature(message, cert, dss, algorithms)
+    }
+
+    fn schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+impl ServerCertVerifier for PeerCertVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
+        end_entity: &CertificateDer<'_>,
         _intermediates: &[CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
+        _server_name: &ServerName<'_>,
         _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        // We verify the peer's identity via their X25519 public key and
-        // cert fingerprint exchanged through GitHub Gist signaling.
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        self.check(end_entity)?;
+        Ok(ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.tls12(message, cert, dss)
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.tls13(message, cert, dss)
     }
 
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA512,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-            rustls::SignatureScheme::ED25519,
-            rustls::SignatureScheme::ED448,
-        ]
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.schemes()
+    }
+}
+
+impl ClientCertVerifier for PeerCertVerifier {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        self.check(end_entity)?;
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.tls12(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.tls13(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.schemes()
     }
 }
 
@@ -413,4 +487,61 @@ pub enum TransportError {
     Deserialize(String),
     #[error("message too large: {0} bytes")]
     MessageTooLarge(usize),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn localhost() -> SocketAddr {
+        "127.0.0.1:0".parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn pinned_fingerprint_connects_and_both_sides_see_the_other() {
+        let alice = QuicTransport::bind(localhost()).unwrap();
+        let bob = QuicTransport::bind(localhost()).unwrap();
+        let bob_addr = bob.local_addr().unwrap();
+
+        let (dialed, accepted) = tokio::join!(
+            alice.connect_to_peer(bob_addr, bob.cert_fingerprint()),
+            bob.accept_peer()
+        );
+        let (dialed, accepted) = (dialed.unwrap(), accepted.unwrap());
+
+        assert_eq!(
+            dialed.peer_fingerprint().as_deref(),
+            Some(bob.cert_fingerprint())
+        );
+        assert_eq!(
+            accepted.peer_fingerprint().as_deref(),
+            Some(alice.cert_fingerprint())
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_fingerprint_is_refused() {
+        let alice = QuicTransport::bind(localhost()).unwrap();
+        let bob = QuicTransport::bind(localhost()).unwrap();
+        let mallory = QuicTransport::bind(localhost()).unwrap();
+        let bob_addr = bob.local_addr().unwrap();
+
+        // Alice expects Mallory's certificate but reaches Bob.
+        let accept = tokio::spawn(async move { bob.accept_peer().await.is_ok() });
+        let dialed = alice
+            .connect_to_peer(bob_addr, mallory.cert_fingerprint())
+            .await;
+        assert!(dialed.is_err());
+        alice.close();
+        let _ = accept.await;
+    }
+
+    #[test]
+    fn fingerprint_is_sha256() {
+        let cert = CertificateDer::from(b"abc".to_vec());
+        assert_eq!(
+            hex_fingerprint(&cert).replace(':', ""),
+            "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD"
+        );
+    }
 }
