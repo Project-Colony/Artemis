@@ -417,7 +417,7 @@ async fn sign_in_everyone(addr: SocketAddr) -> [Client; 4] {
 
 #[sqlx::test(migrator = "crate::db::MIGRATOR")]
 #[ignore = "needs DATABASE_URL"]
-async fn server_events_reach_its_members_only(pool: DbPool) {
+async fn server_events_reach_only_that_servers_members(pool: DbPool) {
     seed(&pool).await;
     let [mut stranger, mut outsider, mut member, mut founder] =
         sign_in_everyone(serve(pool).await).await;
