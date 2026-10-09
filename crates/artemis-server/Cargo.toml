@@ -32,4 +32,5 @@ reqwest = { workspace = true }
 dotenvy = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite = { workspace = true }

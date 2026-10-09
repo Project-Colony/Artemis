@@ -1,14 +1,17 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
-use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{Message as WsMessage, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
-use futures::stream::SplitSink;
-use futures::{SinkExt, StreamExt};
-use tokio::sync::{Mutex, RwLock};
+use futures::{Sink, SinkExt, StreamExt};
+use tokio::sync::{mpsc, RwLock};
+use tokio::task::AbortHandle;
+use tokio::time::{interval_at, timeout, Instant};
 use uuid::Uuid;
 
 use artemis_core::protocol::{ClientEvent, FriendPayload, FriendRequestPayload, ServerEvent};
@@ -25,14 +28,26 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState) {
-    let (sender, mut receiver) = socket.split();
-    let sender = Arc::new(Mutex::new(sender));
+    let (sink, mut receiver) = socket.split();
+    // Every frame to this socket, the replies below and the fan-out alike,
+    // goes through this queue, so they reach the client in the order sent.
+    let (sender, queue) = mpsc::channel(SEND_QUEUE);
+    let ponged = Arc::new(AtomicBool::new(true));
+    let mut writer = tokio::spawn(write_frames(sink, queue, ponged.clone()));
 
     let mut user_id: Option<Uuid> = None;
     let mut username_cache: Option<String> = None;
     let conn_id = Uuid::new_v4();
 
-    while let Some(Ok(msg)) = receiver.next().await {
+    loop {
+        let msg = tokio::select! {
+            msg = receiver.next() => match msg {
+                Some(Ok(msg)) => msg,
+                _ => break,
+            },
+            // The writer gave up on the socket, or the fan-out dropped it.
+            _ = &mut writer => break,
+        };
         match msg {
             WsMessage::Text(txt) => {
                 let event: ClientEvent = match serde_json::from_str(&txt) {
@@ -56,29 +71,40 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 user_id = Some(user.id);
                                 username_cache = Some(user.username.clone());
 
-                                // Register connection
-                                state.connections.write().await.insert(
-                                    conn_id,
-                                    ConnectedUser {
-                                        user_id: user.id,
-                                        sender: sender.clone(),
-                                    },
-                                );
-
-                                // Set user online
-                                let _ = db::update_user_status(&state.db, user.id, "online").await;
+                                // Register the socket. The user's first one
+                                // brings them online; later ones keep the
+                                // status they already have, Idle or DND too.
+                                let presence = state.presence.lock().await;
+                                let first = {
+                                    let mut connections = state.connections.write().await;
+                                    let first =
+                                        !connections.values().any(|conn| conn.user_id == user.id);
+                                    connections.insert(
+                                        conn_id,
+                                        ConnectedUser {
+                                            user_id: user.id,
+                                            queue: sender.clone(),
+                                            writer: writer.abort_handle(),
+                                        },
+                                    );
+                                    first
+                                };
+                                if first {
+                                    let _ =
+                                        db::update_user_status(&state.db, user.id, "online").await;
+                                    announce_presence(
+                                        &state,
+                                        user.id,
+                                        artemis_core::models::user::UserStatus::Online,
+                                    )
+                                    .await;
+                                }
+                                drop(presence);
 
                                 // Fetch user's servers
                                 let servers = db::get_user_servers(&state.db, user.id)
                                     .await
                                     .unwrap_or_default();
-
-                                announce_presence(
-                                    &state,
-                                    user.id,
-                                    artemis_core::models::user::UserStatus::Online,
-                                )
-                                .await;
 
                                 let _ = send_event(
                                     &sender,
@@ -1220,18 +1246,66 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
                 }
             }
+            WsMessage::Pong(_) => ponged.store(true, Ordering::Relaxed),
             WsMessage::Close(_) => break,
             _ => {}
         }
     }
 
-    // Cleanup on disconnect
-    state.connections.write().await.remove(&conn_id);
-    if let Some(uid) = user_id {
+    // Cleanup on disconnect. Only a signed-in socket is in the map.
+    writer.abort();
+    let Some(uid) = user_id else {
+        return;
+    };
+    // Under the same lock as sign-in, so a sign-in racing this close cannot
+    // be followed by this socket's offline write.
+    let _presence = state.presence.lock().await;
+    let still_connected = {
+        let mut connections = state.connections.write().await;
+        connections.remove(&conn_id);
+        connections.values().any(|conn| conn.user_id == uid)
+    };
+    // The user stays online while another of their sockets is open.
+    if !still_connected {
         let _ = db::update_user_status(&state.db, uid, "offline").await;
         announce_presence(&state, uid, artemis_core::models::user::UserStatus::Offline).await;
+    }
+    tracing::info!("User {} disconnected", uid);
+}
 
-        tracing::info!("User {} disconnected", uid);
+/// Frames a socket may have waiting. Enough for a burst of events; a client
+/// that falls this far behind is dropped by the fan-out.
+const SEND_QUEUE: usize = 256;
+/// The longest one frame may take to go out before the socket is dropped.
+const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often the relay pings a socket. A socket that has not answered the
+/// previous ping by the next one is dropped.
+const PING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Writes a socket's queued frames and pings it. Stops when the queue closes,
+/// when a frame takes longer than SEND_TIMEOUT, or when a ping got no pong.
+async fn write_frames(
+    mut sink: impl Sink<WsMessage> + Unpin,
+    mut queue: mpsc::Receiver<Utf8Bytes>,
+    ponged: Arc<AtomicBool>,
+) {
+    let mut ping = interval_at(Instant::now() + PING_INTERVAL, PING_INTERVAL);
+    loop {
+        let frame = tokio::select! {
+            text = queue.recv() => match text {
+                Some(text) => WsMessage::Text(text),
+                None => return,
+            },
+            _ = ping.tick() => {
+                if !ponged.swap(false, Ordering::Relaxed) {
+                    return;
+                }
+                WsMessage::Ping(Default::default())
+            }
+        };
+        if !matches!(timeout(SEND_TIMEOUT, sink.send(frame)).await, Ok(Ok(()))) {
+            return;
+        }
     }
 }
 
@@ -1249,7 +1323,7 @@ enum Need {
 /// in, so a non-member cannot probe which ids exist.
 async fn authorize(
     state: &AppState,
-    sender: &Arc<Mutex<SplitSink<WebSocket, WsMessage>>>,
+    sender: &mpsc::Sender<Utf8Bytes>,
     user: Uuid,
     server: Option<Uuid>,
     need: Need,
@@ -1294,7 +1368,10 @@ fn listed(lookup: Result<HashSet<Uuid>, sqlx::Error>) -> HashSet<Uuid> {
 
 pub struct ConnectedUser {
     pub user_id: Uuid,
-    pub sender: Arc<Mutex<SplitSink<WebSocket, WsMessage>>>,
+    /// The socket's send queue.
+    pub queue: mpsc::Sender<Utf8Bytes>,
+    /// Stops the socket's writer, which ends its connection.
+    pub writer: AbortHandle,
 }
 
 pub type ConnectionMap = Arc<RwLock<HashMap<Uuid, ConnectedUser>>>;
@@ -1303,36 +1380,48 @@ pub fn new_connection_map() -> ConnectionMap {
     Arc::new(RwLock::new(HashMap::new()))
 }
 
+/// Queue an event for this socket, behind everything queued before it. Waits
+/// while the queue is full, which only ever holds up this socket's own reader.
 async fn send_event(
-    sender: &Arc<Mutex<SplitSink<WebSocket, WsMessage>>>,
+    sender: &mpsc::Sender<Utf8Bytes>,
     event: &ServerEvent,
-) -> Result<(), Box<dyn std::error::Error + Send>> {
-    let json = serde_json::to_string(event)
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
-    sender
-        .lock()
-        .await
-        .send(WsMessage::Text(json.into()))
-        .await
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send>)?;
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    sender.send(serde_json::to_string(event)?.into()).await?;
     Ok(())
 }
 
-/// Send an event to every open socket of `users`.
+/// Send an event to every open socket of `users`. The queues are copied out
+/// of the map first, so no send runs under its lock. A socket whose queue is
+/// full has fallen behind and is dropped rather than waited for.
 async fn send_to_users(state: &AppState, users: &HashSet<Uuid>, event: &ServerEvent) {
-    let json = match serde_json::to_string(event) {
-        Ok(j) => j,
-        Err(_) => return,
+    let Ok(json) = serde_json::to_string(event) else {
+        return;
     };
-    let connections = state.connections.read().await;
-    for conn in connections.values() {
-        if users.contains(&conn.user_id) {
-            let _ = conn
-                .sender
-                .lock()
-                .await
-                .send(WsMessage::Text(json.clone().into()))
-                .await;
+    let text = Utf8Bytes::from(json);
+    let queues: Vec<(Uuid, mpsc::Sender<Utf8Bytes>)> = state
+        .connections
+        .read()
+        .await
+        .iter()
+        .filter(|(_, conn)| users.contains(&conn.user_id))
+        .map(|(id, conn)| (*id, conn.queue.clone()))
+        .collect();
+    let behind: Vec<Uuid> = queues
+        .into_iter()
+        .filter(|(_, queue)| queue.try_send(text.clone()).is_err())
+        .map(|(id, _)| id)
+        .collect();
+    if behind.is_empty() {
+        return;
+    }
+    let mut connections = state.connections.write().await;
+    for id in behind {
+        if let Some(conn) = connections.remove(&id) {
+            tracing::warn!(
+                "Dropping a socket of user {} that fell behind",
+                conn.user_id
+            );
+            conn.writer.abort();
         }
     }
 }
