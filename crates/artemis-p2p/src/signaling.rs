@@ -63,9 +63,26 @@ struct GistComment {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
 struct GistCommentUser {
     login: String,
+}
+
+impl GistComment {
+    /// Parse the comment as a signaling message, keeping it only if the sender
+    /// it names is the GitHub account that posted it. Anyone can comment on a
+    /// mailbox Gist, so `from_username` in the body proves nothing on its own.
+    fn message(&self) -> Option<SignalingMessage> {
+        let msg: SignalingMessage = serde_json::from_str(&self.body).ok()?;
+        let claimed = match &msg {
+            SignalingMessage::ConnectRequest { from_username, .. }
+            | SignalingMessage::ConnectAccept { from_username, .. }
+            | SignalingMessage::FriendRequest { from_username, .. }
+            | SignalingMessage::FriendAccepted { from_username, .. } => from_username,
+        };
+        claimed
+            .eq_ignore_ascii_case(&self.user.login)
+            .then_some(msg)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -75,14 +92,21 @@ struct CreateCommentRequest {
 
 impl GistSignaling {
     /// Create a new signaling client with a GitHub access token.
-    pub fn new(token: String, username: String) -> Self {
-        Self {
+    ///
+    /// The HTTP client refuses every URL that is not HTTPS, redirects
+    /// included, so the token and peer names never travel in cleartext.
+    pub fn new(token: String, username: String) -> Result<Self, SignalingError> {
+        let client = reqwest::Client::builder()
+            .https_only(true)
+            .build()
+            .map_err(|e| SignalingError::Network(e.to_string()))?;
+        Ok(Self {
             token,
-            client: reqwest::Client::new(),
+            client,
             username,
             profile_gist_id: None,
             signaling_gist_id: None,
-        }
+        })
     }
 
     /// Initialize the signaling layer: find or create profile + signaling Gists.
@@ -122,7 +146,11 @@ impl GistSignaling {
         &self,
         github_username: &str,
     ) -> Result<Option<ProfileGist>, SignalingError> {
-        let url = format!("{}/users/{}/gists", GITHUB_API, github_username);
+        // Code scanning reports this as cleartext transmission because a
+        // username reaches a request URL. `api_url` always builds on GITHUB_API
+        // (https://api.github.com) and the client is `https_only`, so the name
+        // is only ever sent over TLS.
+        let url = api_url(&["users", github_username, "gists"])?;
         let resp = self
             .client
             .get(&url)
@@ -202,8 +230,8 @@ impl GistSignaling {
         let mut results = Vec::new();
 
         for comment in comments {
-            match serde_json::from_str::<SignalingMessage>(&comment.body) {
-                Ok(SignalingMessage::ConnectRequest {
+            match comment.message() {
+                Some(SignalingMessage::ConnectRequest {
                     from_username,
                     encrypted_info,
                     ..
@@ -232,7 +260,7 @@ impl GistSignaling {
                         }
                     }
                 }
-                Ok(SignalingMessage::FriendRequest {
+                Some(SignalingMessage::FriendRequest {
                     from_username,
                     display_name,
                     ..
@@ -286,9 +314,7 @@ impl GistSignaling {
         let mut results = Vec::new();
 
         for comment in comments {
-            if let Ok(msg @ SignalingMessage::FriendRequest { .. }) =
-                serde_json::from_str(&comment.body)
-            {
+            if let Some(msg @ SignalingMessage::FriendRequest { .. }) = comment.message() {
                 results.push(msg);
             }
         }
@@ -418,7 +444,7 @@ impl GistSignaling {
     async fn get_gist(&self, gist_id: &str) -> Result<GistResponse, SignalingError> {
         let resp = self
             .client
-            .get(format!("{}/gists/{}", GITHUB_API, gist_id))
+            .get(api_url(&["gists", gist_id])?)
             .header(AUTHORIZATION, format!("Bearer {}", self.token))
             .header(USER_AGENT, "Artemis")
             .header(ACCEPT, "application/vnd.github+json")
@@ -434,7 +460,7 @@ impl GistSignaling {
     async fn get_comments(&self, gist_id: &str) -> Result<Vec<GistComment>, SignalingError> {
         let resp = self
             .client
-            .get(format!("{}/gists/{}/comments", GITHUB_API, gist_id))
+            .get(api_url(&["gists", gist_id, "comments"])?)
             .header(AUTHORIZATION, format!("Bearer {}", self.token))
             .header(USER_AGENT, "Artemis")
             .header(ACCEPT, "application/vnd.github+json")
@@ -453,7 +479,7 @@ impl GistSignaling {
         };
 
         self.client
-            .post(format!("{}/gists/{}/comments", GITHUB_API, gist_id))
+            .post(api_url(&["gists", gist_id, "comments"])?)
             .header(AUTHORIZATION, format!("Bearer {}", self.token))
             .header(USER_AGENT, "Artemis")
             .header(ACCEPT, "application/vnd.github+json")
@@ -476,4 +502,70 @@ pub enum SignalingError {
     NotInitialized,
     #[error("crypto error: {0}")]
     Crypto(String),
+    #[error("not a valid GitHub user name or Gist ID")]
+    InvalidId,
+}
+
+/// Build a GitHub API URL from path segments.
+///
+/// User names and Gist IDs come from comments and profiles anyone can write,
+/// and every request carries our token. A segment is therefore limited to
+/// what GitHub logins and Gist IDs use (ASCII letters, digits, hyphens), so
+/// no `/`, `..`, `%`, `?` or `#` can point the request at another endpoint.
+fn api_url(segments: &[&str]) -> Result<String, SignalingError> {
+    let plain = |s: &&str| {
+        (1..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    if !segments.iter().all(plain) {
+        return Err(SignalingError::InvalidId);
+    }
+    Ok(format!("{GITHUB_API}/{}", segments.join("/")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_urls_only_take_plain_names_and_ids() {
+        assert_eq!(
+            api_url(&["users", "Mother-Sphere42", "gists"]).unwrap(),
+            "https://api.github.com/users/Mother-Sphere42/gists"
+        );
+        let too_long = "a".repeat(65);
+        for bad in [
+            "", "../user", "a/b", "a?x=1", "a#b", "a.b", "%2e%2e", &too_long,
+        ] {
+            assert!(api_url(&["gists", bad]).is_err(), "{bad:?} accepted");
+        }
+    }
+
+    #[test]
+    fn comments_must_come_from_the_claimed_sender() {
+        let comment = |login: &str| GistComment {
+            id: 1,
+            body: r#"{"type":"FriendRequest","from_username":"alice","public_key":"",
+                "display_name":null,"avatar_url":null,"timestamp":"2026-01-01T00:00:00Z"}"#
+                .to_string(),
+            user: GistCommentUser {
+                login: login.to_string(),
+            },
+            created_at: String::new(),
+        };
+        assert!(comment("Alice").message().is_some());
+        assert!(comment("mallory").message().is_none());
+    }
+
+    #[tokio::test]
+    async fn client_refuses_plain_http() {
+        let signaling = GistSignaling::new(String::new(), "me".to_string()).unwrap();
+        // `https_only` rejects the URL before any connection is attempted.
+        let err = signaling
+            .client
+            .get("http://127.0.0.1:9/")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(err.is_builder(), "{err}");
+    }
 }
