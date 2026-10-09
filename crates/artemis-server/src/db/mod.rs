@@ -106,6 +106,16 @@ pub async fn update_user_status(
     Ok(())
 }
 
+/// Sets every user offline. Run at startup, before any socket connects, so a
+/// relay that stopped without running its disconnect cleanup does not keep
+/// showing its last users online.
+pub async fn mark_all_users_offline(pool: &DbPool) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE users SET status = 'offline' WHERE status <> 'offline'")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 // ── Server queries ──
 
 pub async fn get_user_servers(
@@ -1480,5 +1490,19 @@ mod tests {
         MIGRATOR.run(&pool).await.unwrap();
 
         assert_eq!(recorded_migrations(&pool).await, MIGRATOR.iter().count());
+    }
+
+    #[sqlx::test(migrator = "MIGRATOR")]
+    #[ignore = "needs DATABASE_URL"]
+    async fn startup_sets_users_left_online_offline(pool: DbPool) {
+        sqlx::query("INSERT INTO users (username, github_id, status) VALUES ('ada', 1, 'online')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        mark_all_users_offline(&pool).await.unwrap();
+
+        let user = find_user_by_github_id(&pool, 1).await.unwrap().unwrap();
+        assert_eq!(user.status, "offline");
     }
 }
