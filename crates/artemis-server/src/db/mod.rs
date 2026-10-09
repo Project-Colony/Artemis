@@ -20,6 +20,18 @@ pub async fn connect(database_url: &str) -> Result<DbPool, sqlx::Error> {
 /// always a new numbered file, never an edit to an existing one.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+/// Readies the database before the relay opens its listener: applies pending
+/// migrations, then sets every user offline. Nobody is connected yet, and a
+/// relay that stopped without running its disconnect cleanup would otherwise
+/// keep showing its last users online.
+pub async fn prepare(pool: &DbPool) -> Result<(), sqlx::Error> {
+    MIGRATOR.run(pool).await?;
+    sqlx::query("UPDATE users SET status = 'offline' WHERE status <> 'offline'")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 // ── User queries ──
 
 pub async fn find_user_by_github_id(
@@ -101,16 +113,6 @@ pub async fn update_user_status(
     sqlx::query("UPDATE users SET status = $1 WHERE id = $2")
         .bind(status)
         .bind(user_id)
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
-/// Sets every user offline. Run at startup, before any socket connects, so a
-/// relay that stopped without running its disconnect cleanup does not keep
-/// showing its last users online.
-pub async fn mark_all_users_offline(pool: &DbPool) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE users SET status = 'offline' WHERE status <> 'offline'")
         .execute(pool)
         .await?;
     Ok(())
@@ -1500,7 +1502,7 @@ mod tests {
             .await
             .unwrap();
 
-        mark_all_users_offline(&pool).await.unwrap();
+        prepare(&pool).await.unwrap();
 
         let user = find_user_by_github_id(&pool, 1).await.unwrap().unwrap();
         assert_eq!(user.status, "offline");

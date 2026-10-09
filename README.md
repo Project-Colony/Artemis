@@ -53,7 +53,9 @@ The relay server needs PostgreSQL 16 or later and a GitHub OAuth app. It reads i
 settings from the environment and from a `.env` file (see `.env.example`):
 
 1. Copy `.env.example` to `.env`.
-2. Choose a database password: set it as `POSTGRES_PASSWORD` and in `DATABASE_URL`.
+2. Choose a database password of letters and digits, and set it as `POSTGRES_PASSWORD`
+   and in `DATABASE_URL`. Other characters need quoting in `.env` and percent-encoding
+   in the URL.
 3. Create an OAuth app at <https://github.com/settings/developers> with the callback
    URL `http://localhost:3000/auth/github/callback`, then set `GITHUB_CLIENT_ID` and
    `GITHUB_CLIENT_SECRET`.

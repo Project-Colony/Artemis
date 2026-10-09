@@ -33,10 +33,16 @@ impl Config {
 
         let base_url = var("BASE_URL").unwrap_or_else(|| "http://localhost:3000".to_string());
         let base_url = base_url.trim_end_matches('/').to_string();
-        // The OAuth handlers build this redirect URL on every login; check it
-        // parses once here rather than failing on each request.
-        oauth2::RedirectUrl::new(format!("{base_url}/auth/github/callback"))
-            .with_context(|| format!("BASE_URL {base_url:?} is not an absolute URL"))?;
+        // The OAuth handlers build the redirect URL from this on every login,
+        // and the state cookie is Secure only for https. A value without its
+        // scheme, such as localhost:3000, still parses as a URL, so check the
+        // scheme and host once here rather than failing on each login.
+        let web_url = oauth2::url::Url::parse(&base_url)
+            .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some());
+        anyhow::ensure!(
+            web_url,
+            "BASE_URL {base_url:?} is not an http:// or https:// URL"
+        );
 
         Ok(Self {
             database_url: required("DATABASE_URL")?,
@@ -48,12 +54,35 @@ impl Config {
     }
 }
 
+/// Describes a .env error without the offending line. dotenvy's own message
+/// prints that line in full, and after an unclosed quote every line up to the
+/// end of the file, which can include the database password or the GitHub
+/// secret.
+fn dotenv_error(e: dotenvy::Error) -> anyhow::Error {
+    let dotenvy::Error::LineParse(line, _) = &e else {
+        return anyhow::Error::new(e).context("cannot read .env");
+    };
+    let line = line.trim_start();
+    let line = line.strip_prefix("export ").unwrap_or(line);
+    let key_end = line
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+        .unwrap_or(line.len());
+    let (key, rest) = line.split_at(key_end);
+    if key.is_empty() || !rest.trim_start().starts_with('=') {
+        anyhow::anyhow!("cannot read .env: a line is not of the form KEY=value")
+    } else {
+        anyhow::anyhow!(
+            "cannot read .env: the value of {key} does not parse; quote values that contain spaces, quotes, backslashes or $"
+        )
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Values already in the environment win over the ones in .env.
     if let Err(e) = dotenvy::dotenv() {
         if !e.not_found() {
-            return Err(e).context("cannot read .env");
+            return Err(dotenv_error(e));
         }
     }
 
@@ -66,12 +95,8 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_lookup(|name| std::env::var(name).ok())?;
 
     let pool = db::connect(&config.database_url).await?;
-    db::MIGRATOR.run(&pool).await?;
+    db::prepare(&pool).await?;
     tracing::info!("Database migrations applied");
-
-    // Nobody is connected yet. Users who were online when the relay last
-    // stopped would otherwise stay online for their friends.
-    db::mark_all_users_offline(&pool).await?;
 
     let app_state = AppState {
         db: pool,
@@ -146,8 +171,37 @@ mod tests {
         env.push(("BASE_URL", "/relay"));
         assert!(config_from(&env).is_err());
 
+        // The first two still parse as URLs, with the host name as the scheme.
+        for scheme_less in [
+            "localhost:3000",
+            "relay.example.com:3000",
+            "ftp://relay.example",
+        ] {
+            env.pop();
+            env.push(("BASE_URL", scheme_less));
+            let err = config_from(&env).err().unwrap().to_string();
+            assert!(err.contains("http://"), "{err}");
+        }
+
         env.pop();
         env.push(("BASE_URL", "https://relay.example/"));
         assert_eq!(config_from(&env).unwrap().base_url, "https://relay.example");
+    }
+
+    #[test]
+    fn unparsable_env_line_names_its_key_but_not_its_value() {
+        let env_file = "DATABASE_URL=postgres://artemis:pa'ss@localhost/artemis\nGITHUB_CLIENT_SECRET=s3cret\n";
+        let e = dotenvy::from_read_iter(env_file.as_bytes())
+            .find_map(Result::err)
+            .unwrap();
+        let err = format!("{:#}", dotenv_error(e));
+        assert!(err.contains("DATABASE_URL"), "{err}");
+        assert!(!err.contains("pa'ss") && !err.contains("s3cret"), "{err}");
+
+        let e = dotenvy::from_read_iter("s3cret\n".as_bytes())
+            .find_map(Result::err)
+            .unwrap();
+        let err = format!("{:#}", dotenv_error(e));
+        assert!(!err.contains("s3cret"), "{err}");
     }
 }
