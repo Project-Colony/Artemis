@@ -142,11 +142,7 @@ pub fn view_with_payload<'a>(
         // ── Reply context ──
         if let Some(reply_id) = msg.reply_to_id {
             if let Some(replied_msg) = messages.iter().find(|m| m.id == reply_id) {
-                let reply_preview: String = if replied_msg.content.len() > 60 {
-                    format!("{}...", &replied_msg.content[..57])
-                } else {
-                    replied_msg.content.clone()
-                };
+                let reply_preview = preview(&replied_msg.content, 60);
                 let reply_row = row![
                     Space::new().width(48),
                     text(icons::THREAD).size(12).color(colors::TEXT_TIMESTAMP),
@@ -360,11 +356,7 @@ pub fn view_with_payload<'a>(
     chat_column = chat_column.push(messages_area);
 
     if let Some(reply_msg) = reply_to {
-        let reply_preview: String = if reply_msg.content.len() > 80 {
-            format!("{}...", &reply_msg.content[..77])
-        } else {
-            reply_msg.content.clone()
-        };
+        let reply_preview = preview(&reply_msg.content, 80);
 
         let reply_bar = container(
             row![
@@ -550,4 +542,55 @@ fn render_reactions(message_id: Uuid, reactions: &[ReactionCount]) -> Element<'_
     container(reaction_row)
         .padding(Padding::from([2, 0]))
         .into()
+}
+
+/// Shortens `s` to at most `max` characters, ending with "..." when cut.
+/// Counts characters, not bytes, so multi-byte text never splits mid-character.
+fn preview(s: &str, max: usize) -> String {
+    if s.chars().nth(max).is_some() {
+        let mut cut: String = s.chars().take(max - 3).collect();
+        cut.push_str("...");
+        cut
+    } else {
+        s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preview;
+
+    #[test]
+    fn preview_cuts_on_character_boundaries() {
+        let french =
+            "Ça c'est vraiment très très très très très très bien, j'adore cette interface élégante";
+        // 82 bytes, 79 chars: byte 57 falls inside the 3-byte U+2705.
+        let check =
+            "Les tests passent maintenant sur toutes les plateformes ✅ merci beaucoup à tous";
+        // Byte 77 falls inside the 2-byte "é".
+        let accent_at_77 = format!("{}é{}", "a".repeat(76), "b".repeat(10));
+
+        for s in [french, check, accent_at_77.as_str()] {
+            for max in [60, 80] {
+                let p = preview(s, max);
+                let longer = s.chars().count() > max;
+                assert!(p.chars().count() <= max, "{p:?}");
+                assert_eq!(p.ends_with("..."), longer, "{p:?}");
+                if !longer {
+                    assert_eq!(p, s);
+                }
+            }
+        }
+        assert_eq!(preview(check, 60).chars().count(), 60);
+        assert_eq!(preview(check, 80), check);
+    }
+
+    #[test]
+    fn preview_keeps_ascii_output() {
+        let long = "x".repeat(100);
+        assert_eq!(preview(&long, 60), format!("{}...", &long[..57]));
+        assert_eq!(preview(&long, 80), format!("{}...", &long[..77]));
+        assert_eq!(preview(&long[..60], 60), &long[..60]);
+        assert_eq!(preview(&long[..61], 60), format!("{}...", &long[..57]));
+    }
 }
