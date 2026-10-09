@@ -15,7 +15,7 @@ use artemis_core::protocol::{
     ClientEvent, FriendPayload, FriendRequestPayload, ServerEvent, ServerPayload,
 };
 
-use artemis_p2p::crypto::Identity;
+use artemis_p2p::crypto::{Identity, Purpose};
 
 use views::{
     channel_sidebar, chat_area, friend_list, login_screen, member_list, server_list,
@@ -725,7 +725,7 @@ impl Artemis {
 
         // Encrypt message if friend has a public key
         let encrypted_content = if let Some(ref pk) = friend.public_key {
-            match identity.encrypt_for_b64(pk, content.as_bytes()) {
+            match identity.encrypt_for_b64(Purpose::DirectMessage, pk, content.as_bytes()) {
                 Ok(enc) => enc,
                 Err(e) => {
                     tracing::error!("E2E encryption failed: {}", e);
@@ -763,6 +763,35 @@ impl Artemis {
     }
 
     /// Derive a deterministic DM channel ID from two user IDs.
+    /// Text to show for a direct message exchanged with `friend_id`.
+    ///
+    /// Without a public key for the friend, the message came through the
+    /// plaintext fallback and is shown as is. With one, a message that does
+    /// not decrypt is never shown as its raw content: the relay could have
+    /// written it.
+    fn dm_text(&self, friend_id: Uuid, sent_by_us: bool, content: String) -> String {
+        let Some(pk) = self
+            .friends
+            .iter()
+            .find(|f| f.user_id == friend_id)
+            .and_then(|f| f.public_key.as_deref())
+        else {
+            return content;
+        };
+        self.identity
+            .as_ref()
+            .and_then(|identity| {
+                if sent_by_us {
+                    identity.decrypt_sent_b64(Purpose::DirectMessage, pk, &content)
+                } else {
+                    identity.decrypt_from_b64(Purpose::DirectMessage, pk, &content)
+                }
+                .ok()
+            })
+            .and_then(|plaintext| String::from_utf8(plaintext).ok())
+            .unwrap_or_else(|| "[This message could not be decrypted]".to_string())
+    }
+
     fn dm_channel_id(&self, other_user_id: Uuid) -> Uuid {
         let my_id = self.user_id.unwrap_or(Uuid::nil());
         let (a, b) = if my_id < other_user_id {
@@ -964,30 +993,11 @@ impl Artemis {
 
                 let dm_channel_id = self.dm_channel_id(from_user_id);
 
-                // Try to decrypt
-                let content = if from_user_id == self.user_id.unwrap_or(Uuid::nil()) {
+                if from_user_id == self.user_id.unwrap_or(Uuid::nil()) {
                     // Our own echoed message — skip (already added optimistically)
                     return;
-                } else if let Some(identity) = &self.identity {
-                    let sender_pk = self
-                        .friends
-                        .iter()
-                        .find(|f| f.user_id == from_user_id)
-                        .and_then(|f| f.public_key.as_ref());
-
-                    if let Some(pk) = sender_pk {
-                        match identity.decrypt_from_b64(pk, &encrypted_content) {
-                            Ok(plaintext) => {
-                                String::from_utf8(plaintext).unwrap_or(encrypted_content)
-                            }
-                            Err(_) => encrypted_content,
-                        }
-                    } else {
-                        encrypted_content
-                    }
-                } else {
-                    encrypted_content
-                };
+                }
+                let content = self.dm_text(from_user_id, false, encrypted_content);
 
                 let msg = Message {
                     id: message_id,
@@ -1189,25 +1199,8 @@ impl Artemis {
                 for dm in messages {
                     let msg_id = dm.id;
                     if !self.messages.iter().any(|m| m.id == msg_id) {
-                        // Attempt decrypt
-                        let content = if let Some(identity) = &self.identity {
-                            let sender_pk = self
-                                .friends
-                                .iter()
-                                .find(|f| f.user_id == dm.sender_id)
-                                .and_then(|f| f.public_key.as_ref());
-                            if let Some(pk) = sender_pk {
-                                match identity.decrypt_from_b64(pk, &dm.encrypted_content) {
-                                    Ok(pt) => String::from_utf8(pt)
-                                        .unwrap_or(dm.encrypted_content.clone()),
-                                    Err(_) => dm.encrypted_content.clone(),
-                                }
-                            } else {
-                                dm.encrypted_content.clone()
-                            }
-                        } else {
-                            dm.encrypted_content.clone()
-                        };
+                        let sent_by_us = Some(dm.sender_id) == self.user_id;
+                        let content = self.dm_text(friend_id, sent_by_us, dm.encrypted_content);
 
                         self.messages.push(Message {
                             id: dm.id,

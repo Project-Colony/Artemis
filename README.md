@@ -17,6 +17,10 @@ Early prototype, not ready for use. What works and what does not:
 - A new encryption key pair is generated at every sign-in, so older direct messages
   cannot be decrypted after a restart.
 - A direct message is sent unencrypted when the friend has not published a public key.
+- Friends' public keys come from the relay and are not verified (no fingerprint check or
+  key pinning yet), so whoever runs the relay can substitute a key and read or alter
+  direct messages. Encryption keeps the text unreadable in the relay's database and on
+  the network, but does not protect it from the relay operator.
 - The `artemis-p2p` crate (QUIC transport, GitHub Gist signaling) is not wired into the
   client. Only its key exchange and encryption code is used.
 
