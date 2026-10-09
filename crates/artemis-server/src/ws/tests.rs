@@ -92,15 +92,24 @@ async fn snapshot(pool: &DbPool) -> String {
     .unwrap()
 }
 
-/// Serves the relay's routes on a free loopback port.
-async fn serve(db: DbPool) -> SocketAddr {
-    let state = AppState {
+fn app_state(db: DbPool) -> AppState {
+    AppState {
         db,
         connections: super::new_connection_map(),
         github_client_id: String::new(),
         github_client_secret: String::new(),
         base_url: "http://127.0.0.1".to_string(),
-    };
+    }
+}
+
+/// A pool that never connects, for tests that do not reach the database.
+fn unused_pool() -> DbPool {
+    sqlx::PgPool::connect_lazy("postgres://127.0.0.1/unused").unwrap()
+}
+
+/// Serves the relay's routes on a free loopback port.
+async fn serve(db: DbPool) -> SocketAddr {
+    let state = app_state(db);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, crate::router(state)).await });
@@ -660,11 +669,159 @@ async fn presence_reaches_co_members_and_friends_only(pool: DbPool) {
     );
 }
 
+#[sqlx::test(migrator = "crate::db::MIGRATOR")]
+#[ignore = "needs DATABASE_URL"]
+async fn a_user_goes_offline_when_their_last_socket_closes(pool: DbPool) {
+    seed(&pool).await;
+    let addr = serve(pool.clone()).await;
+    let mut founder = sign_in(addr, "founder-token").await;
+    let mut phone = sign_in(addr, "member-token").await;
+    let mut desktop = sign_in(addr, "member-token").await;
+    let status = || {
+        sqlx::query_scalar::<_, String>("SELECT status FROM users WHERE id = $1")
+            .bind(MEMBER)
+            .fetch_one(&pool)
+    };
+    let presence = |status: &str| json!({"type": "PresenceUpdate", "data": {"user_id": MEMBER, "status": status}});
+
+    for _ in 0..2 {
+        assert_eq!(recv(&mut founder).await, presence("Online"));
+    }
+
+    phone.close(None).await.unwrap();
+    assert_silent(&mut founder).await;
+    assert_eq!(status().await.unwrap(), "online");
+
+    // The other socket still gets the member's events.
+    let post = ClientEvent::SendMessage {
+        channel_id: CHANNEL_A,
+        content: "still there?".to_string(),
+        reply_to_id: None,
+    };
+    assert_eq!(call(&mut founder, &post).await["type"], "MessageReceived");
+    assert_eq!(recv(&mut desktop).await["type"], "MessageReceived");
+
+    desktop.close(None).await.unwrap();
+    assert_eq!(recv(&mut founder).await, presence("Offline"));
+    assert_eq!(status().await.unwrap(), "offline");
+}
+
+/// Frames up to and including the next MessageReceived, each of which has to
+/// arrive within 2 seconds.
+async fn until_message(ws: &mut Client) -> Vec<Value> {
+    let mut frames = Vec::new();
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(2), recv(ws))
+            .await
+            .expect("nothing within 2 seconds");
+        let done = frame["type"] == "MessageReceived";
+        frames.push(frame);
+        if done {
+            return frames;
+        }
+    }
+}
+
+#[sqlx::test(migrator = "crate::db::MIGRATOR")]
+#[ignore = "needs DATABASE_URL"]
+async fn a_client_that_stops_reading_holds_up_nobody(pool: DbPool) {
+    seed(&pool).await;
+    sqlx::query("INSERT INTO server_members (user_id, server_id, role) VALUES ($1, $2, 'member')")
+        .bind(STRANGER)
+        .bind(SERVER_A)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let addr = serve(pool).await;
+
+    // The member signs in, then never reads again.
+    let _stuck = sign_in(addr, "member-token").await;
+    let mut watcher = sign_in(addr, "stranger-token").await;
+    let mut poster = sign_in(addr, "founder-token").await;
+    assert_eq!(recv(&mut watcher).await["type"], "PresenceUpdate");
+
+    // Large messages fill the stuck socket's buffers, then its queue. Once
+    // the queue is full the relay drops that socket, and the member goes
+    // offline. Meanwhile everyone else keeps getting each message at once.
+    let post = ClientEvent::SendMessage {
+        channel_id: CHANNEL_A,
+        content: "x".repeat(16 * 1024),
+        reply_to_id: None,
+    };
+    let offline =
+        json!({"type": "PresenceUpdate", "data": {"user_id": MEMBER, "status": "Offline"}});
+    let mut dropped = false;
+    for sent in 1..=2000 {
+        send(&mut poster, &post).await;
+        until_message(&mut poster).await;
+        dropped |= until_message(&mut watcher).await.contains(&offline);
+        if sent % 64 == 0 {
+            // Signing in is not held up either. The outsider shares no server
+            // with anyone here and has no friends, so nobody hears of it.
+            tokio::time::timeout(Duration::from_secs(2), sign_in(addr, "outsider-token"))
+                .await
+                .expect("no sign-in within 2 seconds");
+        }
+        if dropped {
+            break;
+        }
+    }
+    assert!(dropped, "the stuck socket was never dropped");
+}
+
+#[tokio::test]
+async fn a_full_queue_drops_only_its_socket() {
+    use super::ConnectedUser;
+    use tokio::sync::mpsc;
+
+    let state = app_state(unused_pool());
+    let users = [1, 2, 3].map(Uuid::from_u128);
+    let mut queues = Vec::new();
+    let mut writers = Vec::new();
+    for (conn, user_id) in users.into_iter().enumerate() {
+        let (queue, rx) = mpsc::channel(1);
+        let writer = tokio::spawn(std::future::pending::<()>());
+        let entry = ConnectedUser {
+            user_id,
+            queue,
+            writer: writer.abort_handle(),
+        };
+        state
+            .connections
+            .write()
+            .await
+            .insert(Uuid::from_u128(conn as u128), entry);
+        queues.push(rx);
+        writers.push(writer);
+    }
+    // The third socket has not taken its last frame yet.
+    let third = state.connections.read().await[&Uuid::from_u128(2)]
+        .queue
+        .clone();
+    third.try_send("earlier".into()).unwrap();
+
+    let event = artemis_core::protocol::ServerEvent::PublicKeyAcknowledged;
+    super::send_to_users(&state, &users.into(), &event).await;
+
+    let frame = serde_json::to_string(&event).unwrap();
+    for rx in &mut queues[..2] {
+        assert_eq!(rx.try_recv().unwrap().as_str(), frame);
+    }
+    let connections = state.connections.read().await;
+    let mut left: Vec<_> = connections.keys().map(|id| id.as_u128()).collect();
+    left.sort();
+    assert_eq!(left, [0, 1]);
+    drop(connections);
+
+    let third_writer = writers.pop().unwrap();
+    assert!(third_writer.await.unwrap_err().is_cancelled());
+    assert!(writers.iter().all(|writer| !writer.is_finished()));
+}
+
 #[tokio::test]
 async fn rest_routes_that_took_the_token_in_the_query_are_gone() {
     // Never connects: none of these routes reaches the database.
-    let pool = sqlx::PgPool::connect_lazy("postgres://127.0.0.1/unused").unwrap();
-    let addr = serve(pool).await;
+    let addr = serve(unused_pool()).await;
     let http = reqwest::Client::builder().no_proxy().build().unwrap();
 
     let removed = [
