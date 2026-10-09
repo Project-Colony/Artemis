@@ -814,18 +814,19 @@ async fn a_client_that_stops_reading_holds_up_nobody(pool: DbPool) {
     pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     assert_eq!(recv(&mut watcher).await["type"], "PresenceUpdate");
 
-    // Large messages fill the stuck socket's buffers, then its queue. Once
-    // the queue is full the relay drops that socket, and the member goes
-    // offline. Meanwhile everyone else keeps getting each message at once.
+    // Messages as large as allowed fill the stuck socket's buffers, then its
+    // queue. Once the queue is full, or a frame has waited SEND_TIMEOUT, the
+    // relay drops that socket, and the member goes offline. Meanwhile
+    // everyone else keeps getting each message at once.
     let post = ClientEvent::SendMessage {
         channel_id: CHANNEL_A,
-        content: "x".repeat(16 * 1024),
+        content: "x".repeat(artemis_core::protocol::MAX_MESSAGE_CHARS),
         reply_to_id: None,
     };
     let offline =
         json!({"type": "PresenceUpdate", "data": {"user_id": MEMBER, "status": "Offline"}});
     let mut dropped = false;
-    for sent in 1..=2000 {
+    for sent in 1..=8000 {
         pace.tick().await;
         send(&mut posters[sent % super::MAX_SOCKETS_PER_USER], &post).await;
         for poster in &mut posters {
