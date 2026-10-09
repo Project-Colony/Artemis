@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
@@ -73,14 +73,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     .await
                                     .unwrap_or_default();
 
-                                // Broadcast presence to all connected users
-                                broadcast_event(
+                                announce_presence(
                                     &state,
-                                    &ServerEvent::PresenceUpdate {
-                                        user_id: user.id,
-                                        status: artemis_core::models::user::UserStatus::Online,
-                                    },
-                                    Some(user.id),
+                                    user.id,
+                                    artemis_core::models::user::UserStatus::Online,
                                 )
                                 .await;
 
@@ -100,22 +96,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                     let _ =
                                         send_event(&sender, &ServerEvent::UnreadState { channels })
                                             .await;
-                                }
-
-                                // Notify friends that we're online
-                                if let Ok(friends) = db::get_friends(&state.db, user.id).await {
-                                    for friend in &friends {
-                                        send_to_user(
-                                            &state,
-                                            friend.user_id,
-                                            &ServerEvent::FriendPresenceUpdate {
-                                                user_id: user.id,
-                                                status:
-                                                    artemis_core::models::user::UserStatus::Online,
-                                            },
-                                        )
-                                        .await;
-                                    }
                                 }
 
                                 tracing::info!("User {} authenticated", user.id);
@@ -159,9 +139,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         };
 
                         let server = found(db::channel_server(&state.db, channel_id).await);
-                        if !authorize(&state, &sender, uid, server, Need::Member).await {
+                        let Some(server_id) =
+                            authorize(&state, &sender, uid, server, Need::Member).await
+                        else {
                             continue;
-                        }
+                        };
 
                         // Parse @mentions before sending
                         let mentioned_usernames: Vec<String> = content
@@ -192,32 +174,30 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             Ok(Some(message)) => {
                                 // Track @mentions for unread state
                                 if !mentioned_usernames.is_empty() {
-                                    if let Some(server_id) = server {
-                                        if let Ok(resolved) = db::resolve_mentions(
-                                            &state.db,
-                                            server_id,
-                                            &mentioned_usernames,
-                                        )
-                                        .await
-                                        {
-                                            for (_uname, mentioned_uid) in resolved {
-                                                if mentioned_uid != uid {
-                                                    let _ = db::increment_mention_count(
-                                                        &state.db,
-                                                        mentioned_uid,
-                                                        channel_id,
-                                                    )
-                                                    .await;
-                                                }
+                                    if let Ok(resolved) = db::resolve_mentions(
+                                        &state.db,
+                                        server_id,
+                                        &mentioned_usernames,
+                                    )
+                                    .await
+                                    {
+                                        for (_uname, mentioned_uid) in resolved {
+                                            if mentioned_uid != uid {
+                                                let _ = db::increment_mention_count(
+                                                    &state.db,
+                                                    mentioned_uid,
+                                                    channel_id,
+                                                )
+                                                .await;
                                             }
                                         }
                                     }
                                 }
 
-                                broadcast_event(
+                                broadcast_to_server(
                                     &state,
+                                    server_id,
                                     &ServerEvent::MessageReceived { message },
-                                    None,
                                 )
                                 .await;
                             }
@@ -242,21 +222,23 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                         let server = found(db::message_channel(&state.db, message_id).await)
                             .map(|(_, server)| server);
-                        if !authorize(&state, &sender, uid, server, Need::Member).await {
+                        let Some(server_id) =
+                            authorize(&state, &sender, uid, server, Need::Member).await
+                        else {
                             continue;
-                        }
+                        };
 
                         if let Ok(Some(edited_at)) =
                             db::edit_message(&state.db, message_id, uid, &content).await
                         {
-                            broadcast_event(
+                            broadcast_to_server(
                                 &state,
+                                server_id,
                                 &ServerEvent::MessageEdited {
                                     message_id,
                                     content,
                                     edited_at,
                                 },
-                                None,
                             )
                             .await;
                         }
@@ -267,15 +249,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                         let server = found(db::message_channel(&state.db, message_id).await)
                             .map(|(_, server)| server);
-                        if !authorize(&state, &sender, uid, server, Need::Member).await {
+                        let Some(server_id) =
+                            authorize(&state, &sender, uid, server, Need::Member).await
+                        else {
                             continue;
-                        }
+                        };
 
                         if let Ok(true) = db::delete_message(&state.db, message_id, uid).await {
-                            broadcast_event(
+                            broadcast_to_server(
                                 &state,
+                                server_id,
                                 &ServerEvent::MessageDeleted { message_id },
-                                None,
                             )
                             .await;
                         }
@@ -289,7 +273,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         let Some(uid) = user_id else { continue };
 
                         let server = found(db::channel_server(&state.db, channel_id).await);
-                        if !authorize(&state, &sender, uid, server, Need::Member).await {
+                        if authorize(&state, &sender, uid, server, Need::Member)
+                            .await
+                            .is_none()
+                        {
                             continue;
                         }
 
@@ -317,19 +304,23 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         let Some(uid) = user_id else { continue };
 
                         let server = found(db::channel_server(&state.db, channel_id).await);
-                        if !authorize(&state, &sender, uid, server, Need::Member).await {
+                        let Some(server_id) =
+                            authorize(&state, &sender, uid, server, Need::Member).await
+                        else {
                             continue;
-                        }
+                        };
 
                         let uname = username_cache.clone().unwrap_or_else(|| "User".to_string());
-                        broadcast_event(
+                        let mut others = listed(db::member_ids(&state.db, server_id).await);
+                        others.remove(&uid);
+                        send_to_users(
                             &state,
+                            &others,
                             &ServerEvent::UserTyping {
                                 channel_id,
                                 user_id: uid,
                                 username: uname,
                             },
-                            Some(uid),
                         )
                         .await;
                     }
@@ -343,30 +334,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 artemis_core::models::user::UserStatus::Offline => "offline",
                             };
                             let _ = db::update_user_status(&state.db, uid, status_str).await;
-                            broadcast_event(
+                            announce_presence(&state, uid, status).await;
+                            // The user's other devices show it too.
+                            send_to_user(
                                 &state,
+                                uid,
                                 &ServerEvent::PresenceUpdate {
                                     user_id: uid,
                                     status,
                                 },
-                                None,
                             )
                             .await;
-
-                            // Notify friends
-                            if let Ok(friends) = db::get_friends(&state.db, uid).await {
-                                for friend in &friends {
-                                    send_to_user(
-                                        &state,
-                                        friend.user_id,
-                                        &ServerEvent::FriendPresenceUpdate {
-                                            user_id: uid,
-                                            status,
-                                        },
-                                    )
-                                    .await;
-                                }
-                            }
                         }
                     }
 
@@ -399,21 +377,23 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     } => {
                         let Some(uid) = user_id else { continue };
 
-                        if !authorize(&state, &sender, uid, Some(server_id), Need::Moderator).await
+                        if authorize(&state, &sender, uid, Some(server_id), Need::Moderator)
+                            .await
+                            .is_none()
                         {
                             continue;
                         }
 
                         match db::create_channel(&state.db, server_id, category_id, &name).await {
                             Ok(Some((category_id, channel))) => {
-                                broadcast_event(
+                                broadcast_to_server(
                                     &state,
+                                    server_id,
                                     &ServerEvent::ChannelCreated {
                                         server_id,
                                         category_id,
                                         channel,
                                     },
-                                    None,
                                 )
                                 .await;
                             }
@@ -438,20 +418,22 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                         let server = found(db::message_channel(&state.db, message_id).await)
                             .map(|(_, server)| server);
-                        if !authorize(&state, &sender, uid, server, Need::Member).await {
+                        let Some(server_id) =
+                            authorize(&state, &sender, uid, server, Need::Member).await
+                        else {
                             continue;
-                        }
+                        };
 
                         if let Ok(true) = db::add_reaction(&state.db, message_id, uid, &emoji).await
                         {
-                            broadcast_event(
+                            broadcast_to_server(
                                 &state,
+                                server_id,
                                 &ServerEvent::ReactionAdded {
                                     message_id,
                                     user_id: uid,
                                     emoji,
                                 },
-                                None,
                             )
                             .await;
                         }
@@ -462,21 +444,23 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                         let server = found(db::message_channel(&state.db, message_id).await)
                             .map(|(_, server)| server);
-                        if !authorize(&state, &sender, uid, server, Need::Member).await {
+                        let Some(server_id) =
+                            authorize(&state, &sender, uid, server, Need::Member).await
+                        else {
                             continue;
-                        }
+                        };
 
                         if let Ok(true) =
                             db::remove_reaction(&state.db, message_id, uid, &emoji).await
                         {
-                            broadcast_event(
+                            broadcast_to_server(
                                 &state,
+                                server_id,
                                 &ServerEvent::ReactionRemoved {
                                     message_id,
                                     user_id: uid,
                                     emoji,
                                 },
-                                None,
                             )
                             .await;
                         }
@@ -488,9 +472,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                         let place = found(db::message_channel(&state.db, message_id).await);
                         let server = place.map(|(_, server)| server);
-                        if !authorize(&state, &sender, uid, server, Need::Moderator).await {
+                        let Some(server_id) =
+                            authorize(&state, &sender, uid, server, Need::Moderator).await
+                        else {
                             continue;
-                        }
+                        };
                         let Some((channel_id, _)) = place else {
                             continue;
                         };
@@ -498,14 +484,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         if let Ok(true) =
                             db::pin_message(&state.db, channel_id, message_id, uid).await
                         {
-                            broadcast_event(
+                            broadcast_to_server(
                                 &state,
+                                server_id,
                                 &ServerEvent::MessagePinned {
                                     channel_id,
                                     message_id,
                                     pinned_by: uid,
                                 },
-                                None,
                             )
                             .await;
                         }
@@ -516,22 +502,24 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                         let place = found(db::message_channel(&state.db, message_id).await);
                         let server = place.map(|(_, server)| server);
-                        if !authorize(&state, &sender, uid, server, Need::Moderator).await {
+                        let Some(server_id) =
+                            authorize(&state, &sender, uid, server, Need::Moderator).await
+                        else {
                             continue;
-                        }
+                        };
                         let Some((channel_id, _)) = place else {
                             continue;
                         };
 
                         if let Ok(true) = db::unpin_message(&state.db, channel_id, message_id).await
                         {
-                            broadcast_event(
+                            broadcast_to_server(
                                 &state,
+                                server_id,
                                 &ServerEvent::MessageUnpinned {
                                     channel_id,
                                     message_id,
                                 },
-                                None,
                             )
                             .await;
                         }
@@ -541,7 +529,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         let Some(uid) = user_id else { continue };
 
                         let server = found(db::channel_server(&state.db, channel_id).await);
-                        if !authorize(&state, &sender, uid, server, Need::Member).await {
+                        if authorize(&state, &sender, uid, server, Need::Member)
+                            .await
+                            .is_none()
+                        {
                             continue;
                         }
 
@@ -571,7 +562,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         let server = found(db::message_channel(&state.db, message_id).await)
                             .filter(|(channel, _)| *channel == channel_id)
                             .map(|(_, server)| server);
-                        if !authorize(&state, &sender, uid, server, Need::Member).await {
+                        if authorize(&state, &sender, uid, server, Need::Member)
+                            .await
+                            .is_none()
+                        {
                             continue;
                         }
 
@@ -586,7 +580,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     } => {
                         let Some(uid) = user_id else { continue };
 
-                        if !authorize(&state, &sender, uid, Some(server_id), Need::Moderator).await
+                        if authorize(&state, &sender, uid, Some(server_id), Need::Moderator)
+                            .await
+                            .is_none()
                         {
                             continue;
                         }
@@ -598,14 +594,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             icon_url.as_deref(),
                         )
                         .await;
-                        broadcast_event(
+                        broadcast_to_server(
                             &state,
+                            server_id,
                             &ServerEvent::ServerUpdated {
                                 server_id,
                                 name,
                                 icon_url,
                             },
-                            None,
                         )
                         .await;
                     }
@@ -626,28 +622,47 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             continue;
                         }
 
-                        let _ = db::delete_server(&state.db, server_id).await;
-                        broadcast_event(&state, &ServerEvent::ServerDeleted { server_id }, None)
-                            .await;
+                        match db::delete_server(&state.db, server_id).await {
+                            Ok(members) => {
+                                send_to_users(
+                                    &state,
+                                    &members,
+                                    &ServerEvent::ServerDeleted { server_id },
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to delete server: {}", e);
+                                let _ = send_event(
+                                    &sender,
+                                    &ServerEvent::Error {
+                                        message: "Failed to delete server".to_string(),
+                                    },
+                                )
+                                .await;
+                            }
+                        }
                     }
 
                     ClientEvent::CreateCategory { server_id, name } => {
                         let Some(uid) = user_id else { continue };
 
-                        if !authorize(&state, &sender, uid, Some(server_id), Need::Moderator).await
+                        if authorize(&state, &sender, uid, Some(server_id), Need::Moderator)
+                            .await
+                            .is_none()
                         {
                             continue;
                         }
 
                         match db::create_category(&state.db, server_id, &name).await {
                             Ok(category) => {
-                                broadcast_event(
+                                broadcast_to_server(
                                     &state,
+                                    server_id,
                                     &ServerEvent::CategoryCreated {
                                         server_id,
                                         category,
                                     },
-                                    None,
                                 )
                                 .await;
                             }
@@ -659,19 +674,22 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         let Some(uid) = user_id else { continue };
 
                         let server = found(db::channel_server(&state.db, channel_id).await);
-                        if !authorize(&state, &sender, uid, server, Need::Moderator).await {
+                        if authorize(&state, &sender, uid, server, Need::Moderator)
+                            .await
+                            .is_none()
+                        {
                             continue;
                         }
 
                         if let Ok(Some(server_id)) = db::delete_channel(&state.db, channel_id).await
                         {
-                            broadcast_event(
+                            broadcast_to_server(
                                 &state,
+                                server_id,
                                 &ServerEvent::ChannelDeleted {
                                     server_id,
                                     channel_id,
                                 },
-                                None,
                             )
                             .await;
                         }
@@ -685,9 +703,11 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         let Some(uid) = user_id else { continue };
 
                         let server = found(db::channel_server(&state.db, channel_id).await);
-                        if !authorize(&state, &sender, uid, server, Need::Moderator).await {
+                        let Some(server_id) =
+                            authorize(&state, &sender, uid, server, Need::Moderator).await
+                        else {
                             continue;
-                        }
+                        };
 
                         let _ = db::edit_channel(
                             &state.db,
@@ -696,14 +716,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             topic.as_deref(),
                         )
                         .await;
-                        broadcast_event(
+                        broadcast_to_server(
                             &state,
+                            server_id,
                             &ServerEvent::ChannelUpdated {
                                 channel_id,
                                 name,
                                 topic,
                             },
-                            None,
                         )
                         .await;
                     }
@@ -719,23 +739,26 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             continue;
                         }
 
-                        if let Ok(true) = db::leave_server(&state.db, uid, server_id).await {
-                            broadcast_event(
-                                &state,
-                                &ServerEvent::MemberLeft {
-                                    server_id,
-                                    user_id: uid,
-                                },
-                                None,
-                            )
-                            .await;
-                        }
+                        // The members include the leaver, so they hear it too.
+                        let members = listed(db::leave_server(&state.db, uid, server_id).await);
+                        send_to_users(
+                            &state,
+                            &members,
+                            &ServerEvent::MemberLeft {
+                                server_id,
+                                user_id: uid,
+                            },
+                        )
+                        .await;
                     }
 
                     ClientEvent::GetInviteCode { server_id } => {
                         let Some(uid) = user_id else { continue };
 
-                        if !authorize(&state, &sender, uid, Some(server_id), Need::Member).await {
+                        if authorize(&state, &sender, uid, Some(server_id), Need::Member)
+                            .await
+                            .is_none()
+                        {
                             continue;
                         }
 
@@ -767,14 +790,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             custom_status.as_deref(),
                         )
                         .await;
-                        broadcast_event(
+                        // Co-members, and the user's own devices.
+                        let mut recipients = listed(db::co_member_ids(&state.db, uid).await);
+                        recipients.insert(uid);
+                        send_to_users(
                             &state,
+                            &recipients,
                             &ServerEvent::ProfileUpdated {
                                 user_id: uid,
                                 display_name,
                                 custom_status,
                             },
-                            None,
                         )
                         .await;
                     }
@@ -822,7 +848,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 .filter(|server| *server == server_id),
                             None => Some(server_id),
                         };
-                        if !authorize(&state, &sender, uid, scope, Need::Member).await {
+                        if authorize(&state, &sender, uid, scope, Need::Member)
+                            .await
+                            .is_none()
+                        {
                             continue;
                         }
 
@@ -858,7 +887,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     } => {
                         let Some(uid) = user_id else { continue };
 
-                        if !authorize(&state, &sender, uid, Some(server_id), Need::Moderator).await
+                        if authorize(&state, &sender, uid, Some(server_id), Need::Moderator)
+                            .await
+                            .is_none()
                         {
                             continue;
                         }
@@ -867,10 +898,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             .await
                         {
                             Ok(emoji) => {
-                                broadcast_event(
+                                broadcast_to_server(
                                     &state,
+                                    server_id,
                                     &ServerEvent::CustomEmojiAdded { server_id, emoji },
-                                    None,
                                 )
                                 .await;
                             }
@@ -884,7 +915,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     } => {
                         let Some(uid) = user_id else { continue };
 
-                        if !authorize(&state, &sender, uid, Some(server_id), Need::Moderator).await
+                        if authorize(&state, &sender, uid, Some(server_id), Need::Moderator)
+                            .await
+                            .is_none()
                         {
                             continue;
                         }
@@ -892,13 +925,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         if let Ok(true) =
                             db::remove_custom_emoji(&state.db, server_id, emoji_id).await
                         {
-                            broadcast_event(
+                            broadcast_to_server(
                                 &state,
+                                server_id,
                                 &ServerEvent::CustomEmojiRemoved {
                                     server_id,
                                     emoji_id,
                                 },
-                                None,
                             )
                             .await;
                         }
@@ -907,7 +940,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     ClientEvent::FetchCustomEmojis { server_id } => {
                         let Some(uid) = user_id else { continue };
 
-                        if !authorize(&state, &sender, uid, Some(server_id), Need::Member).await {
+                        if authorize(&state, &sender, uid, Some(server_id), Need::Member)
+                            .await
+                            .is_none()
+                        {
                             continue;
                         }
 
@@ -1193,30 +1229,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     state.connections.write().await.remove(&conn_id);
     if let Some(uid) = user_id {
         let _ = db::update_user_status(&state.db, uid, "offline").await;
-        broadcast_event(
-            &state,
-            &ServerEvent::PresenceUpdate {
-                user_id: uid,
-                status: artemis_core::models::user::UserStatus::Offline,
-            },
-            None,
-        )
-        .await;
-
-        // Notify friends we went offline
-        if let Ok(friends) = db::get_friends(&state.db, uid).await {
-            for friend in &friends {
-                send_to_user(
-                    &state,
-                    friend.user_id,
-                    &ServerEvent::FriendPresenceUpdate {
-                        user_id: uid,
-                        status: artemis_core::models::user::UserStatus::Offline,
-                    },
-                )
-                .await;
-            }
-        }
+        announce_presence(&state, uid, artemis_core::models::user::UserStatus::Offline).await;
 
         tracing::info!("User {} disconnected", uid);
     }
@@ -1230,25 +1243,25 @@ enum Need {
     Moderator,
 }
 
-/// Whether `user` holds `need` in `server`, telling the socket why not.
-/// `server` is None when the event named a channel or message that does not
-/// exist. That gets the same refusal as a server the user is not in, so a
-/// non-member cannot probe which ids exist.
+/// `server` when `user` holds `need` in it, otherwise None after telling the
+/// socket why not. `server` is None when the event named a channel or message
+/// that does not exist. That gets the same refusal as a server the user is not
+/// in, so a non-member cannot probe which ids exist.
 async fn authorize(
     state: &AppState,
     sender: &Arc<Mutex<SplitSink<WebSocket, WsMessage>>>,
     user: Uuid,
     server: Option<Uuid>,
     need: Need,
-) -> bool {
+) -> Option<Uuid> {
     let role = match server {
         Some(server) => found(db::get_member_role(&state.db, user, server).await),
         None => None,
     };
     let refusal = match role.as_deref() {
         None => "Not a member of this server",
-        Some("founder" | "moderator") => return true,
-        Some(_) if need == Need::Member => return true,
+        Some("founder" | "moderator") => return server,
+        Some(_) if need == Need::Member => return server,
         Some(_) => "Insufficient permissions",
     };
     let _ = send_event(
@@ -1258,7 +1271,7 @@ async fn authorize(
         },
     )
     .await;
-    false
+    None
 }
 
 /// The row a lookup found. A database error is logged and counts as not
@@ -1267,6 +1280,15 @@ fn found<T>(lookup: Result<Option<T>, sqlx::Error>) -> Option<T> {
     lookup.unwrap_or_else(|e| {
         tracing::error!("Database lookup failed: {}", e);
         None
+    })
+}
+
+/// The users a lookup listed. A database error is logged and lists nobody, so
+/// the event goes to no one rather than to the wrong people.
+fn listed(lookup: Result<HashSet<Uuid>, sqlx::Error>) -> HashSet<Uuid> {
+    lookup.unwrap_or_else(|e| {
+        tracing::error!("Database lookup failed: {}", e);
+        HashSet::new()
     })
 }
 
@@ -1296,15 +1318,15 @@ async fn send_event(
     Ok(())
 }
 
-/// Send an event to a specific user (if they're online).
-async fn send_to_user(state: &AppState, target_user_id: Uuid, event: &ServerEvent) {
+/// Send an event to every open socket of `users`.
+async fn send_to_users(state: &AppState, users: &HashSet<Uuid>, event: &ServerEvent) {
     let json = match serde_json::to_string(event) {
         Ok(j) => j,
         Err(_) => return,
     };
     let connections = state.connections.read().await;
     for conn in connections.values() {
-        if conn.user_id == target_user_id {
+        if users.contains(&conn.user_id) {
             let _ = conn
                 .sender
                 .lock()
@@ -1315,32 +1337,49 @@ async fn send_to_user(state: &AppState, target_user_id: Uuid, event: &ServerEven
     }
 }
 
+/// Send an event to a specific user (if they're online).
+async fn send_to_user(state: &AppState, target_user_id: Uuid, event: &ServerEvent) {
+    send_to_users(state, &HashSet::from([target_user_id]), event).await;
+}
+
+/// Send an event to every member of `server_id`.
+async fn broadcast_to_server(state: &AppState, server_id: Uuid, event: &ServerEvent) {
+    let members = listed(db::member_ids(&state.db, server_id).await);
+    send_to_users(state, &members, event).await;
+}
+
+/// Tell the people who share a server with `user` that their status changed,
+/// and their friends through the friend list's own event. `user`'s own
+/// sockets are not told: on sign-in and disconnect they have nothing to
+/// update, and `UpdatePresence` tells them itself.
+async fn announce_presence(
+    state: &AppState,
+    user: Uuid,
+    status: artemis_core::models::user::UserStatus,
+) {
+    let co_members = listed(db::co_member_ids(&state.db, user).await);
+    let presence = ServerEvent::PresenceUpdate {
+        user_id: user,
+        status,
+    };
+    send_to_users(state, &co_members, &presence).await;
+
+    let friends = db::get_friends(&state.db, user)
+        .await
+        .map(|rows| rows.into_iter().map(|friend| friend.user_id).collect());
+    let presence = ServerEvent::FriendPresenceUpdate {
+        user_id: user,
+        status,
+    };
+    send_to_users(state, &listed(friends), &presence).await;
+}
+
 fn parse_status(s: &str) -> artemis_core::models::user::UserStatus {
     match s {
         "online" => artemis_core::models::user::UserStatus::Online,
         "idle" => artemis_core::models::user::UserStatus::Idle,
         "dnd" => artemis_core::models::user::UserStatus::DoNotDisturb,
         _ => artemis_core::models::user::UserStatus::Offline,
-    }
-}
-
-async fn broadcast_event(state: &AppState, event: &ServerEvent, exclude_user: Option<Uuid>) {
-    let json = match serde_json::to_string(event) {
-        Ok(j) => j,
-        Err(_) => return,
-    };
-
-    let connections = state.connections.read().await;
-    for conn in connections.values() {
-        if exclude_user.map(|id| id == conn.user_id).unwrap_or(false) {
-            continue;
-        }
-        let _ = conn
-            .sender
-            .lock()
-            .await
-            .send(WsMessage::Text(json.clone().into()))
-            .await;
     }
 }
 
