@@ -28,3 +28,4 @@ futures = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 oauth2 = { workspace = true }
+reqwest = { workspace = true }

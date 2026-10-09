@@ -1,3 +1,6 @@
+use std::future::Future;
+use std::pin::Pin;
+
 use oauth2::basic::BasicClient;
 use oauth2::{AuthUrl, ClientId, ClientSecret, EndpointNotSet, EndpointSet, RedirectUrl, TokenUrl};
 use serde::{Deserialize, Serialize};
@@ -52,6 +55,34 @@ impl GitHubOAuth {
             .await?
             .json::<GitHubUser>()
             .await
+    }
+}
+
+/// A reqwest client that oauth2 can send its requests through.
+///
+/// oauth2's built-in reqwest support is tied to an older reqwest, so that
+/// feature is off and this adapter takes its place.
+pub struct OAuthHttp(pub reqwest::Client);
+
+impl<'c> oauth2::AsyncHttpClient<'c> for OAuthHttp {
+    type Error = oauth2::HttpClientError<reqwest::Error>;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<oauth2::HttpResponse, Self::Error>> + Send + 'c>>;
+
+    fn call(&'c self, request: oauth2::HttpRequest) -> Self::Future {
+        Box::pin(async move {
+            let response = self
+                .0
+                .execute(request.try_into().map_err(Box::new)?)
+                .await
+                .map_err(Box::new)?;
+            let mut builder = oauth2::http::Response::builder().status(response.status());
+            for (name, value) in response.headers() {
+                builder = builder.header(name, value);
+            }
+            let body = response.bytes().await.map_err(Box::new)?;
+            Ok(builder.body(body.to_vec())?)
+        })
     }
 }
 
@@ -131,4 +162,38 @@ pub enum DeviceFlowError {
     Api(String),
     #[error("parse error: {0}")]
     Parse(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oauth2::AsyncHttpClient;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn oauth_http_returns_status_headers_and_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 201 Created\r\nX-Test: yes\r\nContent-Length: 2\r\n\r\n{}")
+                .await
+                .unwrap();
+        });
+
+        let request = oauth2::http::Request::post(format!("http://{addr}/token"))
+            .body(b"code=abc".to_vec())
+            .unwrap();
+        let response = OAuthHttp(reqwest::Client::new())
+            .call(request)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 201);
+        assert_eq!(response.headers()["x-test"], "yes");
+        assert_eq!(response.body(), b"{}");
+    }
 }

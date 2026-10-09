@@ -112,11 +112,11 @@ async fn github_callback(
 
     // No redirects: the oauth2 crate recommends this to keep the token request
     // from being bounced to another host (SSRF).
-    let http_client = match oauth2::reqwest::ClientBuilder::new()
-        .redirect(oauth2::reqwest::redirect::Policy::none())
+    let http_client = match reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
     {
-        Ok(c) => c,
+        Ok(c) => artemis_auth::OAuthHttp(c),
         Err(e) => {
             tracing::error!("Failed to build the HTTP client: {}", e);
             return (
