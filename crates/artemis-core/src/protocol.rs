@@ -5,6 +5,11 @@ use uuid::Uuid;
 use crate::models::message::Message;
 use crate::models::user::{MemberRole, UserStatus};
 
+/// The most characters a message may have. The client's composer stops
+/// there and the relay refuses longer content, so a message always fits the
+/// relay's 64 KiB frame cap, as a direct message too once encrypted.
+pub const MAX_MESSAGE_CHARS: usize = 4000;
+
 /// Events sent FROM client TO server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]

@@ -5,16 +5,19 @@ use std::time::Duration;
 
 use axum::extract::ws::{Message as WsMessage, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
-use axum::response::IntoResponse;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use futures::{Sink, SinkExt, StreamExt};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::AbortHandle;
-use tokio::time::{interval_at, timeout, Instant};
+use tokio::time::{interval_at, sleep, timeout, Instant};
 use uuid::Uuid;
 
-use artemis_core::protocol::{ClientEvent, FriendPayload, FriendRequestPayload, ServerEvent};
+use artemis_core::protocol::{
+    ClientEvent, FriendPayload, FriendRequestPayload, ServerEvent, MAX_MESSAGE_CHARS,
+};
 
 use crate::db;
 use crate::state::AppState;
@@ -23,19 +26,36 @@ pub fn ws_routes() -> Router<AppState> {
     Router::new().route("/ws", get(ws_handler))
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
+    // The socket holds the permit until it signs in, so the cap counts open
+    // sockets rather than handshakes in flight.
+    // ponytail: one cap for every address. One host that keeps reopening
+    // silent sockets holds all MAX_UNAUTHENTICATED places and refuses every
+    // new connection for as long as it keeps going. No per-IP cap, because
+    // behind a proxy every peer shares one address; add ConnectInfo plus a
+    // trusted X-Forwarded-For per-IP cap if that appears.
+    let Ok(permit) = state.unauthenticated.clone().try_acquire_owned() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    ws.max_message_size(MAX_MESSAGE)
+        .max_frame_size(MAX_MESSAGE)
+        .on_upgrade(move |socket| handle_socket(socket, state, permit))
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState) {
+async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphorePermit) {
+    // Released once the socket signs in.
+    let mut unauthenticated = Some(permit);
+    let deadline = sleep(AUTH_DEADLINE);
+    tokio::pin!(deadline);
+    let mut bucket = EventBucket::new();
     let (sink, mut receiver) = socket.split();
-    // Every frame to this socket, the replies below and the fan-out alike,
-    // goes through this queue, so they reach the client in the order sent.
-    let (sender, queue) = mpsc::channel(SEND_QUEUE);
+    let (sender, queue) = Outbox::new();
     let ponged = Arc::new(AtomicBool::new(true));
     let mut writer = tokio::spawn(write_frames(sink, queue, ponged.clone()));
 
     let mut user_id: Option<Uuid> = None;
+    // A socket gets one Authenticate.
+    let mut tried_to_sign_in = false;
     let mut username_cache: Option<String> = None;
     let conn_id = Uuid::new_v4();
 
@@ -47,16 +67,40 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             },
             // The writer gave up on the socket, or the fan-out dropped it.
             _ = &mut writer => break,
+            _ = &mut deadline, if user_id.is_none() => {
+                tracing::debug!("Closing a socket that did not sign in in time");
+                break;
+            }
         };
+        if !bucket.take() {
+            tracing::warn!("Closing a socket that sent events too fast");
+            break;
+        }
         match msg {
             WsMessage::Text(txt) => {
-                let event: ClientEvent = match serde_json::from_str(&txt) {
-                    Ok(e) => e,
+                let event = serde_json::from_str::<ClientEvent>(&txt);
+                if user_id.is_none() {
+                    // A refused socket ignores what the client sent after its
+                    // Authenticate until the deadline closes it. Closing at
+                    // once would abort the writer before the refusal goes out.
+                    if tried_to_sign_in {
+                        continue;
+                    }
+                    // Before that, anything but Authenticate closes it.
+                    if !matches!(event, Ok(ClientEvent::Authenticate { .. })) {
+                        break;
+                    }
+                    tried_to_sign_in = true;
+                }
+                let event = match event {
+                    Ok(event) => event,
                     Err(e) => {
+                        // The error can quote the frame, so it is never sent back.
+                        tracing::debug!("Invalid event: {}", e);
                         let _ = send_event(
                             &sender,
                             &ServerEvent::Error {
-                                message: format!("Invalid event: {}", e),
+                                message: "Invalid event".to_string(),
                             },
                         )
                         .await;
@@ -66,29 +110,56 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
                 match event {
                     ClientEvent::Authenticate { token } => {
+                        if user_id.is_some() {
+                            let _ = send_event(
+                                &sender,
+                                &ServerEvent::Error {
+                                    message: "Already authenticated".to_string(),
+                                },
+                            )
+                            .await;
+                            continue;
+                        }
                         match db::find_user_by_token(&state.db, &token).await {
                             Ok(Some(user)) => {
-                                user_id = Some(user.id);
-                                username_cache = Some(user.username.clone());
-
-                                // Register the socket. The user's first one
+                                // Register the socket unless the user has as
+                                // many open as they may. The user's first one
                                 // brings them online; later ones keep the
                                 // status they already have, Idle or DND too.
                                 let presence = state.presence.lock().await;
                                 let first = {
                                     let mut connections = state.connections.write().await;
-                                    let first =
-                                        !connections.values().any(|conn| conn.user_id == user.id);
-                                    connections.insert(
-                                        conn_id,
-                                        ConnectedUser {
-                                            user_id: user.id,
-                                            queue: sender.clone(),
-                                            writer: writer.abort_handle(),
-                                        },
-                                    );
-                                    first
+                                    let open = connections
+                                        .values()
+                                        .filter(|conn| conn.user_id == user.id)
+                                        .count();
+                                    (open < MAX_SOCKETS_PER_USER).then(|| {
+                                        connections.insert(
+                                            conn_id,
+                                            ConnectedUser {
+                                                user_id: user.id,
+                                                queue: sender.clone(),
+                                                writer: writer.abort_handle(),
+                                            },
+                                        );
+                                        open == 0
+                                    })
                                 };
+                                let Some(first) = first else {
+                                    drop(presence);
+                                    let _ = send_event(
+                                        &sender,
+                                        &ServerEvent::AuthError {
+                                            reason: "Too many connections for this account"
+                                                .to_string(),
+                                        },
+                                    )
+                                    .await;
+                                    continue;
+                                };
+                                user_id = Some(user.id);
+                                username_cache = Some(user.username.clone());
+                                drop(unauthenticated.take());
                                 if first {
                                     let _ =
                                         db::update_user_status(&state.db, user.id, "online").await;
@@ -153,16 +224,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         content,
                         reply_to_id,
                     } => {
-                        let Some(uid) = user_id else {
-                            let _ = send_event(
-                                &sender,
-                                &ServerEvent::Error {
-                                    message: "Not authenticated".to_string(),
-                                },
-                            )
-                            .await;
+                        let Some(uid) = user_id else { continue };
+                        if too_long(&sender, &content).await {
                             continue;
-                        };
+                        }
 
                         let server = found(db::channel_server(&state.db, channel_id).await);
                         let Some(server_id) =
@@ -245,6 +310,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         content,
                     } => {
                         let Some(uid) = user_id else { continue };
+                        if too_long(&sender, &content).await {
+                            continue;
+                        }
 
                         let server = found(db::message_channel(&state.db, message_id).await)
                             .map(|(_, server)| server);
@@ -1273,27 +1341,124 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     tracing::info!("User {} disconnected", uid);
 }
 
+/// The largest frame, and the largest message, a client may send. A frame
+/// over it closes the socket before its payload is read.
+const MAX_MESSAGE: usize = 64 * 1024;
+/// How long a new socket has to sign in before it is closed.
+const AUTH_DEADLINE: Duration = Duration::from_secs(10);
+/// Sockets open at once that have not signed in yet.
+pub const MAX_UNAUTHENTICATED: usize = 512;
+/// Sockets one user may have signed in at once.
+const MAX_SOCKETS_PER_USER: usize = 5;
+/// Frames a socket may send each second, on average.
+const EVENTS_PER_SECOND: f64 = 20.0;
+/// Frames a socket may send at once after a quiet spell.
+const EVENT_BURST: f64 = 40.0;
+
+/// A token bucket over the frames one socket sends. A socket that empties it
+/// is closed.
+struct EventBucket {
+    tokens: f64,
+    last: Instant,
+}
+
+impl EventBucket {
+    fn new() -> Self {
+        Self {
+            tokens: EVENT_BURST,
+            last: Instant::now(),
+        }
+    }
+
+    /// Takes a token for one frame, or returns false when none is left.
+    fn take(&mut self) -> bool {
+        let now = Instant::now();
+        let refill = now.duration_since(self.last).as_secs_f64() * EVENTS_PER_SECOND;
+        self.tokens = (self.tokens + refill).min(EVENT_BURST);
+        self.last = now;
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
+}
+
 /// Frames a socket may have waiting. Enough for a burst of events; a client
 /// that falls this far behind is dropped by the fan-out.
 const SEND_QUEUE: usize = 256;
+/// Bytes a socket may have waiting, so a client that stops reading cannot
+/// pin a queue of large replies.
+const SEND_QUEUE_BYTES: usize = 2 * 1024 * 1024;
+
 /// The longest one frame may take to go out before the socket is dropped.
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the relay pings a socket. A socket that has not answered the
 /// previous ping by the next one is dropped.
 const PING_INTERVAL: Duration = Duration::from_secs(30);
 
+/// A frame in a socket's queue, with the bytes of the queue it takes up.
+type Queued = (Utf8Bytes, OwnedSemaphorePermit);
+
+/// A socket's send queue. Every frame to the socket, its own replies and the
+/// fan-out alike, goes through it, so they reach the client in the order sent.
+/// It holds at most SEND_QUEUE frames and SEND_QUEUE_BYTES bytes.
+#[derive(Clone)]
+pub struct Outbox {
+    frames: mpsc::Sender<Queued>,
+    /// A permit for each byte. A frame holds its own until the writer takes
+    /// it, or until the queue is dropped with it.
+    room: Arc<Semaphore>,
+}
+
+impl Outbox {
+    fn new() -> (Self, mpsc::Receiver<Queued>) {
+        let (frames, queue) = mpsc::channel(SEND_QUEUE);
+        let room = Arc::new(Semaphore::new(SEND_QUEUE_BYTES));
+        (Self { frames, room }, queue)
+    }
+
+    /// The permits `text` takes. A frame larger than the whole budget takes
+    /// all of it, so it still goes out once the queue is empty.
+    fn cost(text: &Utf8Bytes) -> u32 {
+        text.len().min(SEND_QUEUE_BYTES) as u32
+    }
+
+    /// Queues `text`, waiting while the queue is full.
+    async fn send(&self, text: Utf8Bytes) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let room = self
+            .room
+            .clone()
+            .acquire_many_owned(Self::cost(&text))
+            .await?;
+        self.frames.send((text, room)).await?;
+        Ok(())
+    }
+
+    /// Queues `text`, or returns false at once when the queue is full.
+    fn try_send(&self, text: Utf8Bytes) -> bool {
+        self.room
+            .clone()
+            .try_acquire_many_owned(Self::cost(&text))
+            .is_ok_and(|room| self.frames.try_send((text, room)).is_ok())
+    }
+}
+
 /// Writes a socket's queued frames and pings it. Stops when the queue closes,
 /// when a frame takes longer than SEND_TIMEOUT, or when a ping got no pong.
 async fn write_frames(
     mut sink: impl Sink<WsMessage> + Unpin,
-    mut queue: mpsc::Receiver<Utf8Bytes>,
+    mut queue: mpsc::Receiver<Queued>,
     ponged: Arc<AtomicBool>,
 ) {
     let mut ping = interval_at(Instant::now() + PING_INTERVAL, PING_INTERVAL);
     loop {
         let frame = tokio::select! {
-            text = queue.recv() => match text {
-                Some(text) => WsMessage::Text(text),
+            // The frame gives its room back as it leaves the queue, so a
+            // socket holds at most the budget, or one larger frame, plus the
+            // frame being written.
+            queued = queue.recv() => match queued {
+                Some((text, _)) => WsMessage::Text(text),
                 None => return,
             },
             _ = ping.tick() => {
@@ -1323,7 +1488,7 @@ enum Need {
 /// in, so a non-member cannot probe which ids exist.
 async fn authorize(
     state: &AppState,
-    sender: &mpsc::Sender<Utf8Bytes>,
+    sender: &Outbox,
     user: Uuid,
     server: Option<Uuid>,
     need: Need,
@@ -1348,6 +1513,21 @@ async fn authorize(
     None
 }
 
+/// True, after telling the socket, when `content` is over MAX_MESSAGE_CHARS.
+async fn too_long(sender: &Outbox, content: &str) -> bool {
+    if content.chars().count() <= MAX_MESSAGE_CHARS {
+        return false;
+    }
+    let _ = send_event(
+        sender,
+        &ServerEvent::Error {
+            message: format!("A message may have at most {MAX_MESSAGE_CHARS} characters"),
+        },
+    )
+    .await;
+    true
+}
+
 /// The row a lookup found. A database error is logged and counts as not
 /// found, so the event it guards is refused rather than let through.
 fn found<T>(lookup: Result<Option<T>, sqlx::Error>) -> Option<T> {
@@ -1369,7 +1549,7 @@ fn listed(lookup: Result<HashSet<Uuid>, sqlx::Error>) -> HashSet<Uuid> {
 pub struct ConnectedUser {
     pub user_id: Uuid,
     /// The socket's send queue.
-    pub queue: mpsc::Sender<Utf8Bytes>,
+    pub queue: Outbox,
     /// Stops the socket's writer, which ends its connection.
     pub writer: AbortHandle,
 }
@@ -1383,11 +1563,10 @@ pub fn new_connection_map() -> ConnectionMap {
 /// Queue an event for this socket, behind everything queued before it. Waits
 /// while the queue is full, which only ever holds up this socket's own reader.
 async fn send_event(
-    sender: &mpsc::Sender<Utf8Bytes>,
+    sender: &Outbox,
     event: &ServerEvent,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    sender.send(serde_json::to_string(event)?.into()).await?;
-    Ok(())
+    sender.send(serde_json::to_string(event)?.into()).await
 }
 
 /// Send an event to every open socket of `users`. The queues are copied out
@@ -1398,7 +1577,7 @@ async fn send_to_users(state: &AppState, users: &HashSet<Uuid>, event: &ServerEv
         return;
     };
     let text = Utf8Bytes::from(json);
-    let queues: Vec<(Uuid, mpsc::Sender<Utf8Bytes>)> = state
+    let queues: Vec<(Uuid, Outbox)> = state
         .connections
         .read()
         .await
@@ -1408,7 +1587,7 @@ async fn send_to_users(state: &AppState, users: &HashSet<Uuid>, event: &ServerEv
         .collect();
     let behind: Vec<Uuid> = queues
         .into_iter()
-        .filter(|(_, queue)| queue.try_send(text.clone()).is_err())
+        .filter(|(_, queue)| !queue.try_send(text.clone()))
         .map(|(id, _)| id)
         .collect();
     if behind.is_empty() {

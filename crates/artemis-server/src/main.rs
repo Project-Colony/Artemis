@@ -111,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
         db: pool,
         connections: ws::new_connection_map(),
         presence: Default::default(),
+        unauthenticated: std::sync::Arc::new(tokio::sync::Semaphore::new(ws::MAX_UNAUTHENTICATED)),
         github_client_id: config.github_client_id,
         github_client_secret: config.github_client_secret,
         base_url: config.base_url,
