@@ -1416,7 +1416,7 @@ pub async fn resolve_mentions(
     Ok(results)
 }
 
-// These need a Postgres server: set DATABASE_URL and run
+// The ignored tests need a Postgres server: set DATABASE_URL and run
 // `cargo test -p artemis-server -- --include-ignored`. sqlx::test gives each
 // test its own empty database. CI runs them in the relay-db job.
 #[cfg(test)]
@@ -1429,6 +1429,30 @@ mod tests {
             .await
             .unwrap();
         rows as usize
+    }
+
+    #[test]
+    fn applied_migrations_are_unchanged() {
+        // SHA-384 of each file as shipped. Deployed relays recorded these, and
+        // an edited file stops them at startup with VersionMismatch.
+        let frozen = [
+            (1, "094404878e8a015a4798f1e22487f9fbe9c344c647c27423fd78448669e4a512c08d89efabe3ca64fad34343dcd58599"),
+            (2, "d022f78b6bb03d6b61718df629fd94010bb9499a28805751272f180c5e57c58bb3bd6f06fe2069c3888c17abf9ba9c20"),
+            (3, "4d64e9c20652479599559c08ce106762bb2c86661cce7da9981882c5ae87487c09634cd060c7a2306424989c927d4d3e"),
+            (4, "9abcb7c84c0c61a8e77dfecec6819cd70409f6615579a2de5b6bcf014863809a9d5af6a74fa838730baa2c126de3cb72"),
+        ];
+        for (version, expected) in frozen {
+            let migration = MIGRATOR.iter().find(|m| m.version == version).unwrap();
+            let actual: String = migration
+                .checksum
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            assert_eq!(
+                actual, expected,
+                "migration {version} changed after release; revert it and put the change in a new numbered file"
+            );
+        }
     }
 
     #[sqlx::test(migrations = false)]
