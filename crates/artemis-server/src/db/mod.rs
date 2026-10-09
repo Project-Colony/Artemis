@@ -150,50 +150,6 @@ pub async fn get_user_servers(
     Ok(payloads)
 }
 
-pub async fn create_server(
-    pool: &DbPool,
-    name: &str,
-    owner_id: Uuid,
-    invite_code: &str,
-) -> Result<Uuid, sqlx::Error> {
-    let row: (Uuid,) = sqlx::query_as(
-        "INSERT INTO servers (name, owner_id, invite_code) VALUES ($1, $2, $3) RETURNING id",
-    )
-    .bind(name)
-    .bind(owner_id)
-    .bind(invite_code)
-    .fetch_one(pool)
-    .await?;
-
-    let server_id = row.0;
-
-    // Add owner as founder member
-    sqlx::query("INSERT INTO server_members (user_id, server_id, role) VALUES ($1, $2, 'founder')")
-        .bind(owner_id)
-        .bind(server_id)
-        .execute(pool)
-        .await?;
-
-    // Create default category + channel
-    let cat_id: (Uuid,) = sqlx::query_as(
-        "INSERT INTO categories (server_id, name, position) VALUES ($1, 'GENERAL', 0) RETURNING id",
-    )
-    .bind(server_id)
-    .fetch_one(pool)
-    .await?;
-
-    sqlx::query(
-        "INSERT INTO channels (category_id, server_id, name, channel_type, topic, position)
-         VALUES ($1, $2, 'general', 'text', 'Welcome!', 0)",
-    )
-    .bind(cat_id.0)
-    .bind(server_id)
-    .execute(pool)
-    .await?;
-
-    Ok(server_id)
-}
-
 pub async fn join_server_by_invite(
     pool: &DbPool,
     user_id: Uuid,
@@ -285,24 +241,31 @@ async fn get_server_members(
 
 // ── Message queries ──
 
+/// Returns None, and inserts nothing, when `reply_to_id` names a message that
+/// is not in `channel_id`.
 pub async fn create_message(
     pool: &DbPool,
     channel_id: Uuid,
     author_id: Uuid,
     content: &str,
     reply_to_id: Option<Uuid>,
-) -> Result<Message, sqlx::Error> {
-    let row = sqlx::query_as::<_, MessageRow>(
+) -> Result<Option<Message>, sqlx::Error> {
+    let Some(row) = sqlx::query_as::<_, MessageRow>(
         "INSERT INTO messages (channel_id, author_id, content, reply_to_id)
-         VALUES ($1, $2, $3, $4)
+         SELECT $1, $2, $3, $4
+         WHERE $4::uuid IS NULL
+            OR EXISTS (SELECT 1 FROM messages WHERE id = $4 AND channel_id = $1)
          RETURNING id, channel_id, author_id, content, edited_at, created_at, reply_to_id",
     )
     .bind(channel_id)
     .bind(author_id)
     .bind(content)
     .bind(reply_to_id)
-    .fetch_one(pool)
-    .await?;
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(None);
+    };
 
     let author = sqlx::query_as::<_, (String, Option<String>)>(
         "SELECT username, avatar_url FROM users WHERE id = $1",
@@ -311,7 +274,7 @@ pub async fn create_message(
     .fetch_one(pool)
     .await?;
 
-    Ok(Message {
+    Ok(Some(Message {
         id: row.id,
         channel_id: row.channel_id,
         author_id: row.author_id,
@@ -324,7 +287,7 @@ pub async fn create_message(
         reply_to_id: row.reply_to_id,
         pinned: false,
         reactions: vec![],
-    })
+    }))
 }
 
 pub async fn get_messages(
@@ -432,42 +395,42 @@ pub async fn delete_message(
     Ok(result.rows_affected() > 0)
 }
 
+/// Adds a text channel to `category_id`, or to the server's first category
+/// when none is given, and returns the category it went into with the channel.
+/// Returns None, and inserts nothing, when the category is not in `server_id`.
 pub async fn create_channel(
     pool: &DbPool,
     server_id: Uuid,
     category_id: Option<Uuid>,
     name: &str,
-) -> Result<ChannelPayload, sqlx::Error> {
-    let cat_id = if let Some(cid) = category_id {
-        cid
-    } else {
-        // Get first category of the server
-        let row: (Uuid,) = sqlx::query_as(
-            "SELECT id FROM categories WHERE server_id = $1 ORDER BY position LIMIT 1",
-        )
-        .bind(server_id)
-        .fetch_one(pool)
-        .await?;
-        row.0
-    };
-
-    let row = sqlx::query_as::<_, (Uuid,)>(
+) -> Result<Option<(Uuid, ChannelPayload)>, sqlx::Error> {
+    let row = sqlx::query_as::<_, (Uuid, Uuid)>(
         "INSERT INTO channels (category_id, server_id, name, channel_type, position)
-         VALUES ($1, $2, $3, 'text', (SELECT COALESCE(MAX(position), 0) + 1 FROM channels WHERE category_id = $1))
-         RETURNING id"
+         SELECT c.id, c.server_id, $3, 'text',
+                (SELECT COALESCE(MAX(position), 0) + 1 FROM channels WHERE category_id = c.id)
+         FROM categories c
+         WHERE c.server_id = $1 AND ($2::uuid IS NULL OR c.id = $2)
+         ORDER BY c.position
+         LIMIT 1
+         RETURNING id, category_id",
     )
-    .bind(cat_id)
     .bind(server_id)
+    .bind(category_id)
     .bind(name)
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await?;
 
-    Ok(ChannelPayload {
-        id: row.0,
-        name: name.to_string(),
-        channel_type: ChannelType::Text,
-        topic: None,
-    })
+    Ok(row.map(|(id, category_id)| {
+        (
+            category_id,
+            ChannelPayload {
+                id,
+                name: name.to_string(),
+                channel_type: ChannelType::Text,
+                topic: None,
+            },
+        )
+    }))
 }
 
 // ── Row types ──
@@ -842,16 +805,21 @@ pub async fn get_pinned_messages(
     Ok(messages)
 }
 
-/// Get the channel_id for a message.
-pub async fn get_message_channel(
+/// The channel a message is in and that channel's server, as
+/// `(channel_id, server_id)`.
+pub async fn message_channel(
     pool: &DbPool,
     message_id: Uuid,
-) -> Result<Option<Uuid>, sqlx::Error> {
-    let row = sqlx::query_as::<_, (Uuid,)>("SELECT channel_id FROM messages WHERE id = $1")
-        .bind(message_id)
-        .fetch_optional(pool)
-        .await?;
-    Ok(row.map(|r| r.0))
+) -> Result<Option<(Uuid, Uuid)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT m.channel_id, c.server_id
+         FROM messages m
+         JOIN channels c ON c.id = m.channel_id
+         WHERE m.id = $1",
+    )
+    .bind(message_id)
+    .fetch_optional(pool)
+    .await
 }
 
 // ── Unread tracking ──
@@ -1036,10 +1004,7 @@ pub async fn edit_channel(
     Ok(())
 }
 
-pub async fn get_channel_server(
-    pool: &DbPool,
-    channel_id: Uuid,
-) -> Result<Option<Uuid>, sqlx::Error> {
+pub async fn channel_server(pool: &DbPool, channel_id: Uuid) -> Result<Option<Uuid>, sqlx::Error> {
     let row = sqlx::query_as::<_, (Uuid,)>("SELECT server_id FROM channels WHERE id = $1")
         .bind(channel_id)
         .fetch_optional(pool)
