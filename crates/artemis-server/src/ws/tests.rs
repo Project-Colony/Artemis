@@ -107,9 +107,13 @@ fn app_state(db: DbPool) -> AppState {
     }
 }
 
-/// A pool that never connects, for tests that do not reach the database.
+/// A pool that never connects, for tests that do not reach the database. A
+/// lookup through it fails within 100 ms, so a sign-in gets AuthError.
 fn unused_pool() -> DbPool {
-    sqlx::PgPool::connect_lazy("postgres://127.0.0.1/unused").unwrap()
+    sqlx::postgres::PgPoolOptions::new()
+        .acquire_timeout(Duration::from_millis(100))
+        .connect_lazy("postgres://127.0.0.1/unused")
+        .unwrap()
 }
 
 /// Serves the relay's routes on a free loopback port.
@@ -915,6 +919,49 @@ async fn a_socket_that_misses_a_ping_is_dropped() {
     assert_eq!(sent.next().await, None);
 }
 
+/// Pings `ws` gets until `until`. Fails on any other frame, or if the relay
+/// closes the socket.
+async fn pings_until(ws: &mut Client, until: tokio::time::Instant) -> usize {
+    let mut pings = 0;
+    while let Ok(frame) = tokio::time::timeout_at(until, ws.next()).await {
+        match frame {
+            Some(Ok(Message::Ping(_))) => pings += 1,
+            other => panic!("expected a ping, got {other:?}"),
+        }
+    }
+    pings
+}
+
+#[sqlx::test(migrator = "crate::db::MIGRATOR")]
+#[ignore = "needs DATABASE_URL"]
+async fn a_client_that_answers_pings_stays_connected(pool: DbPool) {
+    seed(&pool).await;
+    let mut ws = sign_in(serve(pool).await, "stranger-token").await;
+
+    // Signed in on the real clock, since a paused one jumps ahead while the
+    // database answers. From here only pings and pongs go back and forth.
+    // The paused clock jumps to the next timer whenever the runtime idles,
+    // even while a frame is on its way. A 10 ms ticker keeps the jumps short,
+    // so a pong reaches the relay long before the next ping.
+    tokio::time::pause();
+    let ticker = tokio::spawn(async {
+        let mut tick = tokio::time::interval(Duration::from_millis(10));
+        loop {
+            tick.tick().await;
+        }
+    });
+    let start = tokio::time::Instant::now();
+
+    // The client answers each ping as it reads. Pings go out at 30, 60 and
+    // 90 s; had the relay not recorded the pongs, it would close at 60 s.
+    let until = start + super::PING_INTERVAL * 3 + Duration::from_secs(5);
+    assert_eq!(pings_until(&mut ws, until).await, 3);
+
+    // sqlx drops the test database after this, on the real clock.
+    ticker.abort();
+    tokio::time::resume();
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_frame_that_cannot_go_out_in_time_ends_the_writer() {
     // A sink that never takes the frame, like a client whose buffers are full.
@@ -963,8 +1010,7 @@ fn closed(frame: &Option<tokio_tungstenite::tungstenite::Result<Message>>) -> bo
 async fn a_frame_over_64_kib_closes_the_socket() {
     let mut ws = connect(serve(unused_pool()).await).await.unwrap();
     // A well-formed Authenticate, so only its size can close the socket.
-    // Read in full, it would get an AuthError, or wait on a database that is
-    // not there.
+    // Read in full, it would get an AuthError.
     let event = ClientEvent::Authenticate {
         token: "t".repeat(128 * 1024),
     };
@@ -996,6 +1042,45 @@ async fn a_socket_that_does_not_sign_in_is_closed_after_the_deadline() {
     let end = ws.next().await;
     assert!(closed(&end), "{end:?}");
     assert!(start.elapsed() >= super::AUTH_DEADLINE);
+}
+
+#[tokio::test]
+async fn anything_before_authenticate_closes_the_socket() {
+    let addr = serve(unused_pool()).await;
+    let fetch = serde_json::to_string(&ClientEvent::FetchFriends).unwrap();
+    for first in [fetch, "not json".to_string()] {
+        let mut ws = connect(addr).await.unwrap();
+        ws.send(Message::Text(first.into())).await.unwrap();
+        // Well before AUTH_DEADLINE, and with no reply.
+        let end = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("the socket is still open");
+        assert!(closed(&end), "{end:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_refusal_reaches_a_client_that_sent_more_after_authenticate() {
+    let mut ws = connect(serve(unused_pool()).await).await.unwrap();
+    // As the shipped client does: Authenticate, then more events at once,
+    // which reach the relay while it looks up the token.
+    let events = [
+        ClientEvent::Authenticate {
+            token: "t".to_string(),
+        },
+        ClientEvent::FetchFriends,
+        ClientEvent::FetchFriendRequests,
+    ];
+    for event in &events {
+        let json = serde_json::to_string(event).unwrap();
+        ws.feed(Message::Text(json.into())).await.unwrap();
+    }
+    ws.flush().await.unwrap();
+    assert_eq!(recv(&mut ws).await["type"], "AuthError");
+
+    // A socket gets one try: another Authenticate is not even looked up.
+    send(&mut ws, &events[0]).await;
+    assert_silent(&mut ws).await;
 }
 
 #[tokio::test]

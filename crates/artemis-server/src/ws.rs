@@ -27,10 +27,11 @@ pub fn ws_routes() -> Router<AppState> {
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
     // The socket holds the permit until it signs in, so the cap counts open
     // sockets rather than handshakes in flight.
-    // ponytail: one cap for every address, so a flood of silent sockets can
-    // keep others out for AUTH_DEADLINE. No per-IP cap, because behind a
-    // proxy every peer shares one address; add ConnectInfo plus a trusted
-    // X-Forwarded-For if abuse appears.
+    // ponytail: one cap for every address. One host that keeps reopening
+    // silent sockets holds all MAX_UNAUTHENTICATED places and refuses every
+    // new connection for as long as it keeps going. No per-IP cap, because
+    // behind a proxy every peer shares one address; add ConnectInfo plus a
+    // trusted X-Forwarded-For per-IP cap if that appears.
     let Ok(permit) = state.unauthenticated.clone().try_acquire_owned() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -53,6 +54,8 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
     let mut writer = tokio::spawn(write_frames(sink, queue, ponged.clone()));
 
     let mut user_id: Option<Uuid> = None;
+    // A socket gets one Authenticate.
+    let mut tried_to_sign_in = false;
     let mut username_cache: Option<String> = None;
     let conn_id = Uuid::new_v4();
 
@@ -76,9 +79,18 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
         match msg {
             WsMessage::Text(txt) => {
                 let event = serde_json::from_str::<ClientEvent>(&txt);
-                // Until it signs in, a socket may send nothing but Authenticate.
-                if user_id.is_none() && !matches!(event, Ok(ClientEvent::Authenticate { .. })) {
-                    break;
+                if user_id.is_none() {
+                    // A refused socket ignores what the client sent after its
+                    // Authenticate until the deadline closes it. Closing at
+                    // once would abort the writer before the refusal goes out.
+                    if tried_to_sign_in {
+                        continue;
+                    }
+                    // Before that, anything but Authenticate closes it.
+                    if !matches!(event, Ok(ClientEvent::Authenticate { .. })) {
+                        break;
+                    }
+                    tried_to_sign_in = true;
                 }
                 let event = match event {
                     Ok(event) => event,
