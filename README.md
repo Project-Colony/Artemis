@@ -49,9 +49,11 @@ The client runs on its own:
 cargo run --bin artemis
 ```
 
-The relay server needs PostgreSQL 16 or later (`docker compose up -d` starts one) and
-reads its settings from environment variables (see `.env.example`): `DATABASE_URL`,
-`BIND_ADDR`, `BASE_URL`, `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET`.
+The relay server needs PostgreSQL 16 or later and reads its settings from environment
+variables (see `.env.example`): `DATABASE_URL`, `BIND_ADDR`, `BASE_URL`,
+`GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET`. To start a local database, copy
+`.env.example` to `.env`, choose a `POSTGRES_PASSWORD`, and run `docker compose up -d`;
+it listens on `127.0.0.1:5432` only.
 
 ```bash
 cargo run --bin artemis-server

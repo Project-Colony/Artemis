@@ -1,5 +1,5 @@
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -39,27 +39,68 @@ async fn github_login(State(state): State<AppState>) -> impl IntoResponse {
     use oauth2::CsrfToken;
     use oauth2::Scope;
 
-    let (auth_url, _csrf_token) = oauth
+    let (auth_url, csrf_token) = oauth
         .client()
         .authorize_url(CsrfToken::new_random)
         .add_scope(Scope::new("read:user".to_string()))
         .add_scope(Scope::new("user:email".to_string()))
         .url();
 
-    Redirect::temporary(auth_url.as_str())
+    // The callback only accepts the `state` this browser was given here.
+    let secure = if state.base_url.starts_with("https://") {
+        "; Secure"
+    } else {
+        ""
+    };
+    let cookie = format!(
+        "{OAUTH_STATE_COOKIE}={}; Path=/auth/github; HttpOnly; SameSite=Lax; Max-Age=600{secure}",
+        csrf_token.secret()
+    );
+    (
+        [(header::SET_COOKIE, cookie)],
+        Redirect::temporary(auth_url.as_str()),
+    )
+}
+
+/// Cookie that ties an OAuth callback to the browser that started the login.
+const OAUTH_STATE_COOKIE: &str = "artemis_oauth_state";
+
+/// Whether the `state` GitHub sent back is the one stored in this browser's
+/// cookie. Without this check, anyone could send a victim a callback link
+/// carrying the attacker's own authorization code (login CSRF).
+fn oauth_state_matches(headers: &HeaderMap, returned: Option<&str>) -> bool {
+    let stored = headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .find_map(|pair| {
+            pair.trim()
+                .strip_prefix(OAUTH_STATE_COOKIE)?
+                .strip_prefix('=')
+        });
+    matches!((stored, returned), (Some(stored), Some(returned)) if !stored.is_empty() && stored == returned)
 }
 
 #[derive(Deserialize)]
 struct GithubCallbackParams {
     code: String,
-    #[allow(dead_code)]
     state: Option<String>,
 }
 
 async fn github_callback(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<GithubCallbackParams>,
 ) -> impl IntoResponse {
+    if !oauth_state_matches(&headers, params.state.as_deref()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "OAuth state mismatch" })),
+        )
+            .into_response();
+    }
+
     let oauth = GitHubOAuth::new(
         &state.github_client_id,
         &state.github_client_secret,
@@ -286,5 +327,33 @@ async fn list_messages(
             )
                 .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cookies(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, value.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn oauth_state_must_match_the_cookie() {
+        let headers = cookies("theme=dark; artemis_oauth_state=abc123");
+        assert!(oauth_state_matches(&headers, Some("abc123")));
+        assert!(!oauth_state_matches(&headers, Some("other")));
+        assert!(!oauth_state_matches(&headers, None));
+        assert!(!oauth_state_matches(&HeaderMap::new(), Some("abc123")));
+        assert!(!oauth_state_matches(
+            &cookies("artemis_oauth_state="),
+            Some("")
+        ));
+        assert!(!oauth_state_matches(
+            &cookies("artemis_oauth_state_x=abc123"),
+            Some("abc123")
+        ));
     }
 }

@@ -83,6 +83,11 @@ impl LocalStore {
     // ── Identity ──
 
     /// Save the local user's identity.
+    ///
+    /// ponytail: the GitHub token and the X25519 secret key are written to the
+    /// database file in clear. Nothing calls this yet; before the client
+    /// persists identities, move both secrets to the OS keyring and keep only
+    /// a reference here.
     pub fn save_identity(
         &self,
         github_username: &str,
@@ -367,7 +372,7 @@ impl LocalStore {
 }
 
 /// Stored identity data.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct StoredIdentity {
     pub github_username: String,
     pub github_token: String,
@@ -377,6 +382,23 @@ pub struct StoredIdentity {
     pub signaling_gist_id: Option<String>,
     pub avatar_url: Option<String>,
     pub display_name: Option<String>,
+}
+
+/// Debug output leaves out the GitHub token and the secret key, so logging an
+/// identity cannot leak them.
+impl std::fmt::Debug for StoredIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredIdentity")
+            .field("github_username", &self.github_username)
+            .field("github_token", &"<redacted>")
+            .field("secret_key_b64", &"<redacted>")
+            .field("public_key_b64", &self.public_key_b64)
+            .field("profile_gist_id", &self.profile_gist_id)
+            .field("signaling_gist_id", &self.signaling_gist_id)
+            .field("avatar_url", &self.avatar_url)
+            .field("display_name", &self.display_name)
+            .finish()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
