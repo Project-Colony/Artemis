@@ -912,12 +912,27 @@ pub async fn edit_server(
     Ok(())
 }
 
-pub async fn delete_server(pool: &DbPool, server_id: Uuid) -> Result<(), sqlx::Error> {
+/// Delete `server_id` and return everyone who was in it. The server row is
+/// locked before the members are read, so a join cannot land between the
+/// read and the delete: one in flight is waited for and listed, a later one
+/// fails on the missing server.
+pub async fn delete_server(pool: &DbPool, server_id: Uuid) -> Result<HashSet<Uuid>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT id FROM servers WHERE id = $1 FOR UPDATE")
+        .bind(server_id)
+        .execute(&mut *tx)
+        .await?;
+    let members: Vec<Uuid> =
+        sqlx::query_scalar("SELECT user_id FROM server_members WHERE server_id = $1")
+            .bind(server_id)
+            .fetch_all(&mut *tx)
+            .await?;
     sqlx::query("DELETE FROM servers WHERE id = $1")
         .bind(server_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
-    Ok(())
+    tx.commit().await?;
+    Ok(members.into_iter().collect())
 }
 
 pub async fn get_server_owner(pool: &DbPool, server_id: Uuid) -> Result<Option<Uuid>, sqlx::Error> {
@@ -1014,17 +1029,27 @@ pub async fn channel_server(pool: &DbPool, channel_id: Uuid) -> Result<Option<Uu
     Ok(row.map(|r| r.0))
 }
 
+/// Remove `user_id` from `server_id` and return the members as they were
+/// before, the leaver included. Nobody if they were not a member. One
+/// statement, so the members are never read without the leave or the other
+/// way round.
 pub async fn leave_server(
     pool: &DbPool,
     user_id: Uuid,
     server_id: Uuid,
-) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query("DELETE FROM server_members WHERE user_id = $1 AND server_id = $2")
-        .bind(user_id)
-        .bind(server_id)
-        .execute(pool)
-        .await?;
-    Ok(result.rows_affected() > 0)
+) -> Result<HashSet<Uuid>, sqlx::Error> {
+    let rows: Vec<Uuid> = sqlx::query_scalar(
+        "WITH gone AS (
+            DELETE FROM server_members WHERE user_id = $1 AND server_id = $2 RETURNING 1
+         )
+         SELECT user_id FROM server_members
+         WHERE server_id = $2 AND EXISTS (SELECT 1 FROM gone)",
+    )
+    .bind(user_id)
+    .bind(server_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().collect())
 }
 
 /// Everyone in `server_id`.

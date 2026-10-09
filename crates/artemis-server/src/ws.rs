@@ -335,6 +335,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             };
                             let _ = db::update_user_status(&state.db, uid, status_str).await;
                             announce_presence(&state, uid, status).await;
+                            // The user's other devices show it too.
+                            send_to_user(
+                                &state,
+                                uid,
+                                &ServerEvent::PresenceUpdate {
+                                    user_id: uid,
+                                    status,
+                                },
+                            )
+                            .await;
                         }
                     }
 
@@ -612,15 +622,25 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             continue;
                         }
 
-                        // Deleting the server deletes its member list, so read it first.
-                        let members = listed(db::member_ids(&state.db, server_id).await);
-                        if db::delete_server(&state.db, server_id).await.is_ok() {
-                            send_to_users(
-                                &state,
-                                &members,
-                                &ServerEvent::ServerDeleted { server_id },
-                            )
-                            .await;
+                        match db::delete_server(&state.db, server_id).await {
+                            Ok(members) => {
+                                send_to_users(
+                                    &state,
+                                    &members,
+                                    &ServerEvent::ServerDeleted { server_id },
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to delete server: {}", e);
+                                let _ = send_event(
+                                    &sender,
+                                    &ServerEvent::Error {
+                                        message: "Failed to delete server".to_string(),
+                                    },
+                                )
+                                .await;
+                            }
                         }
                     }
 
@@ -719,19 +739,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             continue;
                         }
 
-                        // Read the members first, so the leaver hears it too.
-                        let members = listed(db::member_ids(&state.db, server_id).await);
-                        if let Ok(true) = db::leave_server(&state.db, uid, server_id).await {
-                            send_to_users(
-                                &state,
-                                &members,
-                                &ServerEvent::MemberLeft {
-                                    server_id,
-                                    user_id: uid,
-                                },
-                            )
-                            .await;
-                        }
+                        // The members include the leaver, so they hear it too.
+                        let members = listed(db::leave_server(&state.db, uid, server_id).await);
+                        send_to_users(
+                            &state,
+                            &members,
+                            &ServerEvent::MemberLeft {
+                                server_id,
+                                user_id: uid,
+                            },
+                        )
+                        .await;
                     }
 
                     ClientEvent::GetInviteCode { server_id } => {
@@ -772,9 +790,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             custom_status.as_deref(),
                         )
                         .await;
+                        // Co-members, and the user's own devices.
+                        let mut recipients = listed(db::co_member_ids(&state.db, uid).await);
+                        recipients.insert(uid);
                         send_to_users(
                             &state,
-                            &listed(db::co_member_ids(&state.db, uid).await),
+                            &recipients,
                             &ServerEvent::ProfileUpdated {
                                 user_id: uid,
                                 display_name,
@@ -1329,7 +1350,8 @@ async fn broadcast_to_server(state: &AppState, server_id: Uuid, event: &ServerEv
 
 /// Tell the people who share a server with `user` that their status changed,
 /// and their friends through the friend list's own event. `user`'s own
-/// sockets are not told.
+/// sockets are not told: on sign-in and disconnect they have nothing to
+/// update, and `UpdatePresence` tells them itself.
 async fn announce_presence(
     state: &AppState,
     user: Uuid,

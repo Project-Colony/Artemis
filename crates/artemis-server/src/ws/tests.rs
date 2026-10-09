@@ -501,20 +501,29 @@ async fn server_events_reach_only_that_servers_members(pool: DbPool) {
             },
             "ServerUpdated",
         ),
-        (
-            ClientEvent::AddCustomEmoji {
-                server_id: SERVER_A,
-                name: "wave".to_string(),
-                image_url: "https://example.com/wave.png".to_string(),
-            },
-            "CustomEmojiAdded",
-        ),
     ];
     for (event, kind) in &events {
         let reply = call(&mut founder, event).await;
         assert_eq!(reply["type"], *kind, "{event:?} got {reply}");
         assert_eq!(recv(&mut member).await["type"], *kind, "{event:?}");
     }
+
+    // An emoji is added, then removed by the id the relay gave it.
+    let add = ClientEvent::AddCustomEmoji {
+        server_id: SERVER_A,
+        name: "wave".to_string(),
+        image_url: "https://example.com/wave.png".to_string(),
+    };
+    let added = call(&mut founder, &add).await;
+    assert_eq!(added["type"], "CustomEmojiAdded", "got {added}");
+    assert_eq!(recv(&mut member).await, added);
+    let remove = ClientEvent::RemoveCustomEmoji {
+        server_id: SERVER_A,
+        emoji_id: serde_json::from_value(added["data"]["emoji"]["id"].clone()).unwrap(),
+    };
+    let removed = call(&mut founder, &remove).await;
+    assert_eq!(removed["type"], "CustomEmojiRemoved", "got {removed}");
+    assert_eq!(recv(&mut member).await, removed);
 
     // Typing goes to the other members, then the channel goes.
     let typing = ClientEvent::StartTyping {
@@ -613,12 +622,17 @@ async fn presence_reaches_co_members_and_friends_only(pool: DbPool) {
         recv(&mut founder).await,
         about_member("PresenceUpdate", "Idle")
     );
+    // The member's own devices hear their own change.
+    assert_eq!(
+        recv(&mut member).await,
+        about_member("PresenceUpdate", "Idle")
+    );
     assert_eq!(
         recv(&mut outsider).await,
         about_member("FriendPresenceUpdate", "Idle")
     );
 
-    // A profile change goes to co-members only.
+    // A profile change goes to co-members and the member's own devices only.
     let profile = ClientEvent::UpdateProfile {
         display_name: Some("Bob".to_string()),
         custom_status: None,
@@ -627,6 +641,7 @@ async fn presence_reaches_co_members_and_friends_only(pool: DbPool) {
     let updated = recv(&mut founder).await;
     assert_eq!(updated["type"], "ProfileUpdated");
     assert_eq!(updated["data"]["user_id"], MEMBER.to_string());
+    assert_eq!(recv(&mut member).await, updated);
 
     member.close(None).await.unwrap();
     assert_eq!(
