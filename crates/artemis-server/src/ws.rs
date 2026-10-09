@@ -8,8 +8,7 @@ use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
-use futures::stream::SplitSink;
-use futures::{SinkExt, StreamExt};
+use futures::{Sink, SinkExt, StreamExt};
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::AbortHandle;
 use tokio::time::{interval_at, timeout, Instant};
@@ -72,30 +71,40 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 user_id = Some(user.id);
                                 username_cache = Some(user.username.clone());
 
-                                // Register connection
-                                state.connections.write().await.insert(
-                                    conn_id,
-                                    ConnectedUser {
-                                        user_id: user.id,
-                                        queue: sender.clone(),
-                                        writer: writer.abort_handle(),
-                                    },
-                                );
-
-                                // Set user online
-                                let _ = db::update_user_status(&state.db, user.id, "online").await;
+                                // Register the socket. The user's first one
+                                // brings them online; later ones keep the
+                                // status they already have, Idle or DND too.
+                                let presence = state.presence.lock().await;
+                                let first = {
+                                    let mut connections = state.connections.write().await;
+                                    let first =
+                                        !connections.values().any(|conn| conn.user_id == user.id);
+                                    connections.insert(
+                                        conn_id,
+                                        ConnectedUser {
+                                            user_id: user.id,
+                                            queue: sender.clone(),
+                                            writer: writer.abort_handle(),
+                                        },
+                                    );
+                                    first
+                                };
+                                if first {
+                                    let _ =
+                                        db::update_user_status(&state.db, user.id, "online").await;
+                                    announce_presence(
+                                        &state,
+                                        user.id,
+                                        artemis_core::models::user::UserStatus::Online,
+                                    )
+                                    .await;
+                                }
+                                drop(presence);
 
                                 // Fetch user's servers
                                 let servers = db::get_user_servers(&state.db, user.id)
                                     .await
                                     .unwrap_or_default();
-
-                                announce_presence(
-                                    &state,
-                                    user.id,
-                                    artemis_core::models::user::UserStatus::Online,
-                                )
-                                .await;
 
                                 let _ = send_event(
                                     &sender,
@@ -1243,22 +1252,25 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     }
 
-    // Cleanup on disconnect
+    // Cleanup on disconnect. Only a signed-in socket is in the map.
     writer.abort();
+    let Some(uid) = user_id else {
+        return;
+    };
+    // Under the same lock as sign-in, so a sign-in racing this close cannot
+    // be followed by this socket's offline write.
+    let _presence = state.presence.lock().await;
     let still_connected = {
         let mut connections = state.connections.write().await;
         connections.remove(&conn_id);
-        user_id.is_some_and(|uid| connections.values().any(|conn| conn.user_id == uid))
+        connections.values().any(|conn| conn.user_id == uid)
     };
-    if let Some(uid) = user_id {
-        // The user stays online while another of their sockets is open.
-        if !still_connected {
-            let _ = db::update_user_status(&state.db, uid, "offline").await;
-            announce_presence(&state, uid, artemis_core::models::user::UserStatus::Offline).await;
-        }
-
-        tracing::info!("User {} disconnected", uid);
+    // The user stays online while another of their sockets is open.
+    if !still_connected {
+        let _ = db::update_user_status(&state.db, uid, "offline").await;
+        announce_presence(&state, uid, artemis_core::models::user::UserStatus::Offline).await;
     }
+    tracing::info!("User {} disconnected", uid);
 }
 
 /// Frames a socket may have waiting. Enough for a burst of events; a client
@@ -1273,7 +1285,7 @@ const PING_INTERVAL: Duration = Duration::from_secs(30);
 /// Writes a socket's queued frames and pings it. Stops when the queue closes,
 /// when a frame takes longer than SEND_TIMEOUT, or when a ping got no pong.
 async fn write_frames(
-    mut sink: SplitSink<WebSocket, WsMessage>,
+    mut sink: impl Sink<WsMessage> + Unpin,
     mut queue: mpsc::Receiver<Utf8Bytes>,
     ponged: Arc<AtomicBool>,
 ) {
