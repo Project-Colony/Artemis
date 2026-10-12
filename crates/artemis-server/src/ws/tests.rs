@@ -1651,6 +1651,7 @@ async fn the_device_flow_passes_on_githubs_answers() {
             })
         )
     );
+    let too_long = "7".repeat(65);
     let answers = [
         ("pending", 200, json!({"status": "pending"})),
         (
@@ -1661,6 +1662,14 @@ async fn the_device_flow_passes_on_githubs_answers() {
         ("denied", 200, json!({"status": "denied"})),
         ("expired", 200, json!({"status": "expired"})),
         ("unknown", 502, json!({"error": "GitHub sign-in failed"})),
+        // Never sent to GitHub, whose stub would answer with a token.
+        ("", 400, json!({"error": "Invalid device code"})),
+        ("1:a b", 400, json!({"error": "Invalid device code"})),
+        (
+            too_long.as_str(),
+            400,
+            json!({"error": "Invalid device code"}),
+        ),
         // GitHub granted a token, then the database failed: no session.
         ("7:ada", 500, json!({"error": "Database error"})),
     ];

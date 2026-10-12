@@ -14,6 +14,8 @@ Early prototype, not ready for use. What works and what does not:
   signs users in through GitHub's device flow and issues its own session tokens, but
   the client still runs the device flow against GitHub itself and sends the GitHub
   token, which the relay refuses.
+- A session cannot be signed out or revoked yet, not even by revoking the app on
+  GitHub, and a connected socket stays signed in after its session has expired.
 - The relay URL is fixed to `http://localhost:3000` (plain WebSocket, no TLS).
 - A new encryption key pair is generated at every sign-in, so older direct messages
   cannot be decrypted after a restart.
@@ -76,19 +78,26 @@ listens on `127.0.0.1:3000` unless `BIND_ADDR` says otherwise, and logs at `info
 A client signs in to the relay in three steps:
 
 1. `POST /auth/device/start` returns `device_code`, `user_code`, `verification_uri`,
-   `interval` and `expires_in`. The user opens `verification_uri` and enters
-   `user_code`.
+   `interval` and `expires_in`. The user opens `https://github.com/login/device` and
+   enters `user_code`. A client opens that address itself rather than the
+   `verification_uri` it was sent, so a relay cannot send its users to another page.
 2. Every `interval` seconds, `POST /auth/device/poll` with `{"device_code": "..."}`.
    The answer's `status` is `pending` (poll again), `slow_down` (poll every `interval`
    seconds from now on), `denied`, `expired`, or `complete` with a `token`, the
-   `username` and the `avatar_url`. GitHub failures get 502 and database failures 500,
-   both with an `error`.
+   `username` and the `avatar_url`. A device code that is empty, over 64 characters or
+   not printable ASCII gets 400, GitHub failures 502 and database failures 500, all
+   with an `error`.
 3. Send the token in `Authenticate` on `/ws`.
 
 The relay asks GitHub for the `read:user` scope only. It uses the GitHub token once to
 read the user's profile and drops it, never storing or logging it. A session token is
 32 random bytes, of which the relay stores only the SHA-256. A session expires 30 days
-after its last use.
+after it last signed a socket in, however long that socket stays connected.
+
+Usernames are GitHub logins, unique whatever their case, as on GitHub. When someone
+takes a login that an account on the relay still holds from before a rename on GitHub,
+that account is renamed `#` followed by its GitHub user ID until its user signs in
+again.
 
 ## License
 

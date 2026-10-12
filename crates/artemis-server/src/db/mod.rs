@@ -41,7 +41,8 @@ pub async fn prepare(pool: &DbPool) -> Result<(), sqlx::Error> {
 
 // ── User queries ──
 
-/// How long a session lasts after its last use.
+/// How long a session lasts after it last signed a socket in. A socket that
+/// stays connected does not extend it.
 const SESSION_LIFETIME: &str = "30 days";
 
 /// What the sessions table stores of a session token.
@@ -67,10 +68,13 @@ pub async fn sign_in(pool: &DbPool, gh: &GitHubUser) -> Result<(UserRow, String)
     sqlx::query("DELETE FROM sessions WHERE expires_at <= NOW()")
         .execute(&mut *tx)
         .await?;
-    // After a rename on GitHub, someone else can take the old login. The
-    // account still holding it gives it up until its own user signs in again.
+    // After a rename on GitHub, someone else can take the old login, in any
+    // case since GitHub ignores it. The account still holding it gives it up
+    // until its own user signs in again, for a name with a `#` that no GitHub
+    // login can have.
     sqlx::query(
-        "UPDATE users SET username = 'gh-' || github_id WHERE username = $1 AND github_id <> $2",
+        "UPDATE users SET username = '#' || github_id
+         WHERE lower(username) = lower($1) AND github_id <> $2",
     )
     .bind(&gh.login)
     .bind(gh.id)
@@ -103,7 +107,7 @@ pub async fn sign_in(pool: &DbPool, gh: &GitHubUser) -> Result<(UserRow, String)
 }
 
 /// The user a session token belongs to, unless the session has expired. Each
-/// use moves the expiry SESSION_LIFETIME past now.
+/// call moves the expiry SESSION_LIFETIME past now.
 pub async fn find_user_by_session(
     pool: &DbPool,
     token: &str,
@@ -130,11 +134,12 @@ pub async fn find_user_by_id(pool: &DbPool, id: Uuid) -> Result<Option<UserRow>,
         .await
 }
 
+/// Logins match whatever their case, as on GitHub.
 pub async fn find_user_by_username(
     pool: &DbPool,
     username: &str,
 ) -> Result<Option<UserRow>, sqlx::Error> {
-    sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE username = $1")
+    sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE lower(username) = lower($1)")
         .bind(username)
         .fetch_optional(pool)
         .await
@@ -1484,7 +1489,7 @@ mod tests {
             (2, "d022f78b6bb03d6b61718df629fd94010bb9499a28805751272f180c5e57c58bb3bd6f06fe2069c3888c17abf9ba9c20"),
             (3, "4d64e9c20652479599559c08ce106762bb2c86661cce7da9981882c5ae87487c09634cd060c7a2306424989c927d4d3e"),
             (4, "9abcb7c84c0c61a8e77dfecec6819cd70409f6615579a2de5b6bcf014863809a9d5af6a74fa838730baa2c126de3cb72"),
-            (5, "707fb0159874ef518f0fd8899390bc255edcd816b94a8cf5955b68716fbadb3e84af226d1ac649e35c79cd6617fb15a7"),
+            (5, "fdff25186bbf155dbe0e96ae0ec6e8bd03cfd46b5191c5b1b159ef6915b754b313b840148d8fa28cf23c481eff7e2165"),
         ];
         for (version, expected) in frozen {
             let migration = MIGRATOR.iter().find(|m| m.version == version).unwrap();
@@ -1511,11 +1516,26 @@ mod tests {
                 .await
                 .unwrap();
         }
+        // Names that differ only in case could both be taken then.
+        sqlx::query(
+            "INSERT INTO users (username, github_id) VALUES ('Ada', 1), ('ada', 2), ('bob', 3)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         MIGRATOR.run(&pool).await.unwrap();
         MIGRATOR.run(&pool).await.unwrap();
 
         assert_eq!(recorded_migrations(&pool).await, MIGRATOR.iter().count());
+        assert_eq!(
+            usernames(&pool).await,
+            [
+                (1, "#1".to_string()),
+                (2, "#2".to_string()),
+                (3, "bob".to_string())
+            ]
+        );
     }
 
     #[sqlx::test(migrations = false)]
@@ -1624,19 +1644,32 @@ mod tests {
     #[ignore = "needs DATABASE_URL"]
     async fn a_login_held_by_a_stale_account_moves_to_its_new_owner(pool: DbPool) {
         sign_in(&pool, &github_user(1, "ada")).await.unwrap();
+        // A real login shaped like a name the relay could give out.
+        sign_in(&pool, &github_user(900, "gh-1")).await.unwrap();
 
-        // GitHub user 1 renamed away from "ada", and user 2 took it.
-        sign_in(&pool, &github_user(2, "ada")).await.unwrap();
+        // GitHub user 1 renamed away from "ada", and user 2 took it with
+        // another case, which GitHub treats as the same login.
+        sign_in(&pool, &github_user(2, "Ada")).await.unwrap();
         assert_eq!(
             usernames(&pool).await,
-            [(1, "gh-1".to_string()), (2, "ada".to_string())]
+            [
+                (1, "#1".to_string()),
+                (2, "Ada".to_string()),
+                (900, "gh-1".to_string())
+            ]
         );
+        let found = find_user_by_username(&pool, "ada").await.unwrap().unwrap();
+        assert_eq!(found.github_id, Some(2));
 
         // User 1 gets their new login back on their next sign-in.
         sign_in(&pool, &github_user(1, "ada2")).await.unwrap();
         assert_eq!(
             usernames(&pool).await,
-            [(1, "ada2".to_string()), (2, "ada".to_string())]
+            [
+                (1, "ada2".to_string()),
+                (2, "Ada".to_string()),
+                (900, "gh-1".to_string())
+            ]
         );
     }
 }

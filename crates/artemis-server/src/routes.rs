@@ -28,9 +28,9 @@ async fn health() -> impl IntoResponse {
 /// Asks GitHub for a code the user enters at its verification page. The
 /// answer holds `device_code`, `user_code`, `verification_uri`, `interval`
 /// and `expires_in`.
-// ponytail: no rate limit. Anyone can spend the OAuth app's device code
-// quota on GitHub and block sign-ins while it lasts. Add a per-IP limit if
-// that appears.
+// ponytail: no rate limit on start or poll. Each call is one request to
+// GitHub, so anyone can spend the OAuth app's quota there and block sign-ins
+// while it lasts. Add a per-IP limit to both if that appears.
 async fn device_start(State(state): State<AppState>) -> Response {
     match state.github.request_device_code().await {
         Ok(code) => Json(code).into_response(),
@@ -47,6 +47,16 @@ struct PollRequest {
 /// GitHub's token is used for one profile read and dropped, never stored or
 /// logged, and the user gets a relay session instead.
 async fn device_poll(State(state): State<AppState>, Json(request): Json<PollRequest>) -> Response {
+    // GitHub's device codes are 40 hex characters. Anything far from that is
+    // refused here instead of being sent on.
+    let code = &request.device_code;
+    if code.is_empty() || code.len() > 64 || !code.bytes().all(|b| b.is_ascii_graphic()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Invalid device code" })),
+        )
+            .into_response();
+    }
     let profile = match state.github.poll_device_token(&request.device_code).await {
         Ok(access_token) => state.github.fetch_user(&access_token).await,
         Err(e) => Err(e),
