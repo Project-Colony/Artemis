@@ -10,6 +10,7 @@ use iced::{Element, Font, Length, Task as IcedTask};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use artemis_core::limits::MAX_MESSAGE_CHARS;
 use artemis_core::models::message::Message;
 use artemis_core::models::user::{MemberRole, ServerMember, User, UserStatus};
 use artemis_core::protocol::{
@@ -557,7 +558,15 @@ impl Artemis {
             AppMessage::ChannelSidebar(ChannelSidebarMsg::ToggleCategory(_cat_id)) => {}
 
             AppMessage::ChatArea(ChatAreaMsg::InputChanged(val)) => {
-                self.message_input = val;
+                // A NUL can never be sent and would disable Send unseen, so it
+                // is dropped. Text over the cap stays for the user to shorten,
+                // but a huge paste is cut at twice the cap so it cannot stall
+                // every redraw.
+                self.message_input = val
+                    .chars()
+                    .filter(|&c| c != '\0')
+                    .take(2 * MAX_MESSAGE_CHARS)
+                    .collect();
             }
             AppMessage::ChatArea(ChatAreaMsg::SendMessage) => {
                 // Over the cap the relay would refuse it, so the text stays
@@ -1354,7 +1363,7 @@ impl Artemis {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use artemis_core::limits::{MAX_DM_CIPHERTEXT_BYTES, MAX_MESSAGE_CHARS};
+    use artemis_core::limits::MAX_DM_CIPHERTEXT_BYTES;
 
     fn type_and_send(app: &mut Artemis, text: &str) {
         let _ = app.update(AppMessage::ChatArea(ChatAreaMsg::InputChanged(
@@ -1384,6 +1393,20 @@ mod tests {
             sent.try_recv(),
             Ok(ClientEvent::SendMessage { content, .. }) if content == at_cap
         ));
+    }
+
+    #[test]
+    fn the_composer_drops_nul_and_cuts_a_huge_paste() {
+        let (mut app, _) = Artemis::new();
+        let input = |app: &mut Artemis, text: String| {
+            let _ = app.update(AppMessage::ChatArea(ChatAreaMsg::InputChanged(text)));
+        };
+        input(&mut app, "a\0b".to_string());
+        assert_eq!(app.message_input, "ab");
+        assert!(chat_area::can_send(&app.message_input));
+
+        input(&mut app, "\u{e9}".repeat(1_000_000));
+        assert_eq!(app.message_input, "\u{e9}".repeat(2 * MAX_MESSAGE_CHARS));
     }
 
     #[test]
