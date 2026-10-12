@@ -6,6 +6,7 @@ use iced::{Border, Element, Length, Padding};
 use uuid::Uuid;
 
 use crate::theme::{colors, icons};
+use artemis_core::limits::{check_text, MAX_MESSAGE_CHARS};
 use artemis_core::models::message::ReactionCount;
 use artemis_core::protocol::ChannelPayload;
 
@@ -399,21 +400,41 @@ pub fn view_with_payload<'a>(
     // ── Input bar ──
     let placeholder = format!("Message #{}", channel_name);
 
+    let send = can_send(input_value).then_some(ChatAreaMsg::SendMessage);
     let input = text_input(&placeholder, input_value)
         .on_input(ChatAreaMsg::InputChanged)
-        .on_submit(ChatAreaMsg::SendMessage)
+        .on_submit_maybe(send.clone())
         .padding(Padding::from([10, 12]))
         .size(14);
+
+    // The count shows once the message nears the cap, in red past it.
+    let chars = input_value.chars().count();
+    let counter = (chars > MAX_MESSAGE_CHARS - 500).then(|| {
+        let color = if chars > MAX_MESSAGE_CHARS {
+            colors::DANGER
+        } else {
+            colors::TEXT_MUTED
+        };
+        container(
+            text(format!("{chars}/{MAX_MESSAGE_CHARS}"))
+                .size(12)
+                .color(color),
+        )
+        .padding(Padding::from([0, 8]))
+    });
 
     let send_btn = button(
         text(format!("{} Send", icons::SEND))
             .size(13)
             .color(colors::TEXT_PRIMARY),
     )
-    .on_press(ChatAreaMsg::SendMessage)
+    .on_press_maybe(send)
     .padding(Padding::from([8, 16]))
-    .style(|_theme, _status| button::Style {
-        background: Some(iced::Background::Color(colors::ACCENT)),
+    .style(|_theme, status| button::Style {
+        background: Some(iced::Background::Color(match status {
+            button::Status::Disabled => colors::BG_HOVER,
+            _ => colors::ACCENT,
+        })),
         text_color: colors::TEXT_PRIMARY,
         border: Border {
             radius: 4.0.into(),
@@ -423,7 +444,7 @@ pub fn view_with_payload<'a>(
     });
 
     let input_bar =
-        container(row![input, Space::new().width(8), send_btn,].align_y(Vertical::Center))
+        container(row![input, counter, Space::new().width(8), send_btn].align_y(Vertical::Center))
             .padding(Padding::from([8, 16]))
             .width(Length::Fill)
             .style(|_| container::Style {
@@ -557,6 +578,11 @@ fn preview(s: &str, max: usize) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// Whether `input` can be sent: not blank, and within the relay's limits.
+pub fn can_send(input: &str) -> bool {
+    !input.trim().is_empty() && check_text(input, MAX_MESSAGE_CHARS).is_ok()
 }
 
 #[cfg(test)]

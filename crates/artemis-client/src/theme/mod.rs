@@ -1,4 +1,3 @@
-use iced::color;
 use iced::Theme;
 
 /// Nerd Font icon constants (JetBrains Mono Nerd Font glyphs).
@@ -167,6 +166,8 @@ pub mod colors {
         0x3A as f32 / 255.0,
         0xED as f32 / 255.0,
     );
+
+    pub const DANGER: Color = iced::color!(0xEF, 0x44, 0x44);
 }
 
 pub fn artemis_theme() -> Theme {
@@ -178,7 +179,7 @@ pub fn artemis_theme() -> Theme {
             primary: colors::ACCENT,
             success: colors::STATUS_ONLINE,
             warning: colors::STATUS_IDLE,
-            danger: color!(0xEF, 0x44, 0x44),
+            danger: colors::DANGER,
         },
     )
 }

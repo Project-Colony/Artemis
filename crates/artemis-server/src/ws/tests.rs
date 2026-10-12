@@ -820,7 +820,7 @@ async fn a_client_that_stops_reading_holds_up_nobody(pool: DbPool) {
     // everyone else keeps getting each message at once.
     let post = ClientEvent::SendMessage {
         channel_id: CHANNEL_A,
-        content: "x".repeat(artemis_core::protocol::MAX_MESSAGE_CHARS),
+        content: "x".repeat(artemis_core::limits::MAX_MESSAGE_CHARS),
         reply_to_id: None,
     };
     let offline =
@@ -1050,7 +1050,7 @@ async fn a_frame_over_64_kib_closes_the_socket() {
 
 #[test]
 fn a_message_at_the_character_cap_fits_in_a_frame() {
-    use artemis_core::protocol::MAX_MESSAGE_CHARS;
+    use artemis_core::limits::MAX_MESSAGE_CHARS;
     // Control characters are escaped as six bytes each, the most any
     // character takes in JSON.
     let event = ClientEvent::SendMessage {
@@ -1060,6 +1060,30 @@ fn a_message_at_the_character_cap_fits_in_a_frame() {
     };
     let frame = serde_json::to_string(&event).unwrap();
     assert!(frame.len() < super::MAX_MESSAGE, "{} bytes", frame.len());
+}
+
+#[test]
+fn a_direct_message_at_the_ciphertext_cap_fits_in_a_frame() {
+    use artemis_core::limits::MAX_DM_CIPHERTEXT_BYTES;
+    let event = ClientEvent::SendDirectMessage {
+        recipient_id: MEMBER,
+        encrypted_content: "A".repeat(MAX_DM_CIPHERTEXT_BYTES),
+    };
+    let frame = serde_json::to_string(&event).unwrap();
+    assert!(frame.len() < super::MAX_MESSAGE, "{} bytes", frame.len());
+}
+
+#[test]
+fn mentions_are_counted_once_each_up_to_the_cap() {
+    use artemis_core::limits::MAX_MENTIONS;
+    assert_eq!(super::mentions(&"@lin ".repeat(500)), ["lin"]);
+    assert_eq!(super::mentions("@lin, @lin! @ @. mail@lin"), ["lin"]);
+    let many: String = (0..30).map(|i| format!("@user{i} ")).collect();
+    let mut found = super::mentions(&many);
+    found.sort();
+    let mut first: Vec<String> = (0..MAX_MENTIONS).map(|i| format!("user{i}")).collect();
+    first.sort();
+    assert_eq!(found, first);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1274,7 +1298,7 @@ async fn a_sixth_socket_for_one_user_is_refused(pool: DbPool) {
 #[sqlx::test(migrator = "crate::db::MIGRATOR")]
 #[ignore = "needs DATABASE_URL"]
 async fn messages_over_the_character_cap_are_refused(pool: DbPool) {
-    use artemis_core::protocol::MAX_MESSAGE_CHARS;
+    use artemis_core::limits::MAX_MESSAGE_CHARS;
     seed(&pool).await;
     let mut member = sign_in(serve(pool.clone()).await, "member-token").await;
     let before = snapshot(&pool).await;
@@ -1299,4 +1323,179 @@ async fn messages_over_the_character_cap_are_refused(pool: DbPool) {
 
     let at_cap = post("\u{e9}".repeat(MAX_MESSAGE_CHARS));
     assert_eq!(call(&mut member, &at_cap).await["type"], "MessageReceived");
+}
+
+/// Server A's name and icon, its channels, categories and emojis, and every
+/// profile: what the refused events below would have changed.
+async fn names(pool: &DbPool) -> String {
+    sqlx::query_scalar(
+        "SELECT concat_ws(' | ',
+            (SELECT name || ' ' || COALESCE(icon_url, '-') FROM servers WHERE id = $1),
+            (SELECT string_agg(name || ' ' || COALESCE(topic, '-'), ', ' ORDER BY id) FROM channels),
+            (SELECT string_agg(name, ', ' ORDER BY id) FROM categories),
+            (SELECT COUNT(*) FROM custom_emojis),
+            (SELECT string_agg(COALESCE(display_name, '-') || ' ' || COALESCE(custom_status, '-'), ', ' ORDER BY id)
+             FROM users))",
+    )
+    .bind(SERVER_A)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[sqlx::test(migrator = "crate::db::MIGRATOR")]
+#[ignore = "needs DATABASE_URL"]
+async fn texts_over_their_limits_are_refused_and_never_broadcast(pool: DbPool) {
+    use artemis_core::limits::{MAX_DM_CIPHERTEXT_BYTES, MAX_NAME_CHARS};
+    seed(&pool).await;
+    sqlx::query("UPDATE server_members SET role = 'moderator' WHERE user_id = $1")
+        .bind(MEMBER)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let addr = serve(pool.clone()).await;
+    let mut founder = sign_in(addr, "founder-token").await;
+    let mut moderator = sign_in(addr, "member-token").await;
+    assert_eq!(recv(&mut founder).await, member_presence("Online"));
+    let before = (snapshot(&pool).await, names(&pool).await);
+
+    let long_name = "n".repeat(70);
+    let text = |s: &str| Some(s.to_string());
+    let refused = [
+        ClientEvent::EditServer {
+            server_id: SERVER_A,
+            name: Some(long_name.clone()),
+            icon_url: None,
+        },
+        // A valid name with a bad icon changes neither.
+        ClientEvent::EditServer {
+            server_id: SERVER_A,
+            name: text("A2"),
+            icon_url: text("https://example.com/\0.png"),
+        },
+        ClientEvent::UpdateProfile {
+            display_name: None,
+            custom_status: Some("s".repeat(129)),
+        },
+        ClientEvent::UpdateProfile {
+            display_name: Some("d".repeat(MAX_NAME_CHARS + 1)),
+            custom_status: text("fine"),
+        },
+        ClientEvent::EditChannel {
+            channel_id: CHANNEL_A,
+            name: text("renamed"),
+            topic: Some("t".repeat(1025)),
+        },
+        ClientEvent::EditChannel {
+            channel_id: CHANNEL_A,
+            name: text("a\0b"),
+            topic: None,
+        },
+        ClientEvent::CreateChannel {
+            server_id: SERVER_A,
+            name: long_name.clone(),
+            category_id: None,
+        },
+        ClientEvent::CreateCategory {
+            server_id: SERVER_A,
+            name: long_name.clone(),
+        },
+        ClientEvent::AddCustomEmoji {
+            server_id: SERVER_A,
+            name: long_name.clone(),
+            image_url: "https://example.com/wave.png".to_string(),
+        },
+        ClientEvent::AddReaction {
+            message_id: FOUNDER_MESSAGE,
+            emoji: long_name.clone(),
+        },
+        ClientEvent::SendMessage {
+            channel_id: CHANNEL_A,
+            content: "a\0b".to_string(),
+            reply_to_id: None,
+        },
+        ClientEvent::SendDirectMessage {
+            recipient_id: FOUNDER,
+            encrypted_content: "A".repeat(MAX_DM_CIPHERTEXT_BYTES + 1),
+        },
+    ];
+    // Each refusal names the limit, not a permission or a database failure.
+    for event in &refused {
+        let reply = call(&mut moderator, event).await;
+        let message = reply["data"]["message"].as_str().unwrap_or_default();
+        assert!(
+            reply["type"] == "Error" && (message.contains("at most") || message.contains("NUL")),
+            "{event:?} got {reply}"
+        );
+    }
+    assert_eq!(
+        call(
+            &mut moderator,
+            &ClientEvent::EditServer {
+                server_id: SERVER_A,
+                name: Some(long_name),
+                icon_url: None,
+            }
+        )
+        .await,
+        json!({"type": "Error", "data": {"message": "A server name may have at most 64 characters"}})
+    );
+    assert_silent(&mut founder).await;
+    assert_eq!((snapshot(&pool).await, names(&pool).await), before);
+
+    // An accepted edit goes out as stored: the icon set before comes with the
+    // new name.
+    let icon = ClientEvent::EditServer {
+        server_id: SERVER_A,
+        name: None,
+        icon_url: text("https://example.com/a.png"),
+    };
+    assert_eq!(call(&mut moderator, &icon).await["type"], "ServerUpdated");
+    assert_eq!(recv(&mut founder).await["type"], "ServerUpdated");
+    let rename = ClientEvent::EditServer {
+        server_id: SERVER_A,
+        name: text("A2"),
+        icon_url: None,
+    };
+    let updated = json!({"type": "ServerUpdated", "data": {
+        "server_id": SERVER_A, "name": "A2", "icon_url": "https://example.com/a.png",
+    }});
+    assert_eq!(call(&mut moderator, &rename).await, updated);
+    assert_eq!(recv(&mut founder).await, updated);
+}
+
+#[sqlx::test(migrator = "crate::db::MIGRATOR")]
+#[ignore = "needs DATABASE_URL"]
+async fn a_name_mentioned_many_times_counts_once(pool: DbPool) {
+    seed(&pool).await;
+    const LIN: Uuid = Uuid::from_u128(0x11);
+    sqlx::query("INSERT INTO users (id, username, github_id) VALUES ($1, 'lin', 5)")
+        .bind(LIN)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO server_members (user_id, server_id) VALUES ($1, $2)")
+        .bind(LIN)
+        .bind(SERVER_A)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut founder = sign_in(serve(pool.clone()).await, "founder-token").await;
+
+    // The founder mentions themselves too, which does not count.
+    let post = ClientEvent::SendMessage {
+        channel_id: CHANNEL_A,
+        content: format!("@founder {}", "@lin ".repeat(500)),
+        reply_to_id: None,
+    };
+    assert_eq!(call(&mut founder, &post).await["type"], "MessageReceived");
+
+    let counts: Vec<(Uuid, i32)> = sqlx::query_as(
+        "SELECT user_id, mention_count FROM channel_read_state WHERE channel_id = $1",
+    )
+    .bind(CHANNEL_A)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(counts, [(LIN, 1)]);
 }

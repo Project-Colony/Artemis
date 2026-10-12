@@ -13,7 +13,7 @@ use uuid::Uuid;
 use artemis_core::models::message::Message;
 use artemis_core::models::user::{MemberRole, ServerMember, User, UserStatus};
 use artemis_core::protocol::{
-    ClientEvent, FriendPayload, FriendRequestPayload, ServerEvent, ServerPayload, MAX_MESSAGE_CHARS,
+    ClientEvent, FriendPayload, FriendRequestPayload, ServerEvent, ServerPayload,
 };
 
 use artemis_p2p::crypto::{Identity, Purpose};
@@ -557,12 +557,12 @@ impl Artemis {
             AppMessage::ChannelSidebar(ChannelSidebarMsg::ToggleCategory(_cat_id)) => {}
 
             AppMessage::ChatArea(ChatAreaMsg::InputChanged(val)) => {
-                // The relay refuses longer messages, so a long paste is cut
-                // here, where it shows, instead of failing once sent.
-                self.message_input = val.chars().take(MAX_MESSAGE_CHARS).collect();
+                self.message_input = val;
             }
             AppMessage::ChatArea(ChatAreaMsg::SendMessage) => {
-                if !self.message_input.trim().is_empty() {
+                // Over the cap the relay would refuse it, so the text stays
+                // in the input for the user to shorten.
+                if chat_area::can_send(&self.message_input) {
                     if self.is_home {
                         // DM mode: send E2E encrypted message through server relay
                         self.send_dm();
@@ -1348,5 +1348,56 @@ impl Artemis {
                     .into()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use artemis_core::limits::{MAX_DM_CIPHERTEXT_BYTES, MAX_MESSAGE_CHARS};
+
+    fn type_and_send(app: &mut Artemis, text: &str) {
+        let _ = app.update(AppMessage::ChatArea(ChatAreaMsg::InputChanged(
+            text.to_string(),
+        )));
+        let _ = app.update(AppMessage::ChatArea(ChatAreaMsg::SendMessage));
+    }
+
+    #[test]
+    fn send_over_the_limit_does_nothing_and_keeps_the_text() {
+        let (mut app, _) = Artemis::new();
+        let (tx, mut sent) = mpsc::unbounded_channel();
+        app.client_tx = Some(tx);
+        app.is_home = false;
+        app.active_channel_id = Some(Uuid::from_u128(1));
+
+        // Counted in characters: each of these is two bytes.
+        let over = "\u{e9}".repeat(MAX_MESSAGE_CHARS + 1);
+        type_and_send(&mut app, &over);
+        assert_eq!(app.message_input, over);
+        assert!(sent.try_recv().is_err());
+
+        let at_cap = "\u{e9}".repeat(MAX_MESSAGE_CHARS);
+        type_and_send(&mut app, &at_cap);
+        assert!(app.message_input.is_empty());
+        assert!(matches!(
+            sent.try_recv(),
+            Ok(ClientEvent::SendMessage { content, .. }) if content == at_cap
+        ));
+    }
+
+    #[test]
+    fn the_longest_message_encrypts_within_the_relay_cap() {
+        let (alice, bob) = (Identity::generate(), Identity::generate());
+        // Each of these is four bytes, the most a character takes.
+        let longest = "\u{1F600}".repeat(MAX_MESSAGE_CHARS);
+        let sealed = alice
+            .encrypt_for_b64(
+                Purpose::DirectMessage,
+                &bob.public_key_b64(),
+                longest.as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(sealed.len(), MAX_DM_CIPHERTEXT_BYTES);
     }
 }
