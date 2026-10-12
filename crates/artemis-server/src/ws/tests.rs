@@ -1443,25 +1443,66 @@ async fn texts_over_their_limits_are_refused_and_never_broadcast(pool: DbPool) {
     assert_silent(&mut founder).await;
     assert_eq!((snapshot(&pool).await, names(&pool).await), before);
 
-    // An accepted edit goes out as stored: the icon set before comes with the
-    // new name.
+    // An accepted edit goes out as stored, with only the fields it set, so
+    // edits of different fields apply in any order.
     let icon = ClientEvent::EditServer {
         server_id: SERVER_A,
         name: None,
         icon_url: text("https://example.com/a.png"),
     };
-    assert_eq!(call(&mut moderator, &icon).await["type"], "ServerUpdated");
-    assert_eq!(recv(&mut founder).await["type"], "ServerUpdated");
+    let updated = json!({"type": "ServerUpdated", "data": {
+        "server_id": SERVER_A, "name": null, "icon_url": "https://example.com/a.png",
+    }});
+    assert_eq!(call(&mut moderator, &icon).await, updated);
+    assert_eq!(recv(&mut founder).await, updated);
     let rename = ClientEvent::EditServer {
         server_id: SERVER_A,
         name: text("A2"),
         icon_url: None,
     };
     let updated = json!({"type": "ServerUpdated", "data": {
-        "server_id": SERVER_A, "name": "A2", "icon_url": "https://example.com/a.png",
+        "server_id": SERVER_A, "name": "A2", "icon_url": null,
     }});
     assert_eq!(call(&mut moderator, &rename).await, updated);
     assert_eq!(recv(&mut founder).await, updated);
+    assert!(names(&pool)
+        .await
+        .starts_with("A2 https://example.com/a.png |"));
+}
+
+#[sqlx::test(migrator = "crate::db::MIGRATOR")]
+#[ignore = "needs DATABASE_URL"]
+async fn only_a_32_byte_public_key_is_stored(pool: DbPool) {
+    seed(&pool).await;
+    let mut member = sign_in(serve(pool.clone()).await, "member-token").await;
+    let publish = |key: String| ClientEvent::PublishPublicKey { public_key: key };
+    let refused = json!({"type": "Error", "data": {
+        "message": "A public key must be 32 bytes in base64",
+    }});
+    // Junk, a NUL, 31 and 33 bytes, and unpadded base64.
+    for key in [
+        "x".repeat(60_000),
+        "\0".to_string(),
+        "A".repeat(40) + "AA==",
+        "A".repeat(44),
+        "A".repeat(43),
+    ] {
+        assert_eq!(call(&mut member, &publish(key)).await, refused);
+    }
+    let stored = || async {
+        let key: Option<String> = sqlx::query_scalar("SELECT public_key FROM users WHERE id = $1")
+            .bind(MEMBER)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        key
+    };
+    assert_eq!(stored().await, None);
+
+    let key = "A".repeat(43) + "=";
+    let reply = call(&mut member, &publish(key.clone())).await;
+    assert_eq!(reply["type"], "PublicKeyAcknowledged");
+    assert_eq!(stored().await, Some(key));
 }
 
 #[sqlx::test(migrator = "crate::db::MIGRATOR")]

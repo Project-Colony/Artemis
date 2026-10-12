@@ -9,6 +9,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use futures::{Sink, SinkExt, StreamExt};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::AbortHandle;
@@ -686,14 +688,16 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                         }
 
                         match db::edit_server(&state.db, server_id, name, icon_url).await {
-                            Ok((name, icon_url)) => {
+                            // Only the fields this edit set, as stored, so two
+                            // edits of different fields apply in any order.
+                            Ok((stored_name, stored_icon)) => {
                                 broadcast_to_server(
                                     &state,
                                     server_id,
                                     &ServerEvent::ServerUpdated {
                                         server_id,
-                                        name: Some(name),
-                                        icon_url,
+                                        name: name.and(Some(stored_name)),
+                                        icon_url: icon_url.and(stored_icon),
                                     },
                                 )
                                 .await;
@@ -830,14 +834,15 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                         };
 
                         match db::edit_channel(&state.db, channel_id, name, topic).await {
-                            Ok((name, topic)) => {
+                            // Only the fields this edit set, as stored.
+                            Ok((stored_name, stored_topic)) => {
                                 broadcast_to_server(
                                     &state,
                                     server_id,
                                     &ServerEvent::ChannelUpdated {
                                         channel_id,
-                                        name: Some(name),
-                                        topic,
+                                        name: name.and(Some(stored_name)),
+                                        topic: topic.and(stored_topic),
                                     },
                                 )
                                 .await;
@@ -923,11 +928,15 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                             continue;
                         }
 
+                        // Only the fields this update set, as stored.
                         let (display_name, custom_status) =
                             match db::update_profile(&state.db, uid, display_name, custom_status)
                                 .await
                             {
-                                Ok(stored) => stored,
+                                Ok((stored_name, stored_status)) => (
+                                    display_name.and(stored_name),
+                                    custom_status.and(stored_status),
+                                ),
                                 Err(e) => {
                                     tracing::error!("Failed to update profile: {}", e);
                                     send_error(&sender, "Failed to update your profile").await;
@@ -1114,8 +1123,15 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                     // ── Friend / DM / E2E relay ──
                     ClientEvent::PublishPublicKey { public_key } => {
                         let Some(uid) = user_id else { continue };
+                        // Friends encrypt to this key, so only a real X25519
+                        // key is stored: 32 bytes in padded base64.
+                        if !B64.decode(&public_key).is_ok_and(|key| key.len() == 32) {
+                            send_error(&sender, "A public key must be 32 bytes in base64").await;
+                            continue;
+                        }
                         if let Err(e) = db::save_public_key(&state.db, uid, &public_key).await {
                             tracing::error!("Failed to save public key: {}", e);
+                            send_error(&sender, "Failed to save your public key").await;
                         } else {
                             let _ = send_event(&sender, &ServerEvent::PublicKeyAcknowledged).await;
                             tracing::info!("Public key stored for user {}", uid);
