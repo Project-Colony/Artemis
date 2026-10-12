@@ -464,6 +464,27 @@ pub struct DirectMessagePayload {
     pub created_at: DateTime<Utc>,
 }
 
+/// The relay's answer to `POST /auth/device/poll`, tagged by `status`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum DevicePoll {
+    /// The code has not been entered yet: poll again after the interval.
+    Pending,
+    /// Poll every `interval` seconds from now on, or 5 seconds slower than
+    /// before when it is null.
+    SlowDown { interval: Option<u64> },
+    /// The user refused access on GitHub.
+    Denied,
+    /// The code expired: start again.
+    Expired,
+    /// Signed in. `token` is the relay session to send in Authenticate.
+    Complete {
+        token: String,
+        username: String,
+        avatar_url: Option<String>,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

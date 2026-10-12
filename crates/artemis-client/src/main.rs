@@ -179,10 +179,12 @@ impl Artemis {
             AppMessage::Login(LoginMsg::SignInWithGitHub) => {
                 self.login_state = LoginState::Polling;
 
-                let client_id = GITHUB_CLIENT_ID.to_string();
-
                 return IcedTask::perform(
-                    async move { artemis_auth::request_device_code(&client_id).await },
+                    async move {
+                        artemis_auth::GitHub::new(GITHUB_CLIENT_ID)?
+                            .request_device_code()
+                            .await
+                    },
                     |result| match result {
                         Ok(resp) => AppMessage::DeviceCodeReceived {
                             device_code: resp.device_code,
@@ -208,68 +210,40 @@ impl Artemis {
 
                 let _ = open::that(&verification_uri);
 
-                let client_id = GITHUB_CLIENT_ID.to_string();
                 let dc = device_code.clone();
 
                 return IcedTask::run(
                     iced::stream::channel(8, move |mut output: Sender<AppMessage>| async move {
-                        let poll_interval = std::time::Duration::from_secs(interval.max(5));
+                        use artemis_auth::DeviceFlowError;
+                        let github = match artemis_auth::GitHub::new(GITHUB_CLIENT_ID) {
+                            Ok(github) => github,
+                            Err(e) => {
+                                let _ = output
+                                    .send(AppMessage::DeviceFlowError(e.to_string()))
+                                    .await;
+                                return;
+                            }
+                        };
+                        let mut poll_interval = std::time::Duration::from_secs(interval.max(5));
                         loop {
                             tokio::time::sleep(poll_interval).await;
-                            match artemis_auth::poll_device_token(&client_id, &dc).await {
-                                Ok(resp) => {
-                                    if let Some(token) = resp.access_token {
-                                        let _ = output
-                                            .send(AppMessage::GitHubTokenReceived(token))
-                                            .await;
-                                        return;
-                                    }
-                                    if let Some(error) = &resp.error {
-                                        match error.as_str() {
-                                            "authorization_pending" => continue,
-                                            "slow_down" => {
-                                                tokio::time::sleep(std::time::Duration::from_secs(
-                                                    5,
-                                                ))
-                                                .await;
-                                                continue;
-                                            }
-                                            "expired_token" => {
-                                                let _ = output
-                                                    .send(AppMessage::DeviceFlowError(
-                                                        "Code expired, please try again"
-                                                            .to_string(),
-                                                    ))
-                                                    .await;
-                                                return;
-                                            }
-                                            "access_denied" => {
-                                                let _ = output
-                                                    .send(AppMessage::DeviceFlowError(
-                                                        "Access denied by user".to_string(),
-                                                    ))
-                                                    .await;
-                                                return;
-                                            }
-                                            other => {
-                                                let desc = resp
-                                                    .error_description
-                                                    .unwrap_or_else(|| other.to_string());
-                                                let _ = output
-                                                    .send(AppMessage::DeviceFlowError(desc))
-                                                    .await;
-                                                return;
-                                            }
-                                        }
-                                    }
+                            let message = match github.poll_device_token(&dc).await {
+                                Ok(token) => AppMessage::GitHubTokenReceived(token),
+                                Err(DeviceFlowError::Pending) => continue,
+                                Err(DeviceFlowError::SlowDown { interval }) => {
+                                    poll_interval = interval.map_or(
+                                        poll_interval + std::time::Duration::from_secs(5),
+                                        std::time::Duration::from_secs,
+                                    );
+                                    continue;
                                 }
-                                Err(e) => {
-                                    let _ = output
-                                        .send(AppMessage::DeviceFlowError(e.to_string()))
-                                        .await;
-                                    return;
-                                }
-                            }
+                                Err(DeviceFlowError::Expired) => AppMessage::DeviceFlowError(
+                                    "Code expired, please try again".to_string(),
+                                ),
+                                Err(e) => AppMessage::DeviceFlowError(e.to_string()),
+                            };
+                            let _ = output.send(message).await;
+                            return;
                         }
                     }),
                     |msg| msg,
@@ -281,7 +255,11 @@ impl Artemis {
                 let t = token.clone();
 
                 return IcedTask::perform(
-                    async move { artemis_auth::GitHubOAuth::fetch_user(&t).await },
+                    async move {
+                        artemis_auth::GitHub::new(GITHUB_CLIENT_ID)?
+                            .fetch_user(&t)
+                            .await
+                    },
                     move |result| match result {
                         Ok(user) => AppMessage::GitHubUserFetched {
                             username: user.login,

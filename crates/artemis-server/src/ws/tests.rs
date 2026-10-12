@@ -1,4 +1,5 @@
-//! The relay served on a loopback port and driven over a real WebSocket.
+//! The relay served on a loopback port and driven over HTTP and a real
+//! WebSocket.
 //!
 //! The tests marked #[ignore] need a Postgres server: set DATABASE_URL and run
 //! `cargo test -p artemis-server -- --include-ignored`. sqlx::test gives each
@@ -48,11 +49,14 @@ const OUTSIDER_MESSAGE: Uuid = Uuid::from_u128(0xe3);
 /// Users sign in with their name followed by "-token".
 async fn seed(pool: &DbPool) {
     let sql = format!(
-        "INSERT INTO users (id, username, github_id, auth_token) VALUES
-            ('{FOUNDER}', 'founder', 1, 'founder-token'),
-            ('{MEMBER}', 'member', 2, 'member-token'),
-            ('{OUTSIDER}', 'outsider', 3, 'outsider-token'),
-            ('{STRANGER}', 'stranger', 4, 'stranger-token');
+        "INSERT INTO users (id, username, github_id) VALUES
+            ('{FOUNDER}', 'founder', 1),
+            ('{MEMBER}', 'member', 2),
+            ('{OUTSIDER}', 'outsider', 3),
+            ('{STRANGER}', 'stranger', 4);
+         INSERT INTO sessions (token_hash, user_id, expires_at)
+            SELECT sha256(convert_to(username || '-token', 'UTF8')), id, NOW() + INTERVAL '1 day'
+            FROM users;
          INSERT INTO servers (id, name, owner_id, invite_code) VALUES
             ('{SERVER_A}', 'A', '{FOUNDER}', 'invite-a'),
             ('{SERVER_B}', 'B', '{OUTSIDER}', 'invite-b');
@@ -101,9 +105,8 @@ fn app_state(db: DbPool) -> AppState {
         connections: super::new_connection_map(),
         presence: Default::default(),
         unauthenticated: Arc::new(Semaphore::new(super::MAX_UNAUTHENTICATED)),
-        github_client_id: String::new(),
-        github_client_secret: String::new(),
-        base_url: "http://127.0.0.1".to_string(),
+        // Unused: the device flow tests swap in stub_github.
+        github: artemis_auth::GitHub::new("test-client").unwrap(),
     }
 }
 
@@ -1539,4 +1542,220 @@ async fn a_name_mentioned_many_times_counts_once(pool: DbPool) {
     .await
     .unwrap();
     assert_eq!(counts, [(LIN, 1)]);
+}
+
+/// A stand-in for GitHub on a loopback port, returning its base URL. The
+/// device code picks GitHub's answer: `pending`, `slow_down`, `denied`,
+/// `expired` and `unknown` get those errors, and `<id>:<login>` grants a
+/// token for GitHub user <id> with that login.
+async fn stub_github() -> String {
+    use std::collections::HashMap;
+
+    use axum::extract::Form;
+    use axum::http::HeaderMap;
+    use axum::routing::{get, post};
+    use axum::Json;
+
+    type FormData = Form<HashMap<String, String>>;
+    let app = axum::Router::new()
+        .route(
+            "/login/device/code",
+            post(|Form(form): FormData| async move {
+                assert_eq!(form["client_id"], "test-client");
+                assert_eq!(form["scope"], "read:user");
+                Json(json!({
+                    "device_code": "dc",
+                    "user_code": "ABCD-1234",
+                    "verification_uri": "https://github.com/login/device",
+                    "expires_in": 900,
+                    "interval": 5,
+                }))
+            }),
+        )
+        .route(
+            "/login/oauth/access_token",
+            post(|Form(form): FormData| async move {
+                assert_eq!(form["client_id"], "test-client");
+                Json(match form["device_code"].as_str() {
+                    "pending" => json!({"error": "authorization_pending"}),
+                    "slow_down" => json!({"error": "slow_down", "interval": 10}),
+                    "denied" => json!({"error": "access_denied"}),
+                    "expired" => json!({"error": "expired_token"}),
+                    "unknown" => json!({"error": "incorrect_device_code"}),
+                    user => json!({"access_token": format!("gho_{user}"), "token_type": "bearer"}),
+                })
+            }),
+        )
+        .route(
+            "/user",
+            get(|headers: HeaderMap| async move {
+                let token = headers["authorization"].to_str().unwrap();
+                let user = token.strip_prefix("Bearer gho_").unwrap();
+                let (id, login) = user.split_once(':').unwrap();
+                Json(json!({
+                    "id": id.parse::<i64>().unwrap(),
+                    "login": login,
+                    "name": "Ada Lovelace",
+                    "avatar_url": format!("https://avatars.example/{id}"),
+                }))
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    format!("http://{addr}")
+}
+
+/// The relay, signing in through stub_github.
+async fn serve_device_flow(db: DbPool) -> SocketAddr {
+    let github = stub_github().await;
+    serve_state(AppState {
+        github: artemis_auth::GitHub::with_urls("test-client", &github, &github).unwrap(),
+        ..app_state(db)
+    })
+    .await
+}
+
+/// POSTs to a device flow route and returns the status and the JSON body.
+async fn post_json(addr: SocketAddr, path: &str, body: Value) -> (u16, Value) {
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let response = http
+        .post(format!("http://{addr}{path}"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    (response.status().as_u16(), response.json().await.unwrap())
+}
+
+async fn poll(addr: SocketAddr, device_code: &str) -> (u16, Value) {
+    let body = json!({ "device_code": device_code });
+    post_json(addr, "/auth/device/poll", body).await
+}
+
+#[tokio::test]
+async fn the_device_flow_passes_on_githubs_answers() {
+    // Never connects: only a granted token reaches the database.
+    let addr = serve_device_flow(unused_pool()).await;
+
+    assert_eq!(
+        post_json(addr, "/auth/device/start", json!({})).await,
+        (
+            200,
+            json!({
+                "device_code": "dc",
+                "user_code": "ABCD-1234",
+                "verification_uri": "https://github.com/login/device",
+                "expires_in": 900,
+                "interval": 5,
+            })
+        )
+    );
+    let answers = [
+        ("pending", 200, json!({"status": "pending"})),
+        (
+            "slow_down",
+            200,
+            json!({"status": "slow_down", "interval": 10}),
+        ),
+        ("denied", 200, json!({"status": "denied"})),
+        ("expired", 200, json!({"status": "expired"})),
+        ("unknown", 502, json!({"error": "GitHub sign-in failed"})),
+        // GitHub granted a token, then the database failed: no session.
+        ("7:ada", 500, json!({"error": "Database error"})),
+    ];
+    for (device_code, status, body) in answers {
+        assert_eq!(
+            poll(addr, device_code).await,
+            (status, body),
+            "{device_code}"
+        );
+    }
+}
+
+#[sqlx::test(migrator = "crate::db::MIGRATOR")]
+#[ignore = "needs DATABASE_URL"]
+async fn a_device_sign_in_opens_a_hashed_session(pool: DbPool) {
+    let addr = serve_device_flow(pool.clone()).await;
+
+    let (status, body) = poll(addr, "7:ada").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], "complete");
+    assert_eq!(body["username"], "ada");
+    assert_eq!(body["avatar_url"], "https://avatars.example/7");
+    let token = body["token"].as_str().unwrap();
+
+    let (hash, sha256, days): (Vec<u8>, Vec<u8>, f64) = sqlx::query_as(
+        "SELECT token_hash, sha256(convert_to($1, 'UTF8')),
+                EXTRACT(EPOCH FROM expires_at - NOW())::float8 / 86400
+         FROM sessions",
+    )
+    .bind(token)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_ne!(hash, token.as_bytes());
+    assert_eq!(hash, sha256);
+    assert!((29.9..=30.0).contains(&days), "{days}");
+
+    let mut ws = connect(addr).await.unwrap();
+    let event = ClientEvent::Authenticate {
+        token: token.to_string(),
+    };
+    let signed_in = call(&mut ws, &event).await;
+    assert_eq!(signed_in["type"], "Authenticated");
+    assert_eq!(signed_in["data"]["username"], "ada");
+}
+
+#[sqlx::test(migrator = "crate::db::MIGRATOR")]
+#[ignore = "needs DATABASE_URL"]
+async fn a_failed_sign_in_stores_nothing(pool: DbPool) {
+    let addr = serve_device_flow(pool.clone()).await;
+    // The session insert fails, after the account was written.
+    sqlx::query("ALTER TABLE sessions ADD CHECK (false)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        poll(addr, "7:ada").await,
+        (500, json!({"error": "Database error"}))
+    );
+    let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(users, 0);
+}
+
+#[sqlx::test(migrator = "crate::db::MIGRATOR")]
+#[ignore = "needs DATABASE_URL"]
+async fn an_expired_session_is_refused_and_a_used_one_extended(pool: DbPool) {
+    seed(&pool).await;
+    sqlx::query("UPDATE sessions SET expires_at = NOW() - INTERVAL '1 second' WHERE user_id = $1")
+        .bind(MEMBER)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let addr = serve(pool.clone()).await;
+
+    let mut ws = connect(addr).await.unwrap();
+    let event = ClientEvent::Authenticate {
+        token: "member-token".to_string(),
+    };
+    assert_eq!(
+        call(&mut ws, &event).await,
+        json!({"type": "AuthError", "data": {"reason": "Invalid or expired session"}})
+    );
+
+    // The seed gave the founder one day left; signing in makes it 30 again.
+    let _founder = sign_in(addr, "founder-token").await;
+    let days: f64 = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM expires_at - NOW())::float8 / 86400 FROM sessions WHERE user_id = $1",
+    )
+    .bind(FOUNDER)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!((29.9..=30.0).contains(&days), "{days}");
 }

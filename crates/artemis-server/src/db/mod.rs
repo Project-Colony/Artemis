@@ -1,9 +1,14 @@
 use std::collections::HashSet;
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPool;
 use uuid::Uuid;
 
+use artemis_auth::GitHubUser;
+use artemis_core::limits;
 use artemis_core::models::channel::ChannelType;
 use artemis_core::models::message::Message;
 use artemis_core::models::user::{MemberRole, UserStatus};
@@ -36,75 +41,103 @@ pub async fn prepare(pool: &DbPool) -> Result<(), sqlx::Error> {
 
 // ── User queries ──
 
-pub async fn find_user_by_github_id(
-    pool: &DbPool,
-    github_id: i64,
-) -> Result<Option<UserRow>, sqlx::Error> {
-    sqlx::query_as::<_, UserRow>(
-        "SELECT id, username, display_name, avatar_url, github_id, status, custom_status, auth_token, public_key, created_at FROM users WHERE github_id = $1"
-    )
-    .bind(github_id)
-    .fetch_optional(pool)
-    .await
+/// How long a session lasts after its last use.
+const SESSION_LIFETIME: &str = "30 days";
+
+/// What the sessions table stores of a session token.
+fn token_hash(token: &str) -> Vec<u8> {
+    Sha256::digest(token.as_bytes()).to_vec()
 }
 
-pub async fn find_user_by_token(
+/// Stores or refreshes the account of GitHub user `gh` and opens a session
+/// for it. Returns the account and the session token. Nothing is stored
+/// unless all of it is.
+pub async fn sign_in(pool: &DbPool, gh: &GitHubUser) -> Result<(UserRow, String), sqlx::Error> {
+    // Only a starting point the user can change, so a name that does not fit
+    // is left out rather than refusing the sign-in.
+    let display_name = gh
+        .name
+        .as_deref()
+        .filter(|name| limits::check_text(name, limits::MAX_NAME_CHARS).is_ok());
+    let token = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
+
+    let mut tx = pool.begin().await?;
+    // Sign-ins are the only thing that adds sessions, so they clear out the
+    // expired ones too.
+    sqlx::query("DELETE FROM sessions WHERE expires_at <= NOW()")
+        .execute(&mut *tx)
+        .await?;
+    // After a rename on GitHub, someone else can take the old login. The
+    // account still holding it gives it up until its own user signs in again.
+    sqlx::query(
+        "UPDATE users SET username = 'gh-' || github_id WHERE username = $1 AND github_id <> $2",
+    )
+    .bind(&gh.login)
+    .bind(gh.id)
+    .execute(&mut *tx)
+    .await?;
+    let user = sqlx::query_as::<_, UserRow>(
+        "INSERT INTO users (username, display_name, avatar_url, github_id)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (github_id) DO UPDATE
+         SET username = EXCLUDED.username, avatar_url = EXCLUDED.avatar_url
+         RETURNING *",
+    )
+    .bind(&gh.login)
+    .bind(display_name)
+    .bind(&gh.avatar_url)
+    .bind(gh.id)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO sessions (token_hash, user_id, expires_at)
+         VALUES ($1, $2, NOW() + $3::interval)",
+    )
+    .bind(token_hash(&token))
+    .bind(user.id)
+    .bind(SESSION_LIFETIME)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok((user, token))
+}
+
+/// The user a session token belongs to, unless the session has expired. Each
+/// use moves the expiry SESSION_LIFETIME past now.
+pub async fn find_user_by_session(
     pool: &DbPool,
     token: &str,
 ) -> Result<Option<UserRow>, sqlx::Error> {
     sqlx::query_as::<_, UserRow>(
-        "SELECT id, username, display_name, avatar_url, github_id, status, custom_status, auth_token, public_key, created_at FROM users WHERE auth_token = $1"
+        "WITH used AS (
+             UPDATE sessions
+             SET last_seen_at = NOW(), expires_at = NOW() + $2::interval
+             WHERE token_hash = $1 AND expires_at > NOW()
+             RETURNING user_id
+         )
+         SELECT users.* FROM users JOIN used ON used.user_id = users.id",
     )
-    .bind(token)
+    .bind(token_hash(token))
+    .bind(SESSION_LIFETIME)
     .fetch_optional(pool)
     .await
+}
+
+pub async fn find_user_by_id(pool: &DbPool, id: Uuid) -> Result<Option<UserRow>, sqlx::Error> {
+    sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
 }
 
 pub async fn find_user_by_username(
     pool: &DbPool,
     username: &str,
 ) -> Result<Option<UserRow>, sqlx::Error> {
-    sqlx::query_as::<_, UserRow>(
-        "SELECT id, username, display_name, avatar_url, github_id, status, custom_status, auth_token, public_key, created_at FROM users WHERE username = $1"
-    )
-    .bind(username)
-    .fetch_optional(pool)
-    .await
-}
-
-pub async fn create_user(
-    pool: &DbPool,
-    username: &str,
-    display_name: Option<&str>,
-    avatar_url: Option<&str>,
-    github_id: i64,
-    auth_token: &str,
-) -> Result<UserRow, sqlx::Error> {
-    sqlx::query_as::<_, UserRow>(
-        "INSERT INTO users (username, display_name, avatar_url, github_id, auth_token, status)
-         VALUES ($1, $2, $3, $4, $5, 'online')
-         RETURNING id, username, display_name, avatar_url, github_id, status, custom_status, auth_token, created_at"
-    )
-    .bind(username)
-    .bind(display_name)
-    .bind(avatar_url)
-    .bind(github_id)
-    .bind(auth_token)
-    .fetch_one(pool)
-    .await
-}
-
-pub async fn update_user_token(
-    pool: &DbPool,
-    user_id: Uuid,
-    token: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE users SET auth_token = $1 WHERE id = $2")
-        .bind(token)
-        .bind(user_id)
-        .execute(pool)
-        .await?;
-    Ok(())
+    sqlx::query_as::<_, UserRow>("SELECT * FROM users WHERE username = $1")
+        .bind(username)
+        .fetch_optional(pool)
+        .await
 }
 
 pub async fn update_user_status(
@@ -447,7 +480,6 @@ pub struct UserRow {
     pub github_id: Option<i64>,
     pub status: String,
     pub custom_status: Option<String>,
-    pub auth_token: Option<String>,
     pub public_key: Option<String>,
     pub created_at: DateTime<Utc>,
 }
@@ -1452,6 +1484,7 @@ mod tests {
             (2, "d022f78b6bb03d6b61718df629fd94010bb9499a28805751272f180c5e57c58bb3bd6f06fe2069c3888c17abf9ba9c20"),
             (3, "4d64e9c20652479599559c08ce106762bb2c86661cce7da9981882c5ae87487c09634cd060c7a2306424989c927d4d3e"),
             (4, "9abcb7c84c0c61a8e77dfecec6819cd70409f6615579a2de5b6bcf014863809a9d5af6a74fa838730baa2c126de3cb72"),
+            (5, "707fb0159874ef518f0fd8899390bc255edcd816b94a8cf5955b68716fbadb3e84af226d1ac649e35c79cd6617fb15a7"),
         ];
         for (version, expected) in frozen {
             let migration = MIGRATOR.iter().find(|m| m.version == version).unwrap();
@@ -1531,7 +1564,79 @@ mod tests {
 
         prepare(&pool).await.unwrap();
 
-        let user = find_user_by_github_id(&pool, 1).await.unwrap().unwrap();
+        let user = find_user_by_username(&pool, "ada").await.unwrap().unwrap();
         assert_eq!(user.status, "offline");
+    }
+
+    fn github_user(id: i64, login: &str) -> GitHubUser {
+        GitHubUser {
+            id,
+            login: login.to_string(),
+            name: None,
+            avatar_url: Some(format!("https://avatars.example/{id}")),
+        }
+    }
+
+    async fn usernames(pool: &DbPool) -> Vec<(i64, String)> {
+        sqlx::query_as("SELECT github_id, username FROM users ORDER BY github_id")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test(migrator = "MIGRATOR")]
+    #[ignore = "needs DATABASE_URL"]
+    async fn a_40_character_login_signs_in(pool: DbPool) {
+        let login = "a".repeat(40);
+        let gh = GitHubUser {
+            // Too long for a display name, so left out.
+            name: Some("n".repeat(65)),
+            ..github_user(1, &login)
+        };
+
+        let (user, _) = sign_in(&pool, &gh).await.unwrap();
+        assert_eq!(user.username, login);
+        assert_eq!(user.display_name, None);
+    }
+
+    #[sqlx::test(migrator = "MIGRATOR")]
+    #[ignore = "needs DATABASE_URL"]
+    async fn a_login_renamed_on_github_renames_the_account(pool: DbPool) {
+        let (before, first) = sign_in(&pool, &github_user(1, "ada")).await.unwrap();
+        let gh = GitHubUser {
+            avatar_url: Some("https://avatars.example/new".to_string()),
+            ..github_user(1, "ada-l")
+        };
+        let (after, second) = sign_in(&pool, &gh).await.unwrap();
+
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.avatar_url, gh.avatar_url);
+        assert_eq!(usernames(&pool).await, [(1, "ada-l".to_string())]);
+        // Both sessions stay valid.
+        assert_ne!(first, second);
+        for token in [first, second] {
+            let found = find_user_by_session(&pool, &token).await.unwrap();
+            assert_eq!(found.map(|user| user.id), Some(before.id));
+        }
+    }
+
+    #[sqlx::test(migrator = "MIGRATOR")]
+    #[ignore = "needs DATABASE_URL"]
+    async fn a_login_held_by_a_stale_account_moves_to_its_new_owner(pool: DbPool) {
+        sign_in(&pool, &github_user(1, "ada")).await.unwrap();
+
+        // GitHub user 1 renamed away from "ada", and user 2 took it.
+        sign_in(&pool, &github_user(2, "ada")).await.unwrap();
+        assert_eq!(
+            usernames(&pool).await,
+            [(1, "gh-1".to_string()), (2, "ada".to_string())]
+        );
+
+        // User 1 gets their new login back on their next sign-in.
+        sign_in(&pool, &github_user(1, "ada2")).await.unwrap();
+        assert_eq!(
+            usernames(&pool).await,
+            [(1, "ada2".to_string()), (2, "ada".to_string())]
+        );
     }
 }
