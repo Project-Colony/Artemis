@@ -889,34 +889,34 @@ struct UnreadRow {
 
 // ── Server / channel management ──
 
+/// Sets the fields given, keeps the others, and returns the server's name and
+/// icon as stored. One statement, so the change is all or nothing.
 pub async fn edit_server(
     pool: &DbPool,
     server_id: Uuid,
     name: Option<&str>,
     icon_url: Option<&str>,
-) -> Result<(), sqlx::Error> {
-    if let Some(name) = name {
-        sqlx::query("UPDATE servers SET name = $1 WHERE id = $2")
-            .bind(name)
-            .bind(server_id)
-            .execute(pool)
-            .await?;
-    }
-    if let Some(icon) = icon_url {
-        sqlx::query("UPDATE servers SET icon_url = $1 WHERE id = $2")
-            .bind(icon)
-            .bind(server_id)
-            .execute(pool)
-            .await?;
-    }
-    Ok(())
+) -> Result<(String, Option<String>), sqlx::Error> {
+    sqlx::query_as(
+        "UPDATE servers SET name = COALESCE($1, name), icon_url = COALESCE($2, icon_url)
+         WHERE id = $3
+         RETURNING name, icon_url",
+    )
+    .bind(name)
+    .bind(icon_url)
+    .bind(server_id)
+    .fetch_one(pool)
+    .await
 }
 
-/// Delete `server_id` and return everyone who was in it. The server row is
-/// locked before the members are read, so a join cannot land between the
-/// read and the delete: one in flight is waited for and listed, a later one
-/// fails on the missing server.
-pub async fn delete_server(pool: &DbPool, server_id: Uuid) -> Result<HashSet<Uuid>, sqlx::Error> {
+/// Delete `server_id` and return everyone who was in it, or None when it was
+/// already gone. The server row is locked before the members are read, so a
+/// join cannot land between the read and the delete: one in flight is waited
+/// for and listed, a later one fails on the missing server.
+pub async fn delete_server(
+    pool: &DbPool,
+    server_id: Uuid,
+) -> Result<Option<HashSet<Uuid>>, sqlx::Error> {
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT id FROM servers WHERE id = $1 FOR UPDATE")
         .bind(server_id)
@@ -927,12 +927,13 @@ pub async fn delete_server(pool: &DbPool, server_id: Uuid) -> Result<HashSet<Uui
             .bind(server_id)
             .fetch_all(&mut *tx)
             .await?;
-    sqlx::query("DELETE FROM servers WHERE id = $1")
+    let deleted = sqlx::query("DELETE FROM servers WHERE id = $1")
         .bind(server_id)
         .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected();
     tx.commit().await?;
-    Ok(members.into_iter().collect())
+    Ok((deleted > 0).then(|| members.into_iter().collect()))
 }
 
 pub async fn get_server_owner(pool: &DbPool, server_id: Uuid) -> Result<Option<Uuid>, sqlx::Error> {
@@ -998,27 +999,24 @@ pub async fn delete_channel(pool: &DbPool, channel_id: Uuid) -> Result<Option<Uu
     }
 }
 
+/// Sets the fields given, keeps the others, and returns the channel's name and
+/// topic as stored.
 pub async fn edit_channel(
     pool: &DbPool,
     channel_id: Uuid,
     name: Option<&str>,
     topic: Option<&str>,
-) -> Result<(), sqlx::Error> {
-    if let Some(name) = name {
-        sqlx::query("UPDATE channels SET name = $1 WHERE id = $2")
-            .bind(name)
-            .bind(channel_id)
-            .execute(pool)
-            .await?;
-    }
-    if let Some(topic) = topic {
-        sqlx::query("UPDATE channels SET topic = $1 WHERE id = $2")
-            .bind(topic)
-            .bind(channel_id)
-            .execute(pool)
-            .await?;
-    }
-    Ok(())
+) -> Result<(String, Option<String>), sqlx::Error> {
+    sqlx::query_as(
+        "UPDATE channels SET name = COALESCE($1, name), topic = COALESCE($2, topic)
+         WHERE id = $3
+         RETURNING name, topic",
+    )
+    .bind(name)
+    .bind(topic)
+    .bind(channel_id)
+    .fetch_one(pool)
+    .await
 }
 
 pub async fn channel_server(pool: &DbPool, channel_id: Uuid) -> Result<Option<Uuid>, sqlx::Error> {
@@ -1090,27 +1088,26 @@ pub async fn get_invite_code(
 
 // ── User profile ──
 
+/// Sets the fields given, keeps the others, and returns the user's display
+/// name and custom status as stored.
 pub async fn update_profile(
     pool: &DbPool,
     user_id: Uuid,
     display_name: Option<&str>,
     custom_status: Option<&str>,
-) -> Result<(), sqlx::Error> {
-    if let Some(dn) = display_name {
-        sqlx::query("UPDATE users SET display_name = $1 WHERE id = $2")
-            .bind(dn)
-            .bind(user_id)
-            .execute(pool)
-            .await?;
-    }
-    if let Some(cs) = custom_status {
-        sqlx::query("UPDATE users SET custom_status = $1 WHERE id = $2")
-            .bind(cs)
-            .bind(user_id)
-            .execute(pool)
-            .await?;
-    }
-    Ok(())
+) -> Result<(Option<String>, Option<String>), sqlx::Error> {
+    sqlx::query_as(
+        "UPDATE users
+         SET display_name = COALESCE($1, display_name),
+             custom_status = COALESCE($2, custom_status)
+         WHERE id = $3
+         RETURNING display_name, custom_status",
+    )
+    .bind(display_name)
+    .bind(custom_status)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
 }
 
 // ── DM history ──
@@ -1344,18 +1341,29 @@ struct CustomEmojiRow {
 
 // ── Mention tracking ──
 
-pub async fn increment_mention_count(
+/// Adds one to the mention count in `channel_id` of each member of
+/// `server_id` named in `usernames`, the author aside. One statement however
+/// many names there are.
+pub async fn record_mentions(
     pool: &DbPool,
-    user_id: Uuid,
+    server_id: Uuid,
     channel_id: Uuid,
+    author_id: Uuid,
+    usernames: &[String],
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO channel_read_state (user_id, channel_id, last_read_message_id, last_read_at, mention_count)
-         VALUES ($1, $2, NULL, NOW(), 1)
-         ON CONFLICT (user_id, channel_id) DO UPDATE SET mention_count = channel_read_state.mention_count + 1"
+        "INSERT INTO channel_read_state (user_id, channel_id, mention_count)
+         SELECT u.id, $2, 1
+         FROM users u
+         JOIN server_members sm ON sm.user_id = u.id
+         WHERE sm.server_id = $1 AND u.username = ANY($4) AND u.id <> $3
+         ON CONFLICT (user_id, channel_id)
+         DO UPDATE SET mention_count = channel_read_state.mention_count + 1",
     )
-    .bind(user_id)
+    .bind(server_id)
     .bind(channel_id)
+    .bind(author_id)
+    .bind(usernames)
     .execute(pool)
     .await?;
     Ok(())
@@ -1418,30 +1426,6 @@ struct AttachmentRow {
     url: String,
     content_type: String,
     size_bytes: i64,
-}
-
-/// Get user IDs for server members by username (for @mention resolution).
-pub async fn resolve_mentions(
-    pool: &DbPool,
-    server_id: Uuid,
-    usernames: &[String],
-) -> Result<Vec<(String, Uuid)>, sqlx::Error> {
-    let mut results = Vec::new();
-    for username in usernames {
-        let row = sqlx::query_as::<_, (Uuid,)>(
-            "SELECT u.id FROM users u
-             JOIN server_members sm ON sm.user_id = u.id
-             WHERE sm.server_id = $1 AND u.username = $2",
-        )
-        .bind(server_id)
-        .bind(username)
-        .fetch_optional(pool)
-        .await?;
-        if let Some((uid,)) = row {
-            results.push((username.clone(), uid));
-        }
-    }
-    Ok(results)
 }
 
 // The ignored tests need a Postgres server: set DATABASE_URL and run
@@ -1508,6 +1492,33 @@ mod tests {
         MIGRATOR.run(&pool).await.unwrap();
 
         assert_eq!(recorded_migrations(&pool).await, MIGRATOR.iter().count());
+    }
+
+    #[sqlx::test(migrator = "MIGRATOR")]
+    #[ignore = "needs DATABASE_URL"]
+    async fn a_server_deleted_twice_is_reported_gone(pool: DbPool) {
+        let (ada, server) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        sqlx::query("INSERT INTO users (id, username, github_id) VALUES ($1, 'ada', 1)")
+            .bind(ada)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO servers (id, name, owner_id) VALUES ($1, 'A', $2)")
+            .bind(server)
+            .bind(ada)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO server_members (user_id, server_id) VALUES ($1, $2)")
+            .bind(ada)
+            .bind(server)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let first = delete_server(&pool, server).await.unwrap();
+        assert_eq!(first, Some(HashSet::from([ada])));
+        assert_eq!(delete_server(&pool, server).await.unwrap(), None);
     }
 
     #[sqlx::test(migrator = "MIGRATOR")]

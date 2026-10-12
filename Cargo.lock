@@ -240,6 +240,7 @@ dependencies = [
  "artemis-core",
  "axum",
  "axum-extra",
+ "base64 0.23.1",
  "chrono",
  "dotenvy",
  "futures",

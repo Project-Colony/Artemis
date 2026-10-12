@@ -9,15 +9,19 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use futures::{Sink, SinkExt, StreamExt};
 use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::AbortHandle;
 use tokio::time::{interval_at, sleep, timeout, Instant};
 use uuid::Uuid;
 
-use artemis_core::protocol::{
-    ClientEvent, FriendPayload, FriendRequestPayload, ServerEvent, MAX_MESSAGE_CHARS,
+use artemis_core::limits::{
+    self, TextError, MAX_DM_CIPHERTEXT_BYTES, MAX_MENTIONS, MAX_MESSAGE_CHARS, MAX_NAME_CHARS,
+    MAX_STATUS_CHARS, MAX_TOPIC_CHARS,
 };
+use artemis_core::protocol::{ClientEvent, FriendPayload, FriendRequestPayload, ServerEvent};
 
 use crate::db;
 use crate::state::AppState;
@@ -225,7 +229,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                         reply_to_id,
                     } => {
                         let Some(uid) = user_id else { continue };
-                        if too_long(&sender, &content).await {
+                        if refused(&sender, "A message", &content, MAX_MESSAGE_CHARS).await {
                             continue;
                         }
 
@@ -235,19 +239,6 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                         else {
                             continue;
                         };
-
-                        // Parse @mentions before sending
-                        let mentioned_usernames: Vec<String> = content
-                            .split_whitespace()
-                            .filter(|w| w.starts_with('@') && w.len() > 1)
-                            .map(|w| {
-                                w[1..]
-                                    .trim_end_matches(|c: char| {
-                                        !c.is_alphanumeric() && c != '-' && c != '_'
-                                    })
-                                    .to_string()
-                            })
-                            .collect();
 
                         match db::create_message(&state.db, channel_id, uid, &content, reply_to_id)
                             .await
@@ -263,25 +254,14 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                                 .await;
                             }
                             Ok(Some(message)) => {
-                                // Track @mentions for unread state
-                                if !mentioned_usernames.is_empty() {
-                                    if let Ok(resolved) = db::resolve_mentions(
-                                        &state.db,
-                                        server_id,
-                                        &mentioned_usernames,
+                                let mentioned = mentions(&content);
+                                if !mentioned.is_empty() {
+                                    if let Err(e) = db::record_mentions(
+                                        &state.db, server_id, channel_id, uid, &mentioned,
                                     )
                                     .await
                                     {
-                                        for (_uname, mentioned_uid) in resolved {
-                                            if mentioned_uid != uid {
-                                                let _ = db::increment_mention_count(
-                                                    &state.db,
-                                                    mentioned_uid,
-                                                    channel_id,
-                                                )
-                                                .await;
-                                            }
-                                        }
+                                        tracing::error!("Failed to record mentions: {}", e);
                                     }
                                 }
 
@@ -310,7 +290,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                         content,
                     } => {
                         let Some(uid) = user_id else { continue };
-                        if too_long(&sender, &content).await {
+                        if refused(&sender, "A message", &content, MAX_MESSAGE_CHARS).await {
                             continue;
                         }
 
@@ -470,6 +450,9 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                         category_id,
                     } => {
                         let Some(uid) = user_id else { continue };
+                        if refused(&sender, "A channel name", &name, MAX_NAME_CHARS).await {
+                            continue;
+                        }
 
                         if authorize(&state, &sender, uid, Some(server_id), Need::Moderator)
                             .await
@@ -502,6 +485,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                             }
                             Err(e) => {
                                 tracing::error!("Failed to create channel: {}", e);
+                                send_error(&sender, "Failed to create the channel").await;
                             }
                         }
                     }
@@ -509,6 +493,9 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                     // ── Reactions ──
                     ClientEvent::AddReaction { message_id, emoji } => {
                         let Some(uid) = user_id else { continue };
+                        if refused(&sender, "A reaction", &emoji, MAX_NAME_CHARS).await {
+                            continue;
+                        }
 
                         let server = found(db::message_channel(&state.db, message_id).await)
                             .map(|(_, server)| server);
@@ -673,6 +660,25 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                         icon_url,
                     } => {
                         let Some(uid) = user_id else { continue };
+                        let name = name.as_deref();
+                        let icon_url = icon_url.as_deref();
+                        if refused(
+                            &sender,
+                            "A server name",
+                            name.unwrap_or_default(),
+                            MAX_NAME_CHARS,
+                        )
+                        .await
+                            || refused(
+                                &sender,
+                                "An icon URL",
+                                icon_url.unwrap_or_default(),
+                                MAX_TOPIC_CHARS,
+                            )
+                            .await
+                        {
+                            continue;
+                        }
 
                         if authorize(&state, &sender, uid, Some(server_id), Need::Moderator)
                             .await
@@ -681,23 +687,26 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                             continue;
                         }
 
-                        let _ = db::edit_server(
-                            &state.db,
-                            server_id,
-                            name.as_deref(),
-                            icon_url.as_deref(),
-                        )
-                        .await;
-                        broadcast_to_server(
-                            &state,
-                            server_id,
-                            &ServerEvent::ServerUpdated {
-                                server_id,
-                                name,
-                                icon_url,
-                            },
-                        )
-                        .await;
+                        match db::edit_server(&state.db, server_id, name, icon_url).await {
+                            // Only the fields this edit set, as stored, so two
+                            // edits of different fields apply in any order.
+                            Ok((stored_name, stored_icon)) => {
+                                broadcast_to_server(
+                                    &state,
+                                    server_id,
+                                    &ServerEvent::ServerUpdated {
+                                        server_id,
+                                        name: name.and(Some(stored_name)),
+                                        icon_url: icon_url.and(stored_icon),
+                                    },
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to edit server: {}", e);
+                                send_error(&sender, "Failed to edit the server").await;
+                            }
+                        }
                     }
 
                     ClientEvent::DeleteServer { server_id } => {
@@ -717,7 +726,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                         }
 
                         match db::delete_server(&state.db, server_id).await {
-                            Ok(members) => {
+                            Ok(Some(members)) => {
                                 send_to_users(
                                     &state,
                                     &members,
@@ -725,21 +734,20 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                                 )
                                 .await;
                             }
+                            // Another of the founder's sockets deleted it first.
+                            Ok(None) => send_error(&sender, "No such server").await,
                             Err(e) => {
                                 tracing::error!("Failed to delete server: {}", e);
-                                let _ = send_event(
-                                    &sender,
-                                    &ServerEvent::Error {
-                                        message: "Failed to delete server".to_string(),
-                                    },
-                                )
-                                .await;
+                                send_error(&sender, "Failed to delete server").await;
                             }
                         }
                     }
 
                     ClientEvent::CreateCategory { server_id, name } => {
                         let Some(uid) = user_id else { continue };
+                        if refused(&sender, "A category name", &name, MAX_NAME_CHARS).await {
+                            continue;
+                        }
 
                         if authorize(&state, &sender, uid, Some(server_id), Need::Moderator)
                             .await
@@ -760,7 +768,10 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                                 )
                                 .await;
                             }
-                            Err(e) => tracing::error!("Failed to create category: {}", e),
+                            Err(e) => {
+                                tracing::error!("Failed to create category: {}", e);
+                                send_error(&sender, "Failed to create the category").await;
+                            }
                         }
                     }
 
@@ -795,6 +806,25 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                         topic,
                     } => {
                         let Some(uid) = user_id else { continue };
+                        let name = name.as_deref();
+                        let topic = topic.as_deref();
+                        if refused(
+                            &sender,
+                            "A channel name",
+                            name.unwrap_or_default(),
+                            MAX_NAME_CHARS,
+                        )
+                        .await
+                            || refused(
+                                &sender,
+                                "A topic",
+                                topic.unwrap_or_default(),
+                                MAX_TOPIC_CHARS,
+                            )
+                            .await
+                        {
+                            continue;
+                        }
 
                         let server = found(db::channel_server(&state.db, channel_id).await);
                         let Some(server_id) =
@@ -803,23 +833,25 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                             continue;
                         };
 
-                        let _ = db::edit_channel(
-                            &state.db,
-                            channel_id,
-                            name.as_deref(),
-                            topic.as_deref(),
-                        )
-                        .await;
-                        broadcast_to_server(
-                            &state,
-                            server_id,
-                            &ServerEvent::ChannelUpdated {
-                                channel_id,
-                                name,
-                                topic,
-                            },
-                        )
-                        .await;
+                        match db::edit_channel(&state.db, channel_id, name, topic).await {
+                            // Only the fields this edit set, as stored.
+                            Ok((stored_name, stored_topic)) => {
+                                broadcast_to_server(
+                                    &state,
+                                    server_id,
+                                    &ServerEvent::ChannelUpdated {
+                                        channel_id,
+                                        name: name.and(Some(stored_name)),
+                                        topic: topic.and(stored_topic),
+                                    },
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to edit channel: {}", e);
+                                send_error(&sender, "Failed to edit the channel").await;
+                            }
+                        }
                     }
 
                     ClientEvent::LeaveServer { server_id } => {
@@ -876,14 +908,41 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                         custom_status,
                     } => {
                         let Some(uid) = user_id else { continue };
-
-                        let _ = db::update_profile(
-                            &state.db,
-                            uid,
-                            display_name.as_deref(),
-                            custom_status.as_deref(),
+                        let display_name = display_name.as_deref();
+                        let custom_status = custom_status.as_deref();
+                        if refused(
+                            &sender,
+                            "A display name",
+                            display_name.unwrap_or_default(),
+                            MAX_NAME_CHARS,
                         )
-                        .await;
+                        .await
+                            || refused(
+                                &sender,
+                                "A custom status",
+                                custom_status.unwrap_or_default(),
+                                MAX_STATUS_CHARS,
+                            )
+                            .await
+                        {
+                            continue;
+                        }
+
+                        // Only the fields this update set, as stored.
+                        let (display_name, custom_status) =
+                            match db::update_profile(&state.db, uid, display_name, custom_status)
+                                .await
+                            {
+                                Ok((stored_name, stored_status)) => (
+                                    display_name.and(stored_name),
+                                    custom_status.and(stored_status),
+                                ),
+                                Err(e) => {
+                                    tracing::error!("Failed to update profile: {}", e);
+                                    send_error(&sender, "Failed to update your profile").await;
+                                    continue;
+                                }
+                            };
                         // Co-members, and the user's own devices.
                         let mut recipients = listed(db::co_member_ids(&state.db, uid).await);
                         recipients.insert(uid);
@@ -980,6 +1039,11 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                         image_url,
                     } => {
                         let Some(uid) = user_id else { continue };
+                        if refused(&sender, "An emoji name", &name, MAX_NAME_CHARS).await
+                            || refused(&sender, "An image URL", &image_url, MAX_TOPIC_CHARS).await
+                        {
+                            continue;
+                        }
 
                         if authorize(&state, &sender, uid, Some(server_id), Need::Moderator)
                             .await
@@ -999,7 +1063,10 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                                 )
                                 .await;
                             }
-                            Err(e) => tracing::error!("Failed to add custom emoji: {}", e),
+                            Err(e) => {
+                                tracing::error!("Failed to add custom emoji: {}", e);
+                                send_error(&sender, "Failed to add the emoji").await;
+                            }
                         }
                     }
 
@@ -1056,8 +1123,15 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                     // ── Friend / DM / E2E relay ──
                     ClientEvent::PublishPublicKey { public_key } => {
                         let Some(uid) = user_id else { continue };
+                        // Friends encrypt to this key, so only a real X25519
+                        // key is stored: 32 bytes in padded base64.
+                        if !B64.decode(&public_key).is_ok_and(|key| key.len() == 32) {
+                            send_error(&sender, "A public key must be 32 bytes in base64").await;
+                            continue;
+                        }
                         if let Err(e) = db::save_public_key(&state.db, uid, &public_key).await {
                             tracing::error!("Failed to save public key: {}", e);
+                            send_error(&sender, "Failed to save your public key").await;
                         } else {
                             let _ = send_event(&sender, &ServerEvent::PublicKeyAcknowledged).await;
                             tracing::info!("Public key stored for user {}", uid);
@@ -1242,6 +1316,16 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                         encrypted_content,
                     } => {
                         let Some(uid) = user_id else { continue };
+                        if refused(
+                            &sender,
+                            "A direct message",
+                            &encrypted_content,
+                            MAX_DM_CIPHERTEXT_BYTES,
+                        )
+                        .await
+                        {
+                            continue;
+                        }
 
                         // Verify friendship
                         if !db::are_friends(&state.db, uid, recipient_id)
@@ -1513,19 +1597,42 @@ async fn authorize(
     None
 }
 
-/// True, after telling the socket, when `content` is over MAX_MESSAGE_CHARS.
-async fn too_long(sender: &Outbox, content: &str) -> bool {
-    if content.chars().count() <= MAX_MESSAGE_CHARS {
-        return false;
-    }
-    let _ = send_event(
-        sender,
-        &ServerEvent::Error {
-            message: format!("A message may have at most {MAX_MESSAGE_CHARS} characters"),
-        },
-    )
-    .await;
+/// True, after telling the socket why, when `text` has more than `max`
+/// characters or a NUL. `what` names the text in the refusal. Every text the
+/// relay stores goes through here before the event touches the database.
+async fn refused(sender: &Outbox, what: &str, text: &str, max: usize) -> bool {
+    let message = match limits::check_text(text, max) {
+        Ok(()) => return false,
+        Err(TextError::TooLong) => format!("{what} may have at most {max} characters"),
+        Err(TextError::Nul) => format!("{what} may not contain a NUL character"),
+    };
+    send_error(sender, message).await;
     true
+}
+
+async fn send_error(sender: &Outbox, message: impl Into<String>) {
+    let event = ServerEvent::Error {
+        message: message.into(),
+    };
+    let _ = send_event(sender, &event).await;
+}
+
+/// The users `content` mentions as @name, each once, up to MAX_MENTIONS.
+fn mentions(content: &str) -> Vec<String> {
+    let mut names = HashSet::new();
+    for word in content.split_whitespace() {
+        if names.len() == MAX_MENTIONS {
+            break;
+        }
+        let Some(name) = word.strip_prefix('@') else {
+            continue;
+        };
+        let name = name.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_');
+        if !name.is_empty() {
+            names.insert(name);
+        }
+    }
+    names.into_iter().map(str::to_string).collect()
 }
 
 /// The row a lookup found. A database error is logged and counts as not
