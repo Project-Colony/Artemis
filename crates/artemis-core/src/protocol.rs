@@ -19,6 +19,10 @@ pub enum ClientEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[serde(default)]
         reply_to_id: Option<Uuid>,
+        /// Chosen by the client and echoed in the MessageReceived the relay
+        /// sends back, so the client can tell its own message once stored.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_nonce: Option<Uuid>,
     },
 
     /// Edit an existing message.
@@ -129,10 +133,16 @@ pub enum ClientEvent {
     /// Decline a pending friend request.
     DeclineFriendRequest { from_user_id: Uuid },
 
+    /// End a friendship. Either side may send a new request afterwards.
+    RemoveFriend { user_id: Uuid },
+
     /// Send an E2E encrypted DM relayed through the server.
     SendDirectMessage {
         recipient_id: Uuid,
         encrypted_content: String,
+        /// Echoed in the DirectMessageReceived sent back to the sender.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_nonce: Option<Uuid>,
     },
 
     /// Fetch own friend list.
@@ -180,7 +190,12 @@ pub enum ServerEvent {
     AuthError { reason: String },
 
     /// A new message was received.
-    MessageReceived { message: Message },
+    MessageReceived {
+        message: Message,
+        /// The sender's client_nonce, when the sender gave one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_nonce: Option<Uuid>,
+    },
 
     /// A message was edited.
     MessageEdited {
@@ -338,6 +353,9 @@ pub enum ServerEvent {
     /// A friend request was declined.
     FriendRequestDeclined { by_user_id: Uuid },
 
+    /// A friendship ended, by either side: `user_id` is no longer a friend.
+    FriendRemoved { user_id: Uuid },
+
     /// Full friend list response.
     FriendList { friends: Vec<FriendPayload> },
 
@@ -351,10 +369,17 @@ pub enum ServerEvent {
         encrypted_content: String,
         timestamp: DateTime<Utc>,
         message_id: Uuid,
+        /// The sender's client_nonce, in the echo to the sender only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_nonce: Option<Uuid>,
     },
 
     /// A friend's presence changed.
     FriendPresenceUpdate { user_id: Uuid, status: UserStatus },
+
+    /// A friend published a public key other than the one they had, or their
+    /// first one. Direct messages to them are encrypted to it from now on.
+    FriendKeyChanged { user_id: Uuid, public_key: String },
 
     // ── Search ──
     /// Search results for a query.
@@ -464,6 +489,41 @@ pub struct DirectMessagePayload {
     pub created_at: DateTime<Utc>,
 }
 
+/// The relay's answer to `POST /auth/device/start`, as GitHub gave it: the
+/// user enters `user_code` at `https://github.com/login/device`, while
+/// `device_code` is polled every `interval` seconds for up to `expires_in`
+/// seconds. Clients open that page themselves rather than `verification_uri`,
+/// so a relay cannot send its users to another page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceCode {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub expires_in: u64,
+    pub interval: u64,
+}
+
+/// The relay's answer to `POST /auth/device/poll`, tagged by `status`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum DevicePoll {
+    /// The code has not been entered yet: poll again after the interval.
+    Pending,
+    /// Poll every `interval` seconds from now on, or 5 seconds slower than
+    /// before when it is null.
+    SlowDown { interval: Option<u64> },
+    /// The user refused access on GitHub.
+    Denied,
+    /// The code expired: start again.
+    Expired,
+    /// Signed in. `token` is the relay session to send in Authenticate.
+    Complete {
+        token: String,
+        username: String,
+        avatar_url: Option<String>,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,6 +534,7 @@ mod tests {
             channel_id: Uuid::nil(),
             content: "hello".to_string(),
             reply_to_id: None,
+            client_nonce: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: ClientEvent = serde_json::from_str(&json).unwrap();
@@ -552,6 +613,7 @@ mod tests {
             channel_id: Uuid::nil(),
             content: "reply".to_string(),
             reply_to_id: Some(reply_id),
+            client_nonce: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: ClientEvent = serde_json::from_str(&json).unwrap();
@@ -561,6 +623,47 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn the_client_nonce_is_optional_and_left_out_when_none() {
+        let nonce = Uuid::from_u128(7);
+        let send = ClientEvent::SendMessage {
+            channel_id: Uuid::nil(),
+            content: "hi".to_string(),
+            reply_to_id: None,
+            client_nonce: Some(nonce),
+        };
+        let json = serde_json::to_value(&send).unwrap();
+        assert_eq!(json["data"]["client_nonce"], nonce.to_string());
+
+        // A frame from a client or relay that predates the nonce.
+        let old = r#"{"type":"DirectMessageReceived","data":{"from_user_id":"00000000-0000-0000-0000-000000000001","from_username":"ada","encrypted_content":"x","timestamp":"2026-10-14T12:00:00Z","message_id":"00000000-0000-0000-0000-000000000002"}}"#;
+        let event: ServerEvent = serde_json::from_str(old).unwrap();
+        assert!(matches!(
+            event,
+            ServerEvent::DirectMessageReceived {
+                client_nonce: None,
+                ..
+            }
+        ));
+        let old = r#"{"type":"SendDirectMessage","data":{"recipient_id":"00000000-0000-0000-0000-000000000001","encrypted_content":"x"}}"#;
+        let event: ClientEvent = serde_json::from_str(old).unwrap();
+        assert!(matches!(
+            event,
+            ClientEvent::SendDirectMessage {
+                client_nonce: None,
+                ..
+            }
+        ));
+
+        let none = ClientEvent::SendDirectMessage {
+            recipient_id: Uuid::nil(),
+            encrypted_content: "x".to_string(),
+            client_nonce: None,
+        };
+        let json = serde_json::to_value(&none).unwrap();
+        assert!(json["data"].get("client_nonce").is_none());
     }
 
     #[test]

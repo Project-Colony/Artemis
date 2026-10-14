@@ -1,13 +1,13 @@
-use axum::extract::{Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Redirect};
-use axum::routing::get;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
-use uuid::Uuid;
 
-use artemis_auth::GitHubOAuth;
+use artemis_auth::DeviceFlowError;
+use artemis_core::protocol::DevicePoll;
 
 use crate::db;
 use crate::state::AppState;
@@ -15,212 +15,90 @@ use crate::state::AppState;
 pub fn api_routes() -> Router<AppState> {
     Router::new()
         .route("/health", get(health))
-        .route("/auth/github", get(github_login))
-        .route("/auth/github/callback", get(github_callback))
+        .route("/auth/device/start", post(device_start))
+        .route("/auth/device/poll", post(device_poll))
 }
 
 async fn health() -> impl IntoResponse {
     Json(json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
 }
 
-// ── GitHub OAuth ──
+// ── Sign-in through GitHub's device flow ──
 
-async fn github_login(State(state): State<AppState>) -> impl IntoResponse {
-    let oauth = GitHubOAuth::new(
-        &state.github_client_id,
-        &state.github_client_secret,
-        &format!("{}/auth/github/callback", state.base_url),
-    );
-
-    use oauth2::CsrfToken;
-    use oauth2::Scope;
-
-    let (auth_url, csrf_token) = oauth
-        .client()
-        .authorize_url(CsrfToken::new_random)
-        .add_scope(Scope::new("read:user".to_string()))
-        .add_scope(Scope::new("user:email".to_string()))
-        .url();
-
-    // The callback only accepts the `state` this browser was given here.
-    let secure = if state.base_url.starts_with("https://") {
-        "; Secure"
-    } else {
-        ""
-    };
-    let cookie = format!(
-        "{OAUTH_STATE_COOKIE}={}; Path=/auth/github; HttpOnly; SameSite=Lax; Max-Age=600{secure}",
-        csrf_token.secret()
-    );
-    (
-        [(header::SET_COOKIE, cookie)],
-        Redirect::temporary(auth_url.as_str()),
-    )
-}
-
-/// Cookie that ties an OAuth callback to the browser that started the login.
-const OAUTH_STATE_COOKIE: &str = "artemis_oauth_state";
-
-/// Whether the `state` GitHub sent back is the one stored in this browser's
-/// cookie. Without this check, anyone could send a victim a callback link
-/// carrying the attacker's own authorization code (login CSRF).
-fn oauth_state_matches(headers: &HeaderMap, returned: Option<&str>) -> bool {
-    let stored = headers
-        .get_all(header::COOKIE)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(';'))
-        .find_map(|pair| {
-            pair.trim()
-                .strip_prefix(OAUTH_STATE_COOKIE)?
-                .strip_prefix('=')
-        });
-    matches!((stored, returned), (Some(stored), Some(returned)) if !stored.is_empty() && stored == returned)
+/// Asks GitHub for a code the user enters at its verification page. The
+/// answer holds `device_code`, `user_code`, `verification_uri`, `interval`
+/// and `expires_in`.
+// ponytail: no rate limit on start or poll. Each call is one request to
+// GitHub, so anyone can spend the OAuth app's quota there and block sign-ins
+// while it lasts. Add a per-IP limit to both if that appears.
+async fn device_start(State(state): State<AppState>) -> Response {
+    match state.github.request_device_code().await {
+        Ok(code) => Json(code).into_response(),
+        Err(e) => not_signed_in(e),
+    }
 }
 
 #[derive(Deserialize)]
-struct GithubCallbackParams {
-    code: String,
-    state: Option<String>,
+struct PollRequest {
+    device_code: String,
 }
 
-async fn github_callback(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(params): Query<GithubCallbackParams>,
-) -> impl IntoResponse {
-    if !oauth_state_matches(&headers, params.state.as_deref()) {
+/// Asks GitHub once whether the user has entered the code. Once they have,
+/// GitHub's token is used for one profile read and dropped, never stored or
+/// logged, and the user gets a relay session instead.
+async fn device_poll(State(state): State<AppState>, Json(request): Json<PollRequest>) -> Response {
+    // GitHub's device codes are 40 hex characters. Anything far from that is
+    // refused here instead of being sent on.
+    let code = &request.device_code;
+    if code.is_empty() || code.len() > 64 || !code.bytes().all(|b| b.is_ascii_graphic()) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "OAuth state mismatch" })),
+            Json(json!({ "error": "Invalid device code" })),
         )
             .into_response();
     }
-
-    let oauth = GitHubOAuth::new(
-        &state.github_client_id,
-        &state.github_client_secret,
-        &format!("{}/auth/github/callback", state.base_url),
-    );
-
-    use oauth2::basic::BasicTokenResponse;
-    use oauth2::{AuthorizationCode, TokenResponse};
-
-    // No redirects: the oauth2 crate recommends this to keep the token request
-    // from being bounced to another host (SSRF).
-    let http_client = match reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-    {
-        Ok(c) => artemis_auth::OAuthHttp(c),
-        Err(e) => {
-            tracing::error!("Failed to build the HTTP client: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "OAuth failed" })),
-            )
-                .into_response();
-        }
+    let profile = match state.github.poll_device_token(&request.device_code).await {
+        Ok(access_token) => state.github.fetch_user(&access_token).await,
+        Err(e) => Err(e),
     };
-
-    // Exchange code for token
-    let token_result: Result<BasicTokenResponse, _> = oauth
-        .client()
-        .exchange_code(AuthorizationCode::new(params.code))
-        .request_async(&http_client)
-        .await;
-
-    let token: BasicTokenResponse = match token_result {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!("OAuth token exchange failed: {}", e);
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "OAuth failed", "detail": e.to_string() })),
-            )
-                .into_response();
-        }
+    let profile = match profile {
+        Ok(profile) => profile,
+        Err(e) => return not_signed_in(e),
     };
-
-    let access_token = token.access_token().secret();
-
-    // Fetch GitHub user profile
-    let gh_user = match GitHubOAuth::fetch_user(access_token).await {
-        Ok(u) => u,
+    match db::sign_in(&state.db, &profile).await {
+        Ok((user, token)) => Json(DevicePoll::Complete {
+            token,
+            username: user.username,
+            avatar_url: user.avatar_url,
+        })
+        .into_response(),
         Err(e) => {
-            tracing::error!("Failed to fetch GitHub user: {}", e);
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "Failed to fetch user profile" })),
-            )
-                .into_response();
-        }
-    };
-
-    // Generate auth token for Artemis
-    let artemis_token = Uuid::new_v4().to_string();
-
-    // Find or create user
-    match db::find_user_by_github_id(&state.db, gh_user.id).await {
-        Ok(Some(existing)) => {
-            // Update token
-            let _ = db::update_user_token(&state.db, existing.id, &artemis_token).await;
-        }
-        Ok(None) => {
-            // Create new user
-            let _ = db::create_user(
-                &state.db,
-                &gh_user.login,
-                gh_user.name.as_deref(),
-                gh_user.avatar_url.as_deref(),
-                gh_user.id,
-                &artemis_token,
-            )
-            .await;
-        }
-        Err(e) => {
-            tracing::error!("DB error: {}", e);
-            return (
+            tracing::error!("Cannot sign in GitHub user {}: {e}", profile.id);
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": "Database error" })),
             )
+                .into_response()
+        }
+    }
+}
+
+/// The answer to a device flow request that gave no profile: one of the
+/// states the client keeps polling through, or 502 when GitHub refused.
+fn not_signed_in(e: DeviceFlowError) -> Response {
+    let state = match e {
+        DeviceFlowError::Pending => DevicePoll::Pending,
+        DeviceFlowError::SlowDown { interval } => DevicePoll::SlowDown { interval },
+        DeviceFlowError::Denied => DevicePoll::Denied,
+        DeviceFlowError::Expired => DevicePoll::Expired,
+        e => {
+            tracing::warn!("GitHub sign-in failed: {e}");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": "GitHub sign-in failed" })),
+            )
                 .into_response();
         }
     };
-
-    // Return the token — the client will use this to connect via WebSocket
-    Json(json!({
-        "token": artemis_token,
-        "github_username": gh_user.login,
-        "avatar_url": gh_user.avatar_url,
-    }))
-    .into_response()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn cookies(value: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(header::COOKIE, value.parse().unwrap());
-        headers
-    }
-
-    #[test]
-    fn oauth_state_must_match_the_cookie() {
-        let headers = cookies("theme=dark; artemis_oauth_state=abc123");
-        assert!(oauth_state_matches(&headers, Some("abc123")));
-        assert!(!oauth_state_matches(&headers, Some("other")));
-        assert!(!oauth_state_matches(&headers, None));
-        assert!(!oauth_state_matches(&HeaderMap::new(), Some("abc123")));
-        assert!(!oauth_state_matches(
-            &cookies("artemis_oauth_state="),
-            Some("")
-        ));
-        assert!(!oauth_state_matches(
-            &cookies("artemis_oauth_state_x=abc123"),
-            Some("abc123")
-        ));
-    }
+    Json(state).into_response()
 }

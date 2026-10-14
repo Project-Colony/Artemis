@@ -35,9 +35,6 @@ base64 = "0.23.1"
 iced = { version = "0.14.0", features = ["tokio", "svg", "image"] }
 
 # Auth
-# Without its reqwest feature: oauth2 5 builds on reqwest 0.12, so the token
-# exchange goes through our own client instead (artemis_auth::oauth_http).
-oauth2 = { version = "5.0.0", default-features = false }
 # The features reqwest 0.12 enabled by default, with the OS TLS stack (0.13
 # switched its default to rustls on aws-lc-rs), plus json, form and query.
 reqwest = { version = "0.13.5", default-features = false, features = ["native-tls", "charset", "http2", "system-proxy", "json", "form", "query"] }
@@ -64,7 +61,6 @@ open = "5.4.4"
 
 # Server (kept as optional relay)
 axum = { version = "0.8.9", features = ["ws"] }
-axum-extra = { version = "0.12.6", features = ["typed-header"] }
 tower-http = { version = "0.7.1", features = ["trace"] }
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json"] }
 dotenvy = "0.15.7"

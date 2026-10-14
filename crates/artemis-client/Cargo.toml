@@ -13,7 +13,6 @@ path = "src/main.rs"
 
 [dependencies]
 artemis-core = { path = "../artemis-core" }
-artemis-auth = { path = "../artemis-auth" }
 artemis-p2p = { path = "../artemis-p2p" }
 iced = { workspace = true }
 serde = { workspace = true }
@@ -27,3 +26,7 @@ futures = { workspace = true }
 reqwest = { workspace = true }
 open = { workspace = true }
 tokio-tungstenite = { workspace = true }
+
+[dev-dependencies]
+# A stub relay for the sign-in and session tests.
+axum = { workspace = true }

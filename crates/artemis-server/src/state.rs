@@ -16,7 +16,6 @@ pub struct AppState {
     pub presence: Arc<Mutex<()>>,
     /// A permit for each socket that has not signed in yet.
     pub unauthenticated: Arc<Semaphore>,
-    pub github_client_id: String,
-    pub github_client_secret: String,
-    pub base_url: String,
+    /// The relay's OAuth app on GitHub, which signs users in.
+    pub github: artemis_auth::GitHub,
 }

@@ -14,9 +14,7 @@ use state::AppState;
 struct Config {
     database_url: String,
     bind_addr: String,
-    base_url: String,
     github_client_id: String,
-    github_client_secret: String,
 }
 
 impl Config {
@@ -31,33 +29,17 @@ impl Config {
             ),
         };
 
-        let base_url = var("BASE_URL").unwrap_or_else(|| "http://localhost:3000".to_string());
-        let base_url = base_url.trim_end_matches('/').to_string();
-        // The OAuth handlers build the redirect URL from this on every login,
-        // and the state cookie is Secure only for https. A value without its
-        // scheme, such as localhost:3000, still parses as a URL, so check the
-        // scheme and host once here rather than failing on each login.
-        let web_url = oauth2::url::Url::parse(&base_url)
-            .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some());
-        anyhow::ensure!(
-            web_url,
-            "BASE_URL {base_url:?} is not an http:// or https:// URL"
-        );
-
         Ok(Self {
             database_url: required("DATABASE_URL")?,
             bind_addr: var("BIND_ADDR").unwrap_or_else(|| "127.0.0.1:3000".to_string()),
-            base_url,
             github_client_id: required("GITHUB_CLIENT_ID")?,
-            github_client_secret: required("GITHUB_CLIENT_SECRET")?,
         })
     }
 }
 
 /// Describes a .env error without the offending line. dotenvy's own message
 /// prints that line in full, and after an unclosed quote every line up to the
-/// end of the file, which can include the database password or the GitHub
-/// secret.
+/// end of the file, which can include the database password.
 fn dotenv_error(e: dotenvy::Error) -> anyhow::Error {
     let dotenvy::Error::LineParse(line, _) = &e else {
         return anyhow::Error::new(e).context("cannot read .env");
@@ -122,9 +104,8 @@ async fn main() -> anyhow::Result<()> {
         connections: ws::new_connection_map(),
         presence: Default::default(),
         unauthenticated: std::sync::Arc::new(tokio::sync::Semaphore::new(ws::MAX_UNAUTHENTICATED)),
-        github_client_id: config.github_client_id,
-        github_client_secret: config.github_client_secret,
-        base_url: config.base_url,
+        github: artemis_auth::GitHub::new(&config.github_client_id)
+            .context("cannot set up the HTTPS client for GitHub")?,
     };
 
     let app = router(app_state);
@@ -151,13 +132,12 @@ mod tests {
         Config::from_lookup(|name| env.get(name).cloned())
     }
 
-    const COMPLETE: [(&str, &str); 3] = [
+    const COMPLETE: [(&str, &str); 2] = [
         (
             "DATABASE_URL",
             "postgres://artemis:secret@localhost:5432/artemis",
         ),
         ("GITHUB_CLIENT_ID", "id"),
-        ("GITHUB_CLIENT_SECRET", "secret"),
     ];
 
     #[test]
@@ -179,35 +159,12 @@ mod tests {
     fn defaults_bind_to_loopback() {
         let config = config_from(&COMPLETE).unwrap();
         assert_eq!(config.bind_addr, "127.0.0.1:3000");
-        assert_eq!(config.base_url, "http://localhost:3000");
-    }
-
-    #[test]
-    fn base_url_must_be_absolute() {
-        let mut env = COMPLETE.to_vec();
-        env.push(("BASE_URL", "/relay"));
-        assert!(config_from(&env).is_err());
-
-        // The first two still parse as URLs, with the host name as the scheme.
-        for scheme_less in [
-            "localhost:3000",
-            "relay.example.com:3000",
-            "ftp://relay.example",
-        ] {
-            env.pop();
-            env.push(("BASE_URL", scheme_less));
-            let err = config_from(&env).err().unwrap().to_string();
-            assert!(err.contains("http://"), "{err}");
-        }
-
-        env.pop();
-        env.push(("BASE_URL", "https://relay.example/"));
-        assert_eq!(config_from(&env).unwrap().base_url, "https://relay.example");
     }
 
     #[test]
     fn unparsable_env_line_names_its_key_but_not_its_value() {
-        let env_file = "DATABASE_URL=postgres://artemis:pa'ss@localhost/artemis\nGITHUB_CLIENT_SECRET=s3cret\n";
+        let env_file =
+            "DATABASE_URL=postgres://artemis:pa'ss@localhost/artemis\nPOSTGRES_PASSWORD=s3cret\n";
         let e = dotenvy::from_read_iter(env_file.as_bytes())
             .find_map(Result::err)
             .unwrap();

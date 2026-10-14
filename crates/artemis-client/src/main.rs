@@ -7,10 +7,11 @@ mod net;
 mod theme;
 mod views;
 
-use futures::channel::mpsc::Sender;
-use futures::SinkExt;
-use iced::widget::{container, row};
-use iced::{Element, Font, Length, Task as IcedTask};
+use std::collections::HashMap;
+
+use iced::alignment::Vertical;
+use iced::widget::{button, column, container, row, text, Space};
+use iced::{Background, Color, Element, Font, Length, Padding, Task as IcedTask};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -18,11 +19,13 @@ use artemis_core::limits::MAX_MESSAGE_CHARS;
 use artemis_core::models::message::Message;
 use artemis_core::models::user::{MemberRole, ServerMember, User, UserStatus};
 use artemis_core::protocol::{
-    ClientEvent, FriendPayload, FriendRequestPayload, ServerEvent, ServerPayload,
+    ClientEvent, FriendPayload, FriendRequestPayload, MemberPayload, ServerEvent, ServerPayload,
 };
 
 use artemis_p2p::crypto::{Identity, Purpose};
 
+use theme::{colors, icons};
+use views::chat_area::Outgoing;
 use views::{
     channel_sidebar, chat_area, friend_list, login_screen, member_list, server_list,
     ChannelSidebarMsg, ChatAreaMsg, FriendListMsg, LoginMsg, LoginState, MemberListMsg,
@@ -43,11 +46,17 @@ pub const FONT_BOLD: Font = Font {
     ..Font::with_name("JetBrainsMono Nerd Font")
 };
 
-/// GitHub OAuth App Client ID.
-const GITHUB_CLIENT_ID: &str = "Ov23liYMgdGLfkOKDQya";
+/// Shown in place of a direct message that does not decrypt.
+const UNREADABLE: &str = "[This message could not be decrypted]";
 
-/// Default server URL (can be overridden later).
+/// The relay, until the client lets the user choose one.
 const DEFAULT_SERVER_URL: &str = "http://localhost:3000";
+
+fn relay_url() -> reqwest::Url {
+    DEFAULT_SERVER_URL
+        .parse()
+        .expect("the default relay URL is valid")
+}
 
 fn main() -> iced::Result {
     // Answered before any window, so the release workflow can smoke-test the
@@ -83,21 +92,32 @@ struct Artemis {
     // Login state
     login_state: LoginState,
 
-    // Server connection
+    // Relay session
+    /// Events to the relay, while a socket is open.
     client_tx: Option<mpsc::UnboundedSender<ClientEvent>>,
+    /// The session task. Dropping it closes the socket and stops reconnecting.
+    session: Option<iced::task::Handle>,
+    /// Messages sent but not yet echoed by the relay, by client nonce. Each
+    /// is also in `messages`, under its nonce, until the echo replaces it.
+    outbox: HashMap<Uuid, Outgoing>,
+    /// The last error, shown above the chat until dismissed.
+    banner: Option<String>,
 
     // Identity
-    github_username: String,
-    github_token: String,
     avatar_url: Option<String>,
     identity: Option<Identity>,
 
     // Friend list (from server)
     friends: Vec<FriendPayload>,
+    /// A notice above a direct conversation, by friend: their key changed,
+    /// or why nothing was sent.
+    dm_notices: HashMap<Uuid, String>,
     pending_requests: Vec<FriendRequestPayload>,
     active_friend: Option<String>,
     add_friend_input: String,
     show_add_friend: bool,
+    /// The friend whose removal waits for confirmation.
+    confirm_remove: Option<Uuid>,
 
     // Chat state
     user_id: Option<Uuid>,
@@ -132,25 +152,28 @@ enum AppMessage {
     ChatArea(ChatAreaMsg),
     MemberList(MemberListMsg),
 
-    // GitHub Device Flow
+    // Sign-in through the relay
     DeviceCodeReceived {
-        device_code: String,
         user_code: String,
-        verification_uri: String,
-        interval: u64,
     },
     DeviceFlowError(String),
-    GitHubTokenReceived(String),
-    GitHubUserFetched {
+    SignedIn {
+        /// The relay's session token.
+        token: String,
         username: String,
         avatar_url: Option<String>,
-        token: String,
     },
 
-    // Server connection
+    // Relay session
     Connected(mpsc::UnboundedSender<ClientEvent>),
+    /// The socket ended, with why. The session reconnects on its own.
+    Disconnected(String),
+    /// A socket could not be opened. The session tries again on its own.
     ConnectionFailed(String),
     ServerEventReceived(ServerEvent),
+    DismissBanner,
+    /// Hide the notice above the conversation with this friend.
+    DismissNotice(Uuid),
 }
 
 impl Artemis {
@@ -160,15 +183,18 @@ impl Artemis {
                 screen: AppScreen::Login,
                 login_state: LoginState::Idle,
                 client_tx: None,
-                github_username: String::new(),
-                github_token: String::new(),
+                session: None,
+                outbox: HashMap::new(),
+                banner: None,
                 avatar_url: None,
                 identity: None,
                 friends: Vec::new(),
+                dm_notices: HashMap::new(),
                 pending_requests: Vec::new(),
                 active_friend: None,
                 add_friend_input: String::new(),
                 show_add_friend: false,
+                confirm_remove: None,
                 user_id: None,
                 username: String::new(),
                 servers: Vec::new(),
@@ -192,197 +218,70 @@ impl Artemis {
             // ── Login ──
             AppMessage::Login(LoginMsg::SignInWithGitHub) => {
                 self.login_state = LoginState::Polling;
-
-                let client_id = GITHUB_CLIENT_ID.to_string();
-
-                return IcedTask::perform(
-                    async move { artemis_auth::request_device_code(&client_id).await },
-                    |result| match result {
-                        Ok(resp) => AppMessage::DeviceCodeReceived {
-                            device_code: resp.device_code,
-                            user_code: resp.user_code,
-                            verification_uri: resp.verification_uri,
-                            interval: resp.interval,
-                        },
-                        Err(e) => AppMessage::DeviceFlowError(e.to_string()),
-                    },
-                );
+                return IcedTask::run(net::sign_in(relay_url()), |msg| msg);
             }
 
-            AppMessage::DeviceCodeReceived {
-                device_code,
-                user_code,
-                verification_uri,
-                interval,
-            } => {
-                self.login_state = LoginState::WaitingForCode {
-                    user_code: user_code.clone(),
-                    verification_uri: verification_uri.clone(),
-                };
-
-                let _ = open::that(&verification_uri);
-
-                let client_id = GITHUB_CLIENT_ID.to_string();
-                let dc = device_code.clone();
-
-                return IcedTask::run(
-                    iced::stream::channel(8, move |mut output: Sender<AppMessage>| async move {
-                        let poll_interval = std::time::Duration::from_secs(interval.max(5));
-                        loop {
-                            tokio::time::sleep(poll_interval).await;
-                            match artemis_auth::poll_device_token(&client_id, &dc).await {
-                                Ok(resp) => {
-                                    if let Some(token) = resp.access_token {
-                                        let _ = output
-                                            .send(AppMessage::GitHubTokenReceived(token))
-                                            .await;
-                                        return;
-                                    }
-                                    if let Some(error) = &resp.error {
-                                        match error.as_str() {
-                                            "authorization_pending" => continue,
-                                            "slow_down" => {
-                                                tokio::time::sleep(std::time::Duration::from_secs(
-                                                    5,
-                                                ))
-                                                .await;
-                                                continue;
-                                            }
-                                            "expired_token" => {
-                                                let _ = output
-                                                    .send(AppMessage::DeviceFlowError(
-                                                        "Code expired, please try again"
-                                                            .to_string(),
-                                                    ))
-                                                    .await;
-                                                return;
-                                            }
-                                            "access_denied" => {
-                                                let _ = output
-                                                    .send(AppMessage::DeviceFlowError(
-                                                        "Access denied by user".to_string(),
-                                                    ))
-                                                    .await;
-                                                return;
-                                            }
-                                            other => {
-                                                let desc = resp
-                                                    .error_description
-                                                    .unwrap_or_else(|| other.to_string());
-                                                let _ = output
-                                                    .send(AppMessage::DeviceFlowError(desc))
-                                                    .await;
-                                                return;
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    let _ = output
-                                        .send(AppMessage::DeviceFlowError(e.to_string()))
-                                        .await;
-                                    return;
-                                }
-                            }
-                        }
-                    }),
-                    |msg| msg,
-                );
+            AppMessage::DeviceCodeReceived { user_code } => {
+                self.login_state = LoginState::WaitingForCode { user_code };
+                // The page is on screen too, so a browser that does not open
+                // is not an error.
+                let _ = open::that(net::GITHUB_DEVICE_PAGE);
             }
 
-            AppMessage::GitHubTokenReceived(token) => {
-                self.login_state = LoginState::Initializing;
-                let t = token.clone();
-
-                return IcedTask::perform(
-                    async move { artemis_auth::GitHubOAuth::fetch_user(&t).await },
-                    move |result| match result {
-                        Ok(user) => AppMessage::GitHubUserFetched {
-                            username: user.login,
-                            avatar_url: user.avatar_url,
-                            token: token.clone(),
-                        },
-                        Err(e) => AppMessage::DeviceFlowError(format!(
-                            "Failed to fetch GitHub profile: {}",
-                            e
-                        )),
-                    },
-                );
+            AppMessage::DeviceFlowError(err) => {
+                self.login_state = LoginState::Error(err);
             }
 
-            AppMessage::GitHubUserFetched {
+            AppMessage::SignedIn {
+                token,
                 username,
                 avatar_url,
-                token,
             } => {
-                self.github_username = username.clone();
-                self.github_token = token.clone();
                 self.avatar_url = avatar_url;
                 self.username = username;
-                self.login_state = LoginState::Idle;
+                self.login_state = LoginState::Initializing;
 
                 // Generate E2E identity
                 let identity = Identity::generate();
-                let public_key = identity.public_key_b64();
-                self.identity = Some(identity);
                 tracing::info!(
                     "E2E identity generated, public key: {}...",
-                    &public_key[..8]
+                    &identity.public_key_b64()[..8]
                 );
+                self.identity = Some(identity);
 
-                // Connect to server relay
-                let server_url = DEFAULT_SERVER_URL.to_string();
-                let tk = token;
-                let pk = public_key;
-
-                return IcedTask::run(
-                    iced::stream::channel(64, move |mut output: Sender<AppMessage>| async move {
-                        match net::connect(&server_url, tk).await {
-                            Ok((tx, mut rx)) => {
-                                // Publish public key
-                                let _ = tx.send(ClientEvent::PublishPublicKey { public_key: pk });
-                                // Fetch friends and requests
-                                let _ = tx.send(ClientEvent::FetchFriends);
-                                let _ = tx.send(ClientEvent::FetchFriendRequests);
-
-                                // Send connection handle
-                                let _ = output.send(AppMessage::Connected(tx)).await;
-
-                                // Forward all server events to the UI
-                                while let Some(event) = rx.recv().await {
-                                    if output
-                                        .send(AppMessage::ServerEventReceived(event))
-                                        .await
-                                        .is_err()
-                                    {
-                                        break;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                let _ = output
-                                    .send(AppMessage::ConnectionFailed(e.to_string()))
-                                    .await;
-                            }
-                        }
-                    }),
-                    |msg| msg,
-                );
+                // Replacing an older session stops it.
+                let (task, handle) =
+                    IcedTask::run(net::session(relay_url(), token), |msg| msg).abortable();
+                self.session = Some(handle.abort_on_drop());
+                return task;
             }
 
             AppMessage::Connected(tx) => {
                 tracing::info!("Connected to relay server");
                 self.client_tx = Some(tx);
                 self.screen = AppScreen::Chat;
+                // A connection error is over once connected again.
+                self.banner = None;
+            }
+
+            AppMessage::Disconnected(reason) => {
+                tracing::warn!("Lost the connection to the relay: {}", reason);
+                self.client_tx = None;
+                self.fail_pending();
             }
 
             AppMessage::ConnectionFailed(e) => {
-                tracing::warn!("Server connection failed: {} — using offline mode", e);
+                tracing::warn!("Cannot reach the relay: {}", e);
+                self.banner = Some(format!("Cannot reach the relay: {e}"));
                 self.screen = AppScreen::Chat;
             }
 
-            AppMessage::DeviceFlowError(err) => {
-                self.login_state = LoginState::Error(err);
+            AppMessage::DismissBanner => {
+                self.banner = None;
+            }
+
+            AppMessage::DismissNotice(friend_id) => {
+                self.dm_notices.remove(&friend_id);
             }
 
             AppMessage::Login(LoginMsg::UseMockData) => {
@@ -435,7 +334,6 @@ impl Artemis {
                     .map(|ch| ch.id);
                 self.user_id = Some(Uuid::nil());
                 self.username = "You".to_string();
-                self.github_username = "demo-user".to_string();
 
                 // Mock friends
                 self.friends = vec![
@@ -471,6 +369,22 @@ impl Artemis {
             // ── Friend list ──
             AppMessage::FriendList(FriendListMsg::SelectFriend(username)) => {
                 self.active_friend = Some(username);
+                self.confirm_remove = None;
+            }
+            AppMessage::FriendList(FriendListMsg::AskRemove(user_id)) => {
+                self.confirm_remove = Some(user_id);
+            }
+            AppMessage::FriendList(FriendListMsg::CancelRemove) => {
+                self.confirm_remove = None;
+            }
+            AppMessage::FriendList(FriendListMsg::ConfirmRemove(user_id)) => {
+                // The friend leaves the list once the relay confirms, with
+                // FriendRemoved. Offline, the confirmation stays open.
+                if let Some(tx) = &self.client_tx {
+                    if tx.send(ClientEvent::RemoveFriend { user_id }).is_ok() {
+                        self.confirm_remove = None;
+                    }
+                }
             }
             AppMessage::FriendList(FriendListMsg::AddFriendInputChanged(val)) => {
                 self.add_friend_input = val;
@@ -521,43 +435,7 @@ impl Artemis {
 
             AppMessage::ServerList(ServerListMsg::SelectServer(idx)) => {
                 self.is_home = false;
-                self.active_server_idx = idx;
-                if let Some(server) = self.servers.get(idx) {
-                    self.active_channel_id = server
-                        .categories
-                        .first()
-                        .and_then(|c| c.channels.first())
-                        .map(|ch| ch.id);
-
-                    self.members = server
-                        .members
-                        .iter()
-                        .map(|m| ServerMember {
-                            user: User {
-                                id: m.user_id,
-                                username: m.username.clone(),
-                                display_name: Some(m.username.clone()),
-                                avatar_url: m.avatar_url.clone(),
-                                github_id: None,
-                                public_key: None,
-                                status: m.status,
-                                custom_status: m.custom_status.clone(),
-                                created_at: chrono::Utc::now(),
-                            },
-                            role: m.role,
-                            joined_at: chrono::Utc::now(),
-                        })
-                        .collect();
-
-                    if let (Some(channel_id), Some(tx)) = (self.active_channel_id, &self.client_tx)
-                    {
-                        let _ = tx.send(ClientEvent::FetchMessages {
-                            channel_id,
-                            before: None,
-                            limit: 50,
-                        });
-                    }
-                }
+                self.open_server(idx, None);
             }
             AppMessage::ChannelSidebar(ChannelSidebarMsg::SelectChannel(id)) => {
                 self.active_channel_id = Some(id);
@@ -590,36 +468,46 @@ impl Artemis {
                         // DM mode: send E2E encrypted message through server relay
                         self.send_dm();
                     } else if let Some(channel_id) = self.active_channel_id {
-                        let reply_id = self.reply_to_id.take();
-                        // Server channel mode
-                        if let Some(tx) = &self.client_tx {
-                            let _ = tx.send(ClientEvent::SendMessage {
+                        let content = self.message_input.clone();
+                        let reply_to_id = self.reply_to_id;
+                        let sent = if self.is_mock {
+                            let msg = self.local_message(
+                                Uuid::new_v4(),
                                 channel_id,
-                                content: self.message_input.clone(),
-                                reply_to_id: reply_id,
-                            });
-                            self.message_input.clear();
-                        } else {
-                            // Offline/mock
-                            let msg = Message {
-                                id: Uuid::new_v4(),
-                                channel_id,
-                                author_id: self.user_id.unwrap_or(Uuid::nil()),
-                                author_name: self.username.clone(),
-                                author_avatar: None,
-                                content: self.message_input.clone(),
-                                attachments: vec![],
-                                timestamp: chrono::Utc::now(),
-                                edited_at: None,
-                                reply_to_id: reply_id,
-                                pinned: false,
-                                reactions: vec![],
-                            };
+                                content,
+                                reply_to_id,
+                            );
                             self.messages.push(msg);
+                            true
+                        } else {
+                            let nonce = Uuid::new_v4();
+                            let event = ClientEvent::SendMessage {
+                                channel_id,
+                                content: content.clone(),
+                                reply_to_id,
+                                client_nonce: Some(nonce),
+                            };
+                            self.send_pending(nonce, event, channel_id, content, reply_to_id)
+                        };
+                        // Offline, the text and the reply wait in the input.
+                        if sent {
                             self.message_input.clear();
+                            self.reply_to_id = None;
                         }
                     }
                 }
+            }
+            AppMessage::ChatArea(ChatAreaMsg::Retry(nonce)) => {
+                // The same nonce, so the echo replaces this message.
+                if let (Some(tx), Some(out)) = (&self.client_tx, self.outbox.get_mut(&nonce)) {
+                    if tx.send(out.event.clone()).is_ok() {
+                        out.failed = false;
+                    }
+                }
+            }
+            AppMessage::ChatArea(ChatAreaMsg::Discard(nonce)) => {
+                self.outbox.remove(&nonce);
+                self.messages.retain(|m| m.id != nonce);
             }
             AppMessage::ChatArea(ChatAreaMsg::LoadOlderMessages) => {
                 if let Some(channel_id) = self.active_channel_id {
@@ -743,37 +631,87 @@ impl Artemis {
             tracing::error!("No identity available for E2E encryption");
             return;
         };
-        let Some(tx) = &self.client_tx else {
-            return;
-        };
 
         let content = self.message_input.clone();
         let recipient_id = friend.user_id;
 
-        // Encrypt message if friend has a public key
-        let encrypted_content = if let Some(ref pk) = friend.public_key {
+        // The relay must never see a direct message in clear, so without the
+        // friend's key nothing is sent and the text stays in the input.
+        let Some(pk) = &friend.public_key else {
+            let notice = format!(
+                "{} has not published an encryption key yet, so nothing was sent.",
+                friend.username
+            );
+            self.dm_notices.insert(recipient_id, notice);
+            return;
+        };
+        let encrypted_content =
             match identity.encrypt_for_b64(Purpose::DirectMessage, pk, content.as_bytes()) {
                 Ok(enc) => enc,
                 Err(e) => {
                     tracing::error!("E2E encryption failed: {}", e);
                     return;
                 }
-            }
-        } else {
-            tracing::warn!("Friend has no public key, sending unencrypted");
-            content.clone()
-        };
+            };
 
-        let _ = tx.send(ClientEvent::SendDirectMessage {
+        let nonce = Uuid::new_v4();
+        let event = ClientEvent::SendDirectMessage {
             recipient_id,
             encrypted_content,
-        });
-
-        // Optimistic local display
+            client_nonce: Some(nonce),
+        };
         let dm_channel_id = self.dm_channel_id(recipient_id);
-        let msg = Message {
-            id: Uuid::new_v4(),
-            channel_id: dm_channel_id,
+        if self.send_pending(nonce, event, dm_channel_id, content, None) {
+            self.message_input.clear();
+        }
+    }
+
+    /// Whether events cannot reach the relay right now. The demo never
+    /// connects, so it is never offline.
+    fn offline(&self) -> bool {
+        !self.is_mock && self.client_tx.is_none()
+    }
+
+    /// Queues `event`, which sends a message under `nonce`, and shows the
+    /// message as pending until the relay echoes it. Returns false, with
+    /// nothing queued or shown, while offline.
+    fn send_pending(
+        &mut self,
+        nonce: Uuid,
+        event: ClientEvent,
+        channel_id: Uuid,
+        content: String,
+        reply_to_id: Option<Uuid>,
+    ) -> bool {
+        let Some(tx) = &self.client_tx else {
+            return false;
+        };
+        if tx.send(event.clone()).is_err() {
+            return false;
+        }
+        self.outbox.insert(
+            nonce,
+            Outgoing {
+                event,
+                failed: false,
+            },
+        );
+        let pending = self.local_message(nonce, channel_id, content, reply_to_id);
+        self.messages.push(pending);
+        true
+    }
+
+    /// A message written by the user, as shown before the relay stores it.
+    fn local_message(
+        &self,
+        id: Uuid,
+        channel_id: Uuid,
+        content: String,
+        reply_to_id: Option<Uuid>,
+    ) -> Message {
+        Message {
+            id,
+            channel_id,
             author_id: self.user_id.unwrap_or(Uuid::nil()),
             author_name: self.username.clone(),
             author_avatar: self.avatar_url.clone(),
@@ -781,20 +719,69 @@ impl Artemis {
             attachments: vec![],
             timestamp: chrono::Utc::now(),
             edited_at: None,
-            reply_to_id: None,
+            reply_to_id,
             pinned: false,
             reactions: vec![],
-        };
-        self.messages.push(msg);
-        self.message_input.clear();
+        }
     }
 
-    /// Derive a deterministic DM channel ID from two user IDs.
-    /// Text to show for a direct message exchanged with `friend_id`.
-    ///
-    /// Without a public key for the friend, the message came through the
-    /// plaintext fallback and is shown as is. With one, a message that does
-    /// not decrypt is never shown as its raw content: the relay could have
+    /// Adds `message` from the relay once. When `nonce` names a pending
+    /// message, the stored one takes its place.
+    fn settle(&mut self, nonce: Option<Uuid>, message: Message) {
+        let pending = nonce
+            .filter(|n| self.outbox.remove(n).is_some())
+            .and_then(|n| self.messages.iter().position(|m| m.id == n));
+        if self.messages.iter().any(|m| m.id == message.id) {
+            if let Some(i) = pending {
+                self.messages.remove(i);
+            }
+        } else if let Some(i) = pending {
+            self.messages[i] = message;
+        } else {
+            self.messages.push(message);
+        }
+    }
+
+    /// Marks every message still waiting for its echo as not sent. None is
+    /// re-sent on its own, so none can arrive twice: each waits for Retry.
+    fn fail_pending(&mut self) {
+        for out in self.outbox.values_mut() {
+            out.failed = true;
+        }
+    }
+
+    /// Shows server `idx`: its members, and `channel` when it is one of its
+    /// channels or else its first channel, whose history is fetched.
+    fn open_server(&mut self, idx: usize, channel: Option<Uuid>) {
+        self.active_server_idx = idx;
+        let Some(server) = self.servers.get(idx) else {
+            self.active_channel_id = None;
+            self.members.clear();
+            return;
+        };
+        let channels: Vec<Uuid> = server
+            .categories
+            .iter()
+            .flat_map(|c| &c.channels)
+            .map(|ch| ch.id)
+            .collect();
+        self.active_channel_id = channel
+            .filter(|id| channels.contains(id))
+            .or(channels.first().copied());
+        self.members = server.members.iter().map(server_member).collect();
+
+        if let (Some(channel_id), Some(tx)) = (self.active_channel_id, &self.client_tx) {
+            let _ = tx.send(ClientEvent::FetchMessages {
+                channel_id,
+                before: None,
+                limit: 50,
+            });
+        }
+    }
+
+    /// Text to show for a direct message exchanged with `friend_id`. A message
+    /// that does not decrypt with the friend's key, or that came while they
+    /// had none, is never shown as its raw content: the relay could have
     /// written it.
     fn dm_text(&self, friend_id: Uuid, sent_by_us: bool, content: String) -> String {
         let Some(pk) = self
@@ -803,7 +790,7 @@ impl Artemis {
             .find(|f| f.user_id == friend_id)
             .and_then(|f| f.public_key.as_deref())
         else {
-            return content;
+            return UNREADABLE.to_string();
         };
         self.identity
             .as_ref()
@@ -816,7 +803,7 @@ impl Artemis {
                 .ok()
             })
             .and_then(|plaintext| String::from_utf8(plaintext).ok())
-            .unwrap_or_else(|| "[This message could not be decrypted]".to_string())
+            .unwrap_or_else(|| UNREADABLE.to_string())
     }
 
     /// Whether the user may pin in the active server. The relay lets only
@@ -829,6 +816,7 @@ impl Artemis {
             })
     }
 
+    /// Derive a deterministic DM channel ID from two user IDs.
     fn dm_channel_id(&self, other_user_id: Uuid) -> Uuid {
         let my_id = self.user_id.unwrap_or(Uuid::nil());
         let (a, b) = if my_id < other_user_id {
@@ -848,54 +836,37 @@ impl Artemis {
             } => {
                 self.user_id = Some(user_id);
                 self.username = username;
+                // After a reconnection, the server and channel on screen stay
+                // when they still exist.
+                let shown = self.servers.get(self.active_server_idx).map(|s| s.id);
                 self.servers = servers;
-                self.active_channel_id = self
-                    .servers
-                    .first()
-                    .and_then(|s| s.categories.first())
-                    .and_then(|c| c.channels.first())
-                    .map(|ch| ch.id);
-
-                self.members.clear();
-                if let Some(server) = self.servers.first() {
-                    for m in &server.members {
-                        self.members.push(ServerMember {
-                            user: User {
-                                id: m.user_id,
-                                username: m.username.clone(),
-                                display_name: Some(m.username.clone()),
-                                avatar_url: m.avatar_url.clone(),
-                                github_id: None,
-                                public_key: None,
-                                status: m.status,
-                                custom_status: m.custom_status.clone(),
-                                created_at: chrono::Utc::now(),
-                            },
-                            role: m.role,
-                            joined_at: chrono::Utc::now(),
-                        });
-                    }
-                }
-
+                let idx = shown
+                    .and_then(|id| self.servers.iter().position(|s| s.id == id))
+                    .unwrap_or(0);
+                self.open_server(idx, self.active_channel_id);
                 self.screen = AppScreen::Chat;
 
-                if let (Some(channel_id), Some(tx)) = (self.active_channel_id, &self.client_tx) {
-                    let _ = tx.send(ClientEvent::FetchMessages {
-                        channel_id,
-                        before: None,
-                        limit: 50,
+                // Each socket publishes the key and reloads the friend list.
+                if let (Some(tx), Some(identity)) = (&self.client_tx, &self.identity) {
+                    let _ = tx.send(ClientEvent::PublishPublicKey {
+                        public_key: identity.public_key_b64(),
                     });
+                    let _ = tx.send(ClientEvent::FetchFriends);
+                    let _ = tx.send(ClientEvent::FetchFriendRequests);
                 }
             }
             ServerEvent::AuthError { reason } => {
+                // The session is void: stop its socket and its reconnections.
+                self.session = None;
+                self.client_tx = None;
+                self.fail_pending();
                 self.login_state = LoginState::Error(reason);
                 self.screen = AppScreen::Login;
             }
-            ServerEvent::MessageReceived { message } => {
-                if !self.messages.iter().any(|m| m.id == message.id) {
-                    self.messages.push(message);
-                }
-            }
+            ServerEvent::MessageReceived {
+                message,
+                client_nonce,
+            } => self.settle(client_nonce, message),
             ServerEvent::MessageEdited {
                 message_id,
                 content,
@@ -956,7 +927,13 @@ impl Artemis {
             }
             ServerEvent::UserTyping { .. } => {}
             ServerEvent::Error { message } => {
-                tracing::error!("Server error: {}", message);
+                tracing::warn!("Relay error: {}", message);
+                // ponytail: an Error does not name the event it answers, so it
+                // fails every pending message. An echo still replaces one the
+                // relay did store, but a Retry before it would send it twice.
+                // Give Error the client_nonce of a refused send if that shows.
+                self.fail_pending();
+                self.banner = Some(message);
             }
 
             // ── Friend / DM events ──
@@ -1003,6 +980,19 @@ impl Artemis {
                 }
             }
 
+            ServerEvent::FriendRemoved { user_id } => {
+                if let Some(i) = self.friends.iter().position(|f| f.user_id == user_id) {
+                    let friend = self.friends.remove(i);
+                    if self.active_friend.as_deref() == Some(friend.username.as_str()) {
+                        self.active_friend = None;
+                    }
+                }
+                self.dm_notices.remove(&user_id);
+                if self.confirm_remove == Some(user_id) {
+                    self.confirm_remove = None;
+                }
+            }
+
             ServerEvent::FriendRequestDeclined { by_user_id } => {
                 tracing::info!("Friend request declined by {}", by_user_id);
             }
@@ -1023,22 +1013,29 @@ impl Artemis {
                 encrypted_content,
                 timestamp,
                 message_id,
+                client_nonce,
             } => {
-                if self.messages.iter().any(|m| m.id == message_id) {
-                    return;
-                }
-
-                let dm_channel_id = self.dm_channel_id(from_user_id);
-
-                if from_user_id == self.user_id.unwrap_or(Uuid::nil()) {
-                    // Our own echoed message — skip (already added optimistically)
+                if Some(from_user_id) == self.user_id {
+                    // Our own message, echoed to the socket that sent it. The
+                    // pending copy knows the conversation and the text.
+                    let sent = client_nonce
+                        .and_then(|n| self.messages.iter().find(|m| m.id == n))
+                        .cloned();
+                    if let Some(sent) = sent {
+                        let stored = Message {
+                            id: message_id,
+                            timestamp,
+                            ..sent
+                        };
+                        self.settle(client_nonce, stored);
+                    }
                     return;
                 }
                 let content = self.dm_text(from_user_id, false, encrypted_content);
 
                 let msg = Message {
                     id: message_id,
-                    channel_id: dm_channel_id,
+                    channel_id: self.dm_channel_id(from_user_id),
                     author_id: from_user_id,
                     author_name: from_username,
                     author_avatar: None,
@@ -1050,12 +1047,34 @@ impl Artemis {
                     pinned: false,
                     reactions: vec![],
                 };
-                self.messages.push(msg);
+                self.settle(None, msg);
             }
 
             ServerEvent::FriendPresenceUpdate { user_id, status } => {
                 if let Some(friend) = self.friends.iter_mut().find(|f| f.user_id == user_id) {
                     friend.status = status;
+                }
+            }
+
+            ServerEvent::FriendKeyChanged {
+                user_id,
+                public_key,
+            } => {
+                if let Some(friend) = self.friends.iter_mut().find(|f| f.user_id == user_id) {
+                    match friend.public_key.replace(public_key.clone()) {
+                        Some(old) if old != public_key => {
+                            let notice = format!(
+                                "{}'s encryption key changed. New messages use the new key.",
+                                friend.username
+                            );
+                            self.dm_notices.insert(user_id, notice);
+                        }
+                        Some(_) => {}
+                        // A first key: messages to them can be sent now.
+                        None => {
+                            self.dm_notices.remove(&user_id);
+                        }
+                    }
                 }
             }
 
@@ -1303,6 +1322,7 @@ impl Artemis {
                         self.active_friend.as_deref(),
                         &self.add_friend_input,
                         self.show_add_friend,
+                        self.confirm_remove,
                     )
                     .map(AppMessage::FriendList);
 
@@ -1324,11 +1344,19 @@ impl Artemis {
                         &self.search_query,
                         // The relay pins channel messages only.
                         false,
+                        &self.outbox,
                     )
                     .map(AppMessage::ChatArea);
 
+                    let notice = self.active_friend.as_ref().and_then(|uname| {
+                        let friend = self.friends.iter().find(|f| &f.username == uname)?;
+                        let notice = self.dm_notices.get(&friend.user_id)?;
+                        let dismiss = AppMessage::DismissNotice(friend.user_id);
+                        Some(banner(notice, colors::STATUS_IDLE, Some(dismiss)))
+                    });
+
                     main_row = main_row.push(friend_list_view);
-                    main_row = main_row.push(chat_view);
+                    main_row = main_row.push(column![notice, chat_view]);
                 } else {
                     let channel_sidebar_view =
                         channel_sidebar::view_from_payload(active_server, self.active_channel_id)
@@ -1352,6 +1380,7 @@ impl Artemis {
                         reply_msg,
                         &self.search_query,
                         self.can_pin(),
+                        &self.outbox,
                     )
                     .map(AppMessage::ChatArea);
 
@@ -1365,12 +1394,72 @@ impl Artemis {
                     }
                 }
 
-                container(main_row)
+                let mut screen = column![];
+                if self.offline() {
+                    let offline = "Offline. Reconnecting to the relay...";
+                    screen = screen.push(banner(offline, colors::STATUS_IDLE, None));
+                }
+                if let Some(error) = &self.banner {
+                    screen = screen.push(banner(
+                        error,
+                        colors::DANGER,
+                        Some(AppMessage::DismissBanner),
+                    ));
+                }
+                container(screen.push(main_row))
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .into()
             }
         }
+    }
+}
+
+/// A strip above the chat, with a close button when `dismiss` is given.
+fn banner(message: &str, color: Color, dismiss: Option<AppMessage>) -> Element<'_, AppMessage> {
+    let mut content = row![
+        text(message).size(13).color(colors::TEXT_PRIMARY),
+        Space::new().width(Length::Fill),
+    ]
+    .align_y(Vertical::Center);
+    if let Some(dismiss) = dismiss {
+        content = content.push(
+            button(text(icons::CLOSE).size(12).color(colors::TEXT_PRIMARY))
+                .on_press(dismiss)
+                .padding(Padding::from([2, 6]))
+                .style(|_theme, _status| button::Style {
+                    background: None,
+                    text_color: colors::TEXT_PRIMARY,
+                    ..button::Style::default()
+                }),
+        );
+    }
+    container(content)
+        .padding(Padding::from([6, 16]))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(color)),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// A server member as the member list shows it.
+fn server_member(m: &MemberPayload) -> ServerMember {
+    ServerMember {
+        user: User {
+            id: m.user_id,
+            username: m.username.clone(),
+            display_name: Some(m.username.clone()),
+            avatar_url: m.avatar_url.clone(),
+            github_id: None,
+            public_key: None,
+            status: m.status,
+            custom_status: m.custom_status.clone(),
+            created_at: chrono::Utc::now(),
+        },
+        role: m.role,
+        joined_at: chrono::Utc::now(),
     }
 }
 
@@ -1407,6 +1496,299 @@ mod tests {
             sent.try_recv(),
             Ok(ClientEvent::SendMessage { content, .. }) if content == at_cap
         ));
+    }
+
+    const CHANNEL: Uuid = Uuid::from_u128(1);
+
+    /// The app signed in with an open socket, in CHANNEL of its one server.
+    fn connected() -> (Artemis, mpsc::UnboundedReceiver<ClientEvent>) {
+        let (mut app, _) = Artemis::new();
+        let (tx, sent) = mpsc::unbounded_channel();
+        let _ = app.update(AppMessage::Connected(tx));
+        app.user_id = Some(Uuid::from_u128(2));
+        app.username = "ada".to_string();
+        app.is_home = false;
+        app.active_channel_id = Some(CHANNEL);
+        (app, sent)
+    }
+
+    /// Sends `text` in the active channel and returns the nonce it went with.
+    fn send_text(app: &mut Artemis, sent: &mut mpsc::UnboundedReceiver<ClientEvent>) -> Uuid {
+        type_and_send(app, "hello");
+        match sent.try_recv() {
+            Ok(ClientEvent::SendMessage {
+                client_nonce: Some(nonce),
+                ..
+            }) => nonce,
+            other => panic!("expected SendMessage with a nonce, got {other:?}"),
+        }
+    }
+
+    fn event(app: &mut Artemis, event: ServerEvent) {
+        let _ = app.update(AppMessage::ServerEventReceived(event));
+    }
+
+    #[test]
+    fn a_sent_message_shows_pending_and_its_echo_replaces_it_once() {
+        let (mut app, mut sent) = connected();
+        let nonce = send_text(&mut app, &mut sent);
+        assert!(app.message_input.is_empty());
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].id, nonce);
+        assert!(!app.outbox[&nonce].failed);
+
+        let stored = Message {
+            id: Uuid::from_u128(3),
+            ..app.messages[0].clone()
+        };
+        let echo = ServerEvent::MessageReceived {
+            message: stored.clone(),
+            client_nonce: Some(nonce),
+        };
+        event(&mut app, echo.clone());
+        event(&mut app, echo);
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].id, stored.id);
+        assert!(app.outbox.is_empty());
+    }
+
+    #[test]
+    fn a_lost_connection_fails_pending_messages_and_keeps_new_input() {
+        let (mut app, mut sent) = connected();
+        let nonce = send_text(&mut app, &mut sent);
+
+        let _ = app.update(AppMessage::Disconnected("reset".to_string()));
+        assert!(app.offline());
+        assert!(app.outbox[&nonce].failed);
+
+        // Offline, the text and the reply stay in the composer.
+        let _ = app.update(AppMessage::ChatArea(ChatAreaMsg::ReplyTo(nonce)));
+        type_and_send(&mut app, "still here");
+        assert_eq!(app.message_input, "still here");
+        assert_eq!(app.reply_to_id, Some(nonce));
+        assert_eq!(app.messages.len(), 1);
+    }
+
+    #[test]
+    fn retry_sends_the_same_event_again_once_reconnected() {
+        let (mut app, mut sent) = connected();
+        let nonce = send_text(&mut app, &mut sent);
+        let _ = app.update(AppMessage::Disconnected("reset".to_string()));
+        // Nothing goes out while offline.
+        let _ = app.update(AppMessage::ChatArea(ChatAreaMsg::Retry(nonce)));
+        assert!(app.outbox[&nonce].failed);
+
+        let (tx, mut resent) = mpsc::unbounded_channel();
+        let _ = app.update(AppMessage::Connected(tx));
+        let _ = app.update(AppMessage::ChatArea(ChatAreaMsg::Retry(nonce)));
+        assert!(matches!(
+            resent.try_recv(),
+            Ok(ClientEvent::SendMessage { content, client_nonce, .. })
+                if content == "hello" && client_nonce == Some(nonce)
+        ));
+        assert!(!app.outbox[&nonce].failed);
+        assert_eq!(app.messages.len(), 1);
+
+        let _ = app.update(AppMessage::ChatArea(ChatAreaMsg::Discard(nonce)));
+        assert!(app.outbox.is_empty() && app.messages.is_empty());
+    }
+
+    #[test]
+    fn a_relay_error_shows_a_banner_until_dismissed() {
+        let (mut app, _sent) = connected();
+        event(
+            &mut app,
+            ServerEvent::Error {
+                message: "Not a member of this server".to_string(),
+            },
+        );
+        assert_eq!(app.banner.as_deref(), Some("Not a member of this server"));
+        let _ = app.update(AppMessage::DismissBanner);
+        assert_eq!(app.banner, None);
+
+        let _ = app.update(AppMessage::ConnectionFailed("refused".to_string()));
+        assert_eq!(
+            app.banner.as_deref(),
+            Some("Cannot reach the relay: refused")
+        );
+        let (tx, _sent) = mpsc::unbounded_channel();
+        let _ = app.update(AppMessage::Connected(tx));
+        assert_eq!(app.banner, None);
+    }
+
+    #[test]
+    fn an_auth_error_ends_the_session() {
+        let (mut app, _sent) = connected();
+        event(
+            &mut app,
+            ServerEvent::AuthError {
+                reason: "Invalid or expired session".to_string(),
+            },
+        );
+        assert!(app.client_tx.is_none());
+        assert!(matches!(app.screen, AppScreen::Login));
+        assert_eq!(
+            app.login_state,
+            LoginState::Error("Invalid or expired session".to_string())
+        );
+    }
+
+    #[test]
+    fn a_reconnection_keeps_the_channel_on_screen() {
+        let (mut app, mut sent) = connected();
+        let server = |id: u128, channels: &[u128]| ServerPayload {
+            id: Uuid::from_u128(id),
+            name: format!("server {id}"),
+            icon_url: None,
+            categories: vec![artemis_core::protocol::CategoryPayload {
+                id: Uuid::from_u128(id + 100),
+                name: "GENERAL".to_string(),
+                channels: channels
+                    .iter()
+                    .map(|&ch| artemis_core::protocol::ChannelPayload {
+                        id: Uuid::from_u128(ch),
+                        name: format!("channel {ch}"),
+                        channel_type: artemis_core::models::channel::ChannelType::Text,
+                        topic: None,
+                    })
+                    .collect(),
+            }],
+            members: vec![],
+        };
+        let authenticated = |servers| ServerEvent::Authenticated {
+            user_id: Uuid::from_u128(2),
+            username: "ada".to_string(),
+            servers,
+        };
+        event(
+            &mut app,
+            authenticated(vec![server(10, &[11]), server(20, &[21, 22])]),
+        );
+        let _ = app.update(AppMessage::ServerList(ServerListMsg::SelectServer(1)));
+        let _ = app.update(AppMessage::ChannelSidebar(
+            ChannelSidebarMsg::SelectChannel(Uuid::from_u128(22)),
+        ));
+
+        // Server 10 is gone after the reconnection, which moves server 20.
+        event(&mut app, authenticated(vec![server(20, &[21, 22])]));
+        assert_eq!(app.active_server_idx, 0);
+        assert_eq!(app.active_channel_id, Some(Uuid::from_u128(22)));
+        let fetched: Vec<ClientEvent> = std::iter::from_fn(|| sent.try_recv().ok()).collect();
+        assert!(fetched.iter().any(|e| matches!(
+            e,
+            ClientEvent::FetchMessages { channel_id, .. } if *channel_id == Uuid::from_u128(22)
+        )));
+    }
+
+    const BOB: Uuid = Uuid::from_u128(5);
+
+    /// The app connected, with its own identity, in a conversation with Bob,
+    /// whose key is `key`. Returns the app's public key too.
+    fn talking_to_bob(
+        key: Option<String>,
+    ) -> (Artemis, mpsc::UnboundedReceiver<ClientEvent>, String) {
+        let (mut app, sent) = connected();
+        let me = Identity::generate();
+        let my_key = me.public_key_b64();
+        app.identity = Some(me);
+        app.friends = vec![FriendPayload {
+            user_id: BOB,
+            username: "bob".to_string(),
+            display_name: None,
+            avatar_url: None,
+            public_key: key,
+            status: UserStatus::Online,
+        }];
+        app.is_home = true;
+        app.active_friend = Some("bob".to_string());
+        (app, sent, my_key)
+    }
+
+    fn from_bob(id: u128, encrypted_content: String) -> ServerEvent {
+        ServerEvent::DirectMessageReceived {
+            from_user_id: BOB,
+            from_username: "bob".to_string(),
+            encrypted_content,
+            timestamp: chrono::Utc::now(),
+            message_id: Uuid::from_u128(id),
+            client_nonce: None,
+        }
+    }
+
+    #[test]
+    fn nothing_goes_to_a_friend_without_a_key_or_shows_in_clear() {
+        let (mut app, mut sent, _) = talking_to_bob(None);
+        type_and_send(&mut app, "secret");
+        assert!(sent.try_recv().is_err());
+        assert_eq!(app.message_input, "secret");
+        assert!(app.dm_notices[&BOB].contains("has not published"));
+
+        // A relay could write anything in a message from a keyless friend.
+        event(&mut app, from_bob(10, "hello".to_string()));
+        assert_eq!(app.messages.last().unwrap().content, UNREADABLE);
+        assert_eq!(app.dm_text(BOB, true, "mine".to_string()), UNREADABLE);
+    }
+
+    #[test]
+    fn after_a_key_change_new_messages_decrypt() {
+        let (old_bob, bob) = (Identity::generate(), Identity::generate());
+        let (mut app, mut sent, my_key) = talking_to_bob(Some(old_bob.public_key_b64()));
+        let seal = |text: &str| {
+            bob.encrypt_for_b64(Purpose::DirectMessage, &my_key, text.as_bytes())
+                .unwrap()
+        };
+
+        event(&mut app, from_bob(10, seal("before")));
+        assert_eq!(app.messages.last().unwrap().content, UNREADABLE);
+
+        event(
+            &mut app,
+            ServerEvent::FriendKeyChanged {
+                user_id: BOB,
+                public_key: bob.public_key_b64(),
+            },
+        );
+        assert!(app.dm_notices[&BOB].contains("key changed"));
+        event(&mut app, from_bob(11, seal("after")));
+        assert_eq!(app.messages.last().unwrap().content, "after");
+
+        // What is sent now is encrypted to the new key.
+        type_and_send(&mut app, "hi bob");
+        let Ok(ClientEvent::SendDirectMessage {
+            encrypted_content, ..
+        }) = sent.try_recv()
+        else {
+            panic!("nothing sent");
+        };
+        let opened = bob
+            .decrypt_from_b64(Purpose::DirectMessage, &my_key, &encrypted_content)
+            .unwrap();
+        assert_eq!(opened, b"hi bob");
+    }
+
+    #[test]
+    fn removing_a_friend_asks_first_and_waits_for_the_relay() {
+        let (mut app, mut sent, _) = talking_to_bob(None);
+        let friends = |app: &mut Artemis, msg| {
+            let _ = app.update(AppMessage::FriendList(msg));
+        };
+        friends(&mut app, FriendListMsg::AskRemove(BOB));
+        assert_eq!(app.confirm_remove, Some(BOB));
+        friends(&mut app, FriendListMsg::CancelRemove);
+        assert!(sent.try_recv().is_err());
+
+        friends(&mut app, FriendListMsg::AskRemove(BOB));
+        friends(&mut app, FriendListMsg::ConfirmRemove(BOB));
+        assert!(matches!(
+            sent.try_recv(),
+            Ok(ClientEvent::RemoveFriend { user_id }) if user_id == BOB
+        ));
+        assert_eq!(app.friends.len(), 1);
+
+        event(&mut app, ServerEvent::FriendRemoved { user_id: BOB });
+        assert!(app.friends.is_empty());
+        assert_eq!(app.active_friend, None);
+        assert_eq!(app.confirm_remove, None);
     }
 
     #[test]

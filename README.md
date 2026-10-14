@@ -10,13 +10,21 @@ end-to-end encrypted direct messages, signed in with a GitHub account.
 Early prototype, not ready for use. What works and what does not:
 
 - The desktop client runs and has a demo mode with sample servers, channels and messages.
-- Signing in from the desktop client does not reach a working session yet. The client
-  sends its GitHub token to the relay, but the relay only accepts the tokens it issues
-  through its own web OAuth callback.
+- The desktop client signs in through the relay's device flow and never holds a GitHub
+  token. It keeps the relay's session in memory only, so it signs in again at every
+  start.
+- When the connection to the relay drops, the client says so and reconnects on its own,
+  waiting from 1 to 30 seconds between attempts. A message the relay had not confirmed
+  before the drop is marked "Not sent", and is sent again only when you press Retry.
+- A session cannot be signed out or revoked yet, not even by revoking the app on
+  GitHub, and a connected socket stays signed in after its session has expired.
 - The relay URL is fixed to `http://localhost:3000` (plain WebSocket, no TLS).
 - A new encryption key pair is generated at every sign-in, so older direct messages
   cannot be decrypted after a restart.
-- A direct message is sent unencrypted when the friend has not published a public key.
+- Direct messages are always encrypted: nothing is sent to a friend who has not published
+  a key yet, and a message that does not decrypt is never shown as its raw content. The
+  relay tells online friends when a user's key changes, and the client says so above
+  that conversation.
 - Friends' public keys come from the relay and are not verified (no fingerprint check or
   key pinning yet), so whoever runs the relay can substitute a key and read or alter
   direct messages. Encryption keeps the text unreadable in the relay's database and on
@@ -31,7 +39,7 @@ crates/
   artemis-client/    desktop client (iced), binary "artemis"
   artemis-server/    relay server (Axum + PostgreSQL), binary "artemis-server"
   artemis-core/      shared models and wire protocol
-  artemis-auth/      GitHub OAuth
+  artemis-auth/      GitHub device flow sign-in, used by the relay
   artemis-p2p/       P2P networking and encryption (mostly unused)
 ```
 
@@ -43,7 +51,8 @@ Requires [Rust](https://rustup.rs/) 1.94 or newer.
 cargo build --release --workspace
 ```
 
-The client runs on its own:
+The client signs in through the relay at `http://localhost:3000`. Its demo mode needs no
+relay:
 
 ```bash
 cargo run --bin artemis
@@ -56,9 +65,9 @@ settings from the environment and from a `.env` file (see `.env.example`):
 2. Choose a database password of letters and digits, and set it as `POSTGRES_PASSWORD`
    and in `DATABASE_URL`. Other characters need quoting in `.env` and percent-encoding
    in the URL.
-3. Create an OAuth app at <https://github.com/settings/developers> with the callback
-   URL `http://localhost:3000/auth/github/callback`, then set `GITHUB_CLIENT_ID` and
-   `GITHUB_CLIENT_SECRET`.
+3. Create an OAuth app at <https://github.com/settings/developers>, check
+   "Enable Device Flow", and set its client ID as `GITHUB_CLIENT_ID`. The relay needs
+   no client secret, and does not use the app's callback URL.
 4. Start the database, which listens on `127.0.0.1:5432` only, then the relay:
 
 ```bash
@@ -66,9 +75,35 @@ docker compose up -d
 cargo run --bin artemis-server
 ```
 
-The relay refuses to start while `DATABASE_URL`, `GITHUB_CLIENT_ID` or
-`GITHUB_CLIENT_SECRET` is missing. It listens on `127.0.0.1:3000` unless `BIND_ADDR`
-says otherwise, and logs at `info` unless `RUST_LOG` says otherwise.
+The relay refuses to start while `DATABASE_URL` or `GITHUB_CLIENT_ID` is missing. It
+listens on `127.0.0.1:3000` unless `BIND_ADDR` says otherwise, and logs at `info` unless
+`RUST_LOG` says otherwise.
+
+### Signing in
+
+A client signs in to the relay in three steps:
+
+1. `POST /auth/device/start` returns `device_code`, `user_code`, `verification_uri`,
+   `interval` and `expires_in`. The user opens `https://github.com/login/device` and
+   enters `user_code`. A client opens that address itself rather than the
+   `verification_uri` it was sent, so a relay cannot send its users to another page.
+2. Every `interval` seconds, `POST /auth/device/poll` with `{"device_code": "..."}`.
+   The answer's `status` is `pending` (poll again), `slow_down` (poll every `interval`
+   seconds from now on), `denied`, `expired`, or `complete` with a `token`, the
+   `username` and the `avatar_url`. A device code that is empty, over 64 characters or
+   not printable ASCII gets 400, GitHub failures 502 and database failures 500, all
+   with an `error`.
+3. Send the token in `Authenticate` on `/ws`.
+
+The relay asks GitHub for the `read:user` scope only. It uses the GitHub token once to
+read the user's profile and drops it, never storing or logging it. A session token is
+32 random bytes, of which the relay stores only the SHA-256. A session expires 30 days
+after it last signed a socket in, however long that socket stays connected.
+
+Usernames are GitHub logins, unique whatever their case, as on GitHub. When someone
+takes a login that an account on the relay still holds from before a rename on GitHub,
+that account is renamed `#` followed by its GitHub user ID until its user signs in
+again.
 
 ## Code signing policy
 

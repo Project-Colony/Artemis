@@ -124,7 +124,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                             .await;
                             continue;
                         }
-                        match db::find_user_by_token(&state.db, &token).await {
+                        match db::find_user_by_session(&state.db, &token).await {
                             Ok(Some(user)) => {
                                 // Register the socket unless the user has as
                                 // many open as they may. The user's first one
@@ -205,7 +205,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                                 let _ = send_event(
                                     &sender,
                                     &ServerEvent::AuthError {
-                                        reason: "Invalid token".to_string(),
+                                        reason: "Invalid or expired session".to_string(),
                                     },
                                 )
                                 .await;
@@ -227,6 +227,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                         channel_id,
                         content,
                         reply_to_id,
+                        client_nonce,
                     } => {
                         let Some(uid) = user_id else { continue };
                         if refused(&sender, "A message", &content, MAX_MESSAGE_CHARS).await {
@@ -268,7 +269,12 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                                 broadcast_to_server(
                                     &state,
                                     server_id,
-                                    &ServerEvent::MessageReceived { message },
+                                    // The nonce is random, so the other members
+                                    // learn nothing from it.
+                                    &ServerEvent::MessageReceived {
+                                        message,
+                                        client_nonce,
+                                    },
                                 )
                                 .await;
                             }
@@ -1129,12 +1135,29 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                             send_error(&sender, "A public key must be 32 bytes in base64").await;
                             continue;
                         }
-                        if let Err(e) = db::save_public_key(&state.db, uid, &public_key).await {
-                            tracing::error!("Failed to save public key: {}", e);
-                            send_error(&sender, "Failed to save your public key").await;
-                        } else {
-                            let _ = send_event(&sender, &ServerEvent::PublicKeyAcknowledged).await;
-                            tracing::info!("Public key stored for user {}", uid);
+                        match db::save_public_key(&state.db, uid, &public_key).await {
+                            Ok(changed) => {
+                                let _ =
+                                    send_event(&sender, &ServerEvent::PublicKeyAcknowledged).await;
+                                // Friends encrypt to the key they hold, so a new
+                                // one reaches those online at once. The others
+                                // get it with their friend list.
+                                if changed {
+                                    let friends =
+                                        db::get_friends(&state.db, uid).await.map(|rows| {
+                                            rows.into_iter().map(|friend| friend.user_id).collect()
+                                        });
+                                    let event = ServerEvent::FriendKeyChanged {
+                                        user_id: uid,
+                                        public_key,
+                                    };
+                                    send_to_users(&state, &listed(friends), &event).await;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to save public key: {}", e);
+                                send_error(&sender, "Failed to save your public key").await;
+                            }
                         }
                     }
 
@@ -1187,20 +1210,29 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                             continue;
                         }
 
-                        if let Err(e) = db::send_friend_request(&state.db, uid, target.id).await {
-                            tracing::error!("Failed to send friend request: {}", e);
-                            continue;
+                        // Only a new request, or one sent again after a
+                        // decline, reaches the recipient.
+                        match db::send_friend_request(&state.db, uid, target.id).await {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(e) => {
+                                tracing::error!("Failed to send friend request: {}", e);
+                                continue;
+                            }
                         }
 
                         // Get sender info from DB and notify recipient
-                        if let Ok(Some(from_user)) = sqlx::query_as::<_, db::UserRow>(
-                            "SELECT id, username, display_name, avatar_url, github_id, status, custom_status, auth_token, public_key, created_at FROM users WHERE id = $1"
-                        ).bind(uid).fetch_optional(&state.db).await {
-                            send_to_user(&state, target.id, &ServerEvent::FriendRequestReceived {
-                                from_user_id: uid,
-                                from_username: from_user.username,
-                                from_avatar_url: from_user.avatar_url,
-                            }).await;
+                        if let Ok(Some(from_user)) = db::find_user_by_id(&state.db, uid).await {
+                            send_to_user(
+                                &state,
+                                target.id,
+                                &ServerEvent::FriendRequestReceived {
+                                    from_user_id: uid,
+                                    from_username: from_user.username,
+                                    from_avatar_url: from_user.avatar_url,
+                                },
+                            )
+                            .await;
                         }
 
                         tracing::info!("Friend request sent from {} to {}", uid, target.id);
@@ -1212,26 +1244,35 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                         match db::accept_friend_request(&state.db, from_user_id, uid).await {
                             Ok(true) => {
                                 // Notify the requester that we accepted
-                                if let Ok(Some(accepter)) = sqlx::query_as::<_, db::UserRow>(
-                                    "SELECT id, username, display_name, avatar_url, github_id, status, custom_status, auth_token, public_key, created_at FROM users WHERE id = $1"
-                                ).bind(uid).fetch_optional(&state.db).await {
-                                    send_to_user(&state, from_user_id, &ServerEvent::FriendRequestAccepted {
-                                        user_id: uid,
-                                        username: accepter.username.clone(),
-                                        avatar_url: accepter.avatar_url.clone(),
-                                        public_key: accepter.public_key.clone(),
-                                    }).await;
+                                if let Ok(Some(accepter)) =
+                                    db::find_user_by_id(&state.db, uid).await
+                                {
+                                    send_to_user(
+                                        &state,
+                                        from_user_id,
+                                        &ServerEvent::FriendRequestAccepted {
+                                            user_id: uid,
+                                            username: accepter.username.clone(),
+                                            avatar_url: accepter.avatar_url.clone(),
+                                            public_key: accepter.public_key.clone(),
+                                        },
+                                    )
+                                    .await;
 
                                     // Also send the requester's info back to the accepter
-                                    if let Ok(Some(requester)) = sqlx::query_as::<_, db::UserRow>(
-                                        "SELECT id, username, display_name, avatar_url, github_id, status, custom_status, auth_token, public_key, created_at FROM users WHERE id = $1"
-                                    ).bind(from_user_id).fetch_optional(&state.db).await {
-                                        let _ = send_event(&sender, &ServerEvent::FriendRequestAccepted {
-                                            user_id: from_user_id,
-                                            username: requester.username,
-                                            avatar_url: requester.avatar_url,
-                                            public_key: requester.public_key,
-                                        }).await;
+                                    if let Ok(Some(requester)) =
+                                        db::find_user_by_id(&state.db, from_user_id).await
+                                    {
+                                        let _ = send_event(
+                                            &sender,
+                                            &ServerEvent::FriendRequestAccepted {
+                                                user_id: from_user_id,
+                                                username: requester.username,
+                                                avatar_url: requester.avatar_url,
+                                                public_key: requester.public_key,
+                                            },
+                                        )
+                                        .await;
                                     }
                                 }
                                 tracing::info!(
@@ -1257,13 +1298,34 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
 
                     ClientEvent::DeclineFriendRequest { from_user_id } => {
                         let Some(uid) = user_id else { continue };
-                        let _ = db::decline_friend_request(&state.db, from_user_id, uid).await;
-                        send_to_user(
-                            &state,
-                            from_user_id,
-                            &ServerEvent::FriendRequestDeclined { by_user_id: uid },
-                        )
-                        .await;
+                        // Only a request that was pending is answered.
+                        if let Ok(true) =
+                            db::decline_friend_request(&state.db, from_user_id, uid).await
+                        {
+                            send_to_user(
+                                &state,
+                                from_user_id,
+                                &ServerEvent::FriendRequestDeclined { by_user_id: uid },
+                            )
+                            .await;
+                        }
+                    }
+
+                    ClientEvent::RemoveFriend { user_id: friend } => {
+                        let Some(uid) = user_id else { continue };
+                        match db::remove_friend(&state.db, uid, friend).await {
+                            Ok(true) => {
+                                // Both sides drop the other, on every socket.
+                                let removed = |user_id| ServerEvent::FriendRemoved { user_id };
+                                send_to_user(&state, friend, &removed(uid)).await;
+                                send_to_user(&state, uid, &removed(friend)).await;
+                            }
+                            Ok(false) => send_error(&sender, "Not friends with this user").await,
+                            Err(e) => {
+                                tracing::error!("Failed to remove a friend: {}", e);
+                                send_error(&sender, "Failed to remove this friend").await;
+                            }
+                        }
                     }
 
                     ClientEvent::FetchFriends => {
@@ -1314,6 +1376,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                     ClientEvent::SendDirectMessage {
                         recipient_id,
                         encrypted_content,
+                        client_nonce,
                     } => {
                         let Some(uid) = user_id else { continue };
                         if refused(
@@ -1367,6 +1430,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                                         encrypted_content: encrypted_content.clone(),
                                         timestamp,
                                         message_id: msg_id,
+                                        client_nonce: None,
                                     },
                                 )
                                 .await;
@@ -1380,6 +1444,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                                         encrypted_content,
                                         timestamp,
                                         message_id: msg_id,
+                                        client_nonce,
                                     },
                                 )
                                 .await;
