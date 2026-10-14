@@ -1350,8 +1350,11 @@ async fn the_sender_gets_its_client_nonce_back(pool: DbPool) {
         .await
         .unwrap();
     let addr = serve(pool).await;
-    let mut founder = sign_in(addr, "founder-token").await;
     let mut member = sign_in(addr, "member-token").await;
+    let mut founder = sign_in(addr, "founder-token").await;
+    // The member hears that the founder, a co-member and a friend, came online.
+    assert_eq!(recv(&mut member).await["type"], "PresenceUpdate");
+    assert_eq!(recv(&mut member).await["type"], "FriendPresenceUpdate");
     let nonce = Uuid::from_u128(0x40);
 
     let post = ClientEvent::SendMessage {
