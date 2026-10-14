@@ -110,8 +110,8 @@ How releases are built, signed and published:
 ## Privacy
 
 Artemis sends no telemetry, no analytics and no crash reports. The desktop
-client talks to one relay, and that relay sees everything below: choose one run
-by someone you trust with it.
+client talks to one relay, and that relay sees everything below. For now the
+client only connects to a relay on the same machine (`localhost:3000`).
 
 What the desktop client keeps and sends:
 
@@ -130,6 +130,7 @@ What the relay keeps:
 | Sessions | stored | The SHA-256 of each session token, never the token itself, with when it was created and last used. A session expires 30 days after it was last used. |
 | Public key | stored | The public half of your key pair, given to your friends. |
 | Servers and channels | stored | The servers, categories and channels you create or join, and your role in each. |
+| Custom emojis | stored | For each server, the name and image URL of every custom emoji, and who added it. |
 | Server messages | stored, readable by the relay | The text of every message in a server channel, with its author, time, replies, reactions, pins and mentions, and how far you have read each channel. Server messages are not end-to-end encrypted. |
 | Direct messages | stored, encrypted | The ciphertext, its sender, its recipient and when it was sent. Only you and your friend can decrypt it, provided the public keys are genuine: the relay hands them out and Artemis does not verify them yet, so whoever runs the relay could substitute a key and read the messages that follow. |
 | Friends | stored | Friend requests and friendships. |
