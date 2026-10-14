@@ -160,7 +160,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "artemis-auth"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "artemis-core",
  "reqwest",
@@ -171,7 +171,7 @@ dependencies = [
 
 [[package]]
 name = "artemis-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "artemis-core",
  "artemis-p2p",
@@ -192,7 +192,7 @@ dependencies = [
 
 [[package]]
 name = "artemis-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "serde",
@@ -203,7 +203,7 @@ dependencies = [
 
 [[package]]
 name = "artemis-p2p"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "artemis-core",
  "base64 0.23.1",
@@ -230,7 +230,7 @@ dependencies = [
 
 [[package]]
 name = "artemis-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "artemis-auth",
