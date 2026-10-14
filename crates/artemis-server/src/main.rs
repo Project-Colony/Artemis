@@ -88,6 +88,16 @@ fn router(state: AppState) -> Router {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Answered before .env or any setting is read, so the release workflow can
+    // smoke-test the binary with no configuration and no database.
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--version" || arg == "-V")
+    {
+        println!("{} {}", env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     // Values already in the environment win over the ones in .env.
     if let Err(e) = dotenvy::dotenv() {
         if !e.not_found() {

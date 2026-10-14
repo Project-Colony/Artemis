@@ -3,6 +3,7 @@ name = "artemis-p2p"
 description = "P2P networking layer for Artemis: QUIC transport, GitHub signaling, E2E encryption"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

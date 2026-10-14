@@ -9,8 +9,10 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.0" # x-release-please-version
 edition = "2021"
+# The floor set by sqlx 0.9. CI builds on exactly this toolchain (the msrv job).
+rust-version = "1.94"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/Project-Colony/Artemis"
 
@@ -69,3 +71,10 @@ dotenvy = "0.15.7"
 
 # WebSocket client
 tokio-tungstenite = { version = "0.30.0", features = ["native-tls"] }
+
+# Thin LTO and one codegen unit for a smaller, faster binary; symbols stripped
+# because users download it. See design/releases.md in Project-Colony-Resources.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

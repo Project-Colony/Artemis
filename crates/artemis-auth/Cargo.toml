@@ -3,6 +3,7 @@ name = "artemis-auth"
 description = "GitHub OAuth authentication for Artemis"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

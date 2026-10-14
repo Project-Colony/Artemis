@@ -1,3 +1,7 @@
+// Release builds open no console window on Windows; debug builds keep one for
+// the logs.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod mock;
 mod net;
 mod theme;
@@ -46,6 +50,16 @@ const GITHUB_CLIENT_ID: &str = "Ov23liYMgdGLfkOKDQya";
 const DEFAULT_SERVER_URL: &str = "http://localhost:3000";
 
 fn main() -> iced::Result {
+    // Answered before any window, so the release workflow can smoke-test the
+    // binary on a runner with no display.
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--version" || arg == "-V")
+    {
+        println!("{} {}", env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     tracing_subscriber::fmt::init();
 
     iced::application(Artemis::new, Artemis::update, Artemis::view)

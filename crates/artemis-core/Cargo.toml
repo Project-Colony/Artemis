@@ -3,6 +3,7 @@ name = "artemis-core"
 description = "Shared models, types, and protocol definitions for Artemis"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
