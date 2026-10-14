@@ -561,17 +561,21 @@ struct MessageRow {
 
 // ── Public key ──
 
+/// Stores `public_key` as the user's key. Returns whether it differs from
+/// the key stored before, which a first key does too.
 pub async fn save_public_key(
     pool: &DbPool,
     user_id: Uuid,
     public_key: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE users SET public_key = $1 WHERE id = $2")
-        .bind(public_key)
-        .bind(user_id)
-        .execute(pool)
-        .await?;
-    Ok(())
+) -> Result<bool, sqlx::Error> {
+    let changed = sqlx::query(
+        "UPDATE users SET public_key = $1 WHERE id = $2 AND public_key IS DISTINCT FROM $1",
+    )
+    .bind(public_key)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(changed.rows_affected() > 0)
 }
 
 // ── Friend requests ──

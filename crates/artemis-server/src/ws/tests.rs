@@ -693,6 +693,54 @@ async fn presence_reaches_co_members_and_friends_only(pool: DbPool) {
     );
 }
 
+#[sqlx::test(migrator = "crate::db::MIGRATOR")]
+#[ignore = "needs DATABASE_URL"]
+async fn a_new_public_key_reaches_friends_only(pool: DbPool) {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine;
+
+    seed(&pool).await;
+    // The member is friends with the outsider, and shares server A with the
+    // founder without being friends.
+    sqlx::query("INSERT INTO friendships (user_a, user_b) VALUES ($1, $2)")
+        .bind(MEMBER)
+        .bind(OUTSIDER)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let addr = serve(pool).await;
+    let mut founder = sign_in(addr, "founder-token").await;
+    let mut outsider = sign_in(addr, "outsider-token").await;
+    let mut member = sign_in(addr, "member-token").await;
+    assert_eq!(recv(&mut founder).await["type"], "PresenceUpdate");
+    assert_eq!(recv(&mut outsider).await["type"], "FriendPresenceUpdate");
+
+    let publish = |key: &str| ClientEvent::PublishPublicKey {
+        public_key: key.to_string(),
+    };
+    let changed = |key: &str| json!({"type": "FriendKeyChanged", "data": {"user_id": MEMBER, "public_key": key}});
+    let first = B64.encode([1u8; 32]);
+    let second = B64.encode([2u8; 32]);
+
+    for key in [&first, &second] {
+        assert_eq!(
+            call(&mut member, &publish(key)).await["type"],
+            "PublicKeyAcknowledged"
+        );
+        assert_eq!(recv(&mut outsider).await, changed(key));
+    }
+    // The same key again is no change.
+    assert_eq!(
+        call(&mut member, &publish(&second)).await["type"],
+        "PublicKeyAcknowledged"
+    );
+    tokio::join!(
+        assert_silent(&mut founder),
+        assert_silent(&mut outsider),
+        assert_silent(&mut member),
+    );
+}
+
 async fn member_status(pool: &DbPool) -> String {
     sqlx::query_scalar("SELECT status FROM users WHERE id = $1")
         .bind(MEMBER)

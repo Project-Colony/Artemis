@@ -371,6 +371,10 @@ pub enum ServerEvent {
     /// A friend's presence changed.
     FriendPresenceUpdate { user_id: Uuid, status: UserStatus },
 
+    /// A friend published a public key other than the one they had, or their
+    /// first one. Direct messages to them are encrypted to it from now on.
+    FriendKeyChanged { user_id: Uuid, public_key: String },
+
     // ── Search ──
     /// Search results for a query.
     SearchResults {

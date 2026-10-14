@@ -1135,12 +1135,29 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                             send_error(&sender, "A public key must be 32 bytes in base64").await;
                             continue;
                         }
-                        if let Err(e) = db::save_public_key(&state.db, uid, &public_key).await {
-                            tracing::error!("Failed to save public key: {}", e);
-                            send_error(&sender, "Failed to save your public key").await;
-                        } else {
-                            let _ = send_event(&sender, &ServerEvent::PublicKeyAcknowledged).await;
-                            tracing::info!("Public key stored for user {}", uid);
+                        match db::save_public_key(&state.db, uid, &public_key).await {
+                            Ok(changed) => {
+                                let _ =
+                                    send_event(&sender, &ServerEvent::PublicKeyAcknowledged).await;
+                                // Friends encrypt to the key they hold, so a new
+                                // one reaches those online at once. The others
+                                // get it with their friend list.
+                                if changed {
+                                    let friends =
+                                        db::get_friends(&state.db, uid).await.map(|rows| {
+                                            rows.into_iter().map(|friend| friend.user_id).collect()
+                                        });
+                                    let event = ServerEvent::FriendKeyChanged {
+                                        user_id: uid,
+                                        public_key,
+                                    };
+                                    send_to_users(&state, &listed(friends), &event).await;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to save public key: {}", e);
+                                send_error(&sender, "Failed to save your public key").await;
+                            }
                         }
                     }
 

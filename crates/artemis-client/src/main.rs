@@ -42,6 +42,9 @@ pub const FONT_BOLD: Font = Font {
     ..Font::with_name("JetBrainsMono Nerd Font")
 };
 
+/// Shown in place of a direct message that does not decrypt.
+const UNREADABLE: &str = "[This message could not be decrypted]";
+
 /// The relay, until the client lets the user choose one.
 const DEFAULT_SERVER_URL: &str = "http://localhost:3000";
 
@@ -92,6 +95,9 @@ struct Artemis {
 
     // Friend list (from server)
     friends: Vec<FriendPayload>,
+    /// A notice above a direct conversation, by friend: their key changed,
+    /// or why nothing was sent.
+    dm_notices: HashMap<Uuid, String>,
     pending_requests: Vec<FriendRequestPayload>,
     active_friend: Option<String>,
     add_friend_input: String,
@@ -150,6 +156,8 @@ enum AppMessage {
     ConnectionFailed(String),
     ServerEventReceived(ServerEvent),
     DismissBanner,
+    /// Hide the notice above the conversation with this friend.
+    DismissNotice(Uuid),
 }
 
 impl Artemis {
@@ -165,6 +173,7 @@ impl Artemis {
                 avatar_url: None,
                 identity: None,
                 friends: Vec::new(),
+                dm_notices: HashMap::new(),
                 pending_requests: Vec::new(),
                 active_friend: None,
                 add_friend_input: String::new(),
@@ -252,6 +261,10 @@ impl Artemis {
 
             AppMessage::DismissBanner => {
                 self.banner = None;
+            }
+
+            AppMessage::DismissNotice(friend_id) => {
+                self.dm_notices.remove(&friend_id);
             }
 
             AppMessage::Login(LoginMsg::UseMockData) => {
@@ -589,19 +602,24 @@ impl Artemis {
         let content = self.message_input.clone();
         let recipient_id = friend.user_id;
 
-        // Encrypt message if friend has a public key
-        let encrypted_content = if let Some(ref pk) = friend.public_key {
+        // The relay must never see a direct message in clear, so without the
+        // friend's key nothing is sent and the text stays in the input.
+        let Some(pk) = &friend.public_key else {
+            let notice = format!(
+                "{} has not published an encryption key yet, so nothing was sent.",
+                friend.username
+            );
+            self.dm_notices.insert(recipient_id, notice);
+            return;
+        };
+        let encrypted_content =
             match identity.encrypt_for_b64(Purpose::DirectMessage, pk, content.as_bytes()) {
                 Ok(enc) => enc,
                 Err(e) => {
                     tracing::error!("E2E encryption failed: {}", e);
                     return;
                 }
-            }
-        } else {
-            tracing::warn!("Friend has no public key, sending unencrypted");
-            content.clone()
-        };
+            };
 
         let nonce = Uuid::new_v4();
         let event = ClientEvent::SendDirectMessage {
@@ -728,11 +746,9 @@ impl Artemis {
         }
     }
 
-    /// Text to show for a direct message exchanged with `friend_id`.
-    ///
-    /// Without a public key for the friend, the message came through the
-    /// plaintext fallback and is shown as is. With one, a message that does
-    /// not decrypt is never shown as its raw content: the relay could have
+    /// Text to show for a direct message exchanged with `friend_id`. A message
+    /// that does not decrypt with the friend's key, or that came while they
+    /// had none, is never shown as its raw content: the relay could have
     /// written it.
     fn dm_text(&self, friend_id: Uuid, sent_by_us: bool, content: String) -> String {
         let Some(pk) = self
@@ -741,7 +757,7 @@ impl Artemis {
             .find(|f| f.user_id == friend_id)
             .and_then(|f| f.public_key.as_deref())
         else {
-            return content;
+            return UNREADABLE.to_string();
         };
         self.identity
             .as_ref()
@@ -754,7 +770,7 @@ impl Artemis {
                 .ok()
             })
             .and_then(|plaintext| String::from_utf8(plaintext).ok())
-            .unwrap_or_else(|| "[This message could not be decrypted]".to_string())
+            .unwrap_or_else(|| UNREADABLE.to_string())
     }
 
     /// Whether the user may pin in the active server. The relay lets only
@@ -991,6 +1007,28 @@ impl Artemis {
             ServerEvent::FriendPresenceUpdate { user_id, status } => {
                 if let Some(friend) = self.friends.iter_mut().find(|f| f.user_id == user_id) {
                     friend.status = status;
+                }
+            }
+
+            ServerEvent::FriendKeyChanged {
+                user_id,
+                public_key,
+            } => {
+                if let Some(friend) = self.friends.iter_mut().find(|f| f.user_id == user_id) {
+                    match friend.public_key.replace(public_key.clone()) {
+                        Some(old) if old != public_key => {
+                            let notice = format!(
+                                "{}'s encryption key changed. New messages use the new key.",
+                                friend.username
+                            );
+                            self.dm_notices.insert(user_id, notice);
+                        }
+                        Some(_) => {}
+                        // A first key: messages to them can be sent now.
+                        None => {
+                            self.dm_notices.remove(&user_id);
+                        }
+                    }
                 }
             }
 
@@ -1263,8 +1301,15 @@ impl Artemis {
                     )
                     .map(AppMessage::ChatArea);
 
+                    let notice = self.active_friend.as_ref().and_then(|uname| {
+                        let friend = self.friends.iter().find(|f| &f.username == uname)?;
+                        let notice = self.dm_notices.get(&friend.user_id)?;
+                        let dismiss = AppMessage::DismissNotice(friend.user_id);
+                        Some(banner(notice, colors::STATUS_IDLE, Some(dismiss)))
+                    });
+
                     main_row = main_row.push(friend_list_view);
-                    main_row = main_row.push(chat_view);
+                    main_row = main_row.push(column![notice, chat_view]);
                 } else {
                     let channel_sidebar_view =
                         channel_sidebar::view_from_payload(active_server, self.active_channel_id)
@@ -1586,6 +1631,92 @@ mod tests {
             e,
             ClientEvent::FetchMessages { channel_id, .. } if *channel_id == Uuid::from_u128(22)
         )));
+    }
+
+    const BOB: Uuid = Uuid::from_u128(5);
+
+    /// The app connected, with its own identity, in a conversation with Bob,
+    /// whose key is `key`. Returns the app's public key too.
+    fn talking_to_bob(
+        key: Option<String>,
+    ) -> (Artemis, mpsc::UnboundedReceiver<ClientEvent>, String) {
+        let (mut app, sent) = connected();
+        let me = Identity::generate();
+        let my_key = me.public_key_b64();
+        app.identity = Some(me);
+        app.friends = vec![FriendPayload {
+            user_id: BOB,
+            username: "bob".to_string(),
+            display_name: None,
+            avatar_url: None,
+            public_key: key,
+            status: UserStatus::Online,
+        }];
+        app.is_home = true;
+        app.active_friend = Some("bob".to_string());
+        (app, sent, my_key)
+    }
+
+    fn from_bob(id: u128, encrypted_content: String) -> ServerEvent {
+        ServerEvent::DirectMessageReceived {
+            from_user_id: BOB,
+            from_username: "bob".to_string(),
+            encrypted_content,
+            timestamp: chrono::Utc::now(),
+            message_id: Uuid::from_u128(id),
+            client_nonce: None,
+        }
+    }
+
+    #[test]
+    fn nothing_goes_to_a_friend_without_a_key_or_shows_in_clear() {
+        let (mut app, mut sent, _) = talking_to_bob(None);
+        type_and_send(&mut app, "secret");
+        assert!(sent.try_recv().is_err());
+        assert_eq!(app.message_input, "secret");
+        assert!(app.dm_notices[&BOB].contains("has not published"));
+
+        // A relay could write anything in a message from a keyless friend.
+        event(&mut app, from_bob(10, "hello".to_string()));
+        assert_eq!(app.messages.last().unwrap().content, UNREADABLE);
+        assert_eq!(app.dm_text(BOB, true, "mine".to_string()), UNREADABLE);
+    }
+
+    #[test]
+    fn after_a_key_change_new_messages_decrypt() {
+        let (old_bob, bob) = (Identity::generate(), Identity::generate());
+        let (mut app, mut sent, my_key) = talking_to_bob(Some(old_bob.public_key_b64()));
+        let seal = |text: &str| {
+            bob.encrypt_for_b64(Purpose::DirectMessage, &my_key, text.as_bytes())
+                .unwrap()
+        };
+
+        event(&mut app, from_bob(10, seal("before")));
+        assert_eq!(app.messages.last().unwrap().content, UNREADABLE);
+
+        event(
+            &mut app,
+            ServerEvent::FriendKeyChanged {
+                user_id: BOB,
+                public_key: bob.public_key_b64(),
+            },
+        );
+        assert!(app.dm_notices[&BOB].contains("key changed"));
+        event(&mut app, from_bob(11, seal("after")));
+        assert_eq!(app.messages.last().unwrap().content, "after");
+
+        // What is sent now is encrypted to the new key.
+        type_and_send(&mut app, "hi bob");
+        let Ok(ClientEvent::SendDirectMessage {
+            encrypted_content, ..
+        }) = sent.try_recv()
+        else {
+            panic!("nothing sent");
+        };
+        let opened = bob
+            .decrypt_from_b64(Purpose::DirectMessage, &my_key, &encrypted_content)
+            .unwrap();
+        assert_eq!(opened, b"hi bob");
     }
 
     #[test]
