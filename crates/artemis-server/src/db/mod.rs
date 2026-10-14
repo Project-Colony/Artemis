@@ -580,21 +580,52 @@ pub async fn save_public_key(
 
 // ── Friend requests ──
 
+/// Records a pending request from `from_id` to `to_id`, also in place of one
+/// that was declined. Returns false when one is already pending or accepted.
 pub async fn send_friend_request(
     pool: &DbPool,
     from_id: Uuid,
     to_id: Uuid,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
         "INSERT INTO friend_requests (from_user_id, to_user_id, status)
          VALUES ($1, $2, 'pending')
-         ON CONFLICT (from_user_id, to_user_id) DO NOTHING",
+         ON CONFLICT (from_user_id, to_user_id) DO UPDATE
+         SET status = 'pending', created_at = NOW()
+         WHERE friend_requests.status = 'declined'",
     )
     .bind(from_id)
     .bind(to_id)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(result.rows_affected() > 0)
+}
+
+/// Ends the friendship of `user` and `friend` and forgets the requests
+/// between them, so either may send a new one. Returns whether they were
+/// friends.
+pub async fn remove_friend(pool: &DbPool, user: Uuid, friend: Uuid) -> Result<bool, sqlx::Error> {
+    let (a, b) = if user < friend {
+        (user, friend)
+    } else {
+        (friend, user)
+    };
+    let mut tx = pool.begin().await?;
+    let removed = sqlx::query("DELETE FROM friendships WHERE user_a = $1 AND user_b = $2")
+        .bind(a)
+        .bind(b)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "DELETE FROM friend_requests
+         WHERE (from_user_id = $1 AND to_user_id = $2) OR (from_user_id = $2 AND to_user_id = $1)",
+    )
+    .bind(user)
+    .bind(friend)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(removed.rows_affected() > 0)
 }
 
 pub async fn accept_friend_request(

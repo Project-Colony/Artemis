@@ -1210,9 +1210,15 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                             continue;
                         }
 
-                        if let Err(e) = db::send_friend_request(&state.db, uid, target.id).await {
-                            tracing::error!("Failed to send friend request: {}", e);
-                            continue;
+                        // Only a new request, or one sent again after a
+                        // decline, reaches the recipient.
+                        match db::send_friend_request(&state.db, uid, target.id).await {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(e) => {
+                                tracing::error!("Failed to send friend request: {}", e);
+                                continue;
+                            }
                         }
 
                         // Get sender info from DB and notify recipient
@@ -1292,13 +1298,34 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
 
                     ClientEvent::DeclineFriendRequest { from_user_id } => {
                         let Some(uid) = user_id else { continue };
-                        let _ = db::decline_friend_request(&state.db, from_user_id, uid).await;
-                        send_to_user(
-                            &state,
-                            from_user_id,
-                            &ServerEvent::FriendRequestDeclined { by_user_id: uid },
-                        )
-                        .await;
+                        // Only a request that was pending is answered.
+                        if let Ok(true) =
+                            db::decline_friend_request(&state.db, from_user_id, uid).await
+                        {
+                            send_to_user(
+                                &state,
+                                from_user_id,
+                                &ServerEvent::FriendRequestDeclined { by_user_id: uid },
+                            )
+                            .await;
+                        }
+                    }
+
+                    ClientEvent::RemoveFriend { user_id: friend } => {
+                        let Some(uid) = user_id else { continue };
+                        match db::remove_friend(&state.db, uid, friend).await {
+                            Ok(true) => {
+                                // Both sides drop the other, on every socket.
+                                let removed = |user_id| ServerEvent::FriendRemoved { user_id };
+                                send_to_user(&state, friend, &removed(uid)).await;
+                                send_to_user(&state, uid, &removed(friend)).await;
+                            }
+                            Ok(false) => send_error(&sender, "Not friends with this user").await,
+                            Err(e) => {
+                                tracing::error!("Failed to remove a friend: {}", e);
+                                send_error(&sender, "Failed to remove this friend").await;
+                            }
+                        }
                     }
 
                     ClientEvent::FetchFriends => {

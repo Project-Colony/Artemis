@@ -102,6 +102,8 @@ struct Artemis {
     active_friend: Option<String>,
     add_friend_input: String,
     show_add_friend: bool,
+    /// The friend whose removal waits for confirmation.
+    confirm_remove: Option<Uuid>,
 
     // Chat state
     user_id: Option<Uuid>,
@@ -178,6 +180,7 @@ impl Artemis {
                 active_friend: None,
                 add_friend_input: String::new(),
                 show_add_friend: false,
+                confirm_remove: None,
                 user_id: None,
                 username: String::new(),
                 servers: Vec::new(),
@@ -352,6 +355,22 @@ impl Artemis {
             // ── Friend list ──
             AppMessage::FriendList(FriendListMsg::SelectFriend(username)) => {
                 self.active_friend = Some(username);
+                self.confirm_remove = None;
+            }
+            AppMessage::FriendList(FriendListMsg::AskRemove(user_id)) => {
+                self.confirm_remove = Some(user_id);
+            }
+            AppMessage::FriendList(FriendListMsg::CancelRemove) => {
+                self.confirm_remove = None;
+            }
+            AppMessage::FriendList(FriendListMsg::ConfirmRemove(user_id)) => {
+                // The friend leaves the list once the relay confirms, with
+                // FriendRemoved. Offline, the confirmation stays open.
+                if let Some(tx) = &self.client_tx {
+                    if tx.send(ClientEvent::RemoveFriend { user_id }).is_ok() {
+                        self.confirm_remove = None;
+                    }
+                }
             }
             AppMessage::FriendList(FriendListMsg::AddFriendInputChanged(val)) => {
                 self.add_friend_input = val;
@@ -947,6 +966,19 @@ impl Artemis {
                 }
             }
 
+            ServerEvent::FriendRemoved { user_id } => {
+                if let Some(i) = self.friends.iter().position(|f| f.user_id == user_id) {
+                    let friend = self.friends.remove(i);
+                    if self.active_friend.as_deref() == Some(friend.username.as_str()) {
+                        self.active_friend = None;
+                    }
+                }
+                self.dm_notices.remove(&user_id);
+                if self.confirm_remove == Some(user_id) {
+                    self.confirm_remove = None;
+                }
+            }
+
             ServerEvent::FriendRequestDeclined { by_user_id } => {
                 tracing::info!("Friend request declined by {}", by_user_id);
             }
@@ -1276,6 +1308,7 @@ impl Artemis {
                         self.active_friend.as_deref(),
                         &self.add_friend_input,
                         self.show_add_friend,
+                        self.confirm_remove,
                     )
                     .map(AppMessage::FriendList);
 
@@ -1717,6 +1750,31 @@ mod tests {
             .decrypt_from_b64(Purpose::DirectMessage, &my_key, &encrypted_content)
             .unwrap();
         assert_eq!(opened, b"hi bob");
+    }
+
+    #[test]
+    fn removing_a_friend_asks_first_and_waits_for_the_relay() {
+        let (mut app, mut sent, _) = talking_to_bob(None);
+        let friends = |app: &mut Artemis, msg| {
+            let _ = app.update(AppMessage::FriendList(msg));
+        };
+        friends(&mut app, FriendListMsg::AskRemove(BOB));
+        assert_eq!(app.confirm_remove, Some(BOB));
+        friends(&mut app, FriendListMsg::CancelRemove);
+        assert!(sent.try_recv().is_err());
+
+        friends(&mut app, FriendListMsg::AskRemove(BOB));
+        friends(&mut app, FriendListMsg::ConfirmRemove(BOB));
+        assert!(matches!(
+            sent.try_recv(),
+            Ok(ClientEvent::RemoveFriend { user_id }) if user_id == BOB
+        ));
+        assert_eq!(app.friends.len(), 1);
+
+        event(&mut app, ServerEvent::FriendRemoved { user_id: BOB });
+        assert!(app.friends.is_empty());
+        assert_eq!(app.active_friend, None);
+        assert_eq!(app.confirm_remove, None);
     }
 
     #[test]

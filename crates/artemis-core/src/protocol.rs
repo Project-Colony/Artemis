@@ -133,6 +133,9 @@ pub enum ClientEvent {
     /// Decline a pending friend request.
     DeclineFriendRequest { from_user_id: Uuid },
 
+    /// End a friendship. Either side may send a new request afterwards.
+    RemoveFriend { user_id: Uuid },
+
     /// Send an E2E encrypted DM relayed through the server.
     SendDirectMessage {
         recipient_id: Uuid,
@@ -349,6 +352,9 @@ pub enum ServerEvent {
 
     /// A friend request was declined.
     FriendRequestDeclined { by_user_id: Uuid },
+
+    /// A friendship ended, by either side: `user_id` is no longer a friend.
+    FriendRemoved { user_id: Uuid },
 
     /// Full friend list response.
     FriendList { friends: Vec<FriendPayload> },

@@ -14,6 +14,10 @@ pub enum FriendListMsg {
     ToggleAddFriend,
     AcceptRequest(uuid::Uuid),
     DeclineRequest(uuid::Uuid),
+    /// Ask to confirm removing this friend.
+    AskRemove(uuid::Uuid),
+    ConfirmRemove(uuid::Uuid),
+    CancelRemove,
 }
 
 pub fn view<'a>(
@@ -22,6 +26,7 @@ pub fn view<'a>(
     active_friend: Option<&'a str>,
     add_friend_input: &'a str,
     show_add_form: bool,
+    confirm_remove: Option<uuid::Uuid>,
 ) -> Element<'a, FriendListMsg> {
     let mut content = Column::new().spacing(2);
 
@@ -145,6 +150,9 @@ pub fn view<'a>(
         for friend in &online {
             let is_active = active_friend == Some(friend.username.as_str());
             content = content.push(friend_entry(friend, is_active));
+            if is_active {
+                content = content.push(remove_row(friend, confirm_remove));
+            }
         }
 
         content = content.push(Space::new().height(8));
@@ -167,6 +175,9 @@ pub fn view<'a>(
         for friend in &offline {
             let is_active = active_friend == Some(friend.username.as_str());
             content = content.push(friend_entry(friend, is_active));
+            if is_active {
+                content = content.push(remove_row(friend, confirm_remove));
+            }
         }
     }
 
@@ -301,6 +312,55 @@ fn friend_entry<'a>(friend: &FriendPayload, is_active: bool) -> Element<'a, Frie
         });
 
     container(btn).padding(Padding::from([0, 4])).into()
+}
+
+/// Under the selected friend: Remove friend, then a confirmation.
+fn remove_row<'a>(
+    friend: &FriendPayload,
+    confirm_remove: Option<uuid::Uuid>,
+) -> Element<'a, FriendListMsg> {
+    let id = friend.user_id;
+    let action = |label, color, msg| {
+        button(text(label).size(11).color(color))
+            .on_press(msg)
+            .padding(Padding::from([2, 6]))
+            .style(|_theme, status| button::Style {
+                background: match status {
+                    button::Status::Hovered | button::Status::Pressed => {
+                        Some(iced::Background::Color(colors::BG_HOVER))
+                    }
+                    _ => None,
+                },
+                border: Border {
+                    radius: 3.0.into(),
+                    ..Border::default()
+                },
+                ..button::Style::default()
+            })
+    };
+    let content = if confirm_remove == Some(id) {
+        row![
+            text(format!("Remove @{}?", friend.username))
+                .size(11)
+                .color(colors::TEXT_MUTED),
+            Space::new().width(Length::Fill),
+            action("Remove", colors::DANGER, FriendListMsg::ConfirmRemove(id)),
+            action("Cancel", colors::TEXT_MUTED, FriendListMsg::CancelRemove),
+        ]
+    } else {
+        row![
+            Space::new().width(Length::Fill),
+            action(
+                "Remove friend",
+                colors::TEXT_TIMESTAMP,
+                FriendListMsg::AskRemove(id)
+            ),
+        ]
+    };
+    container(content.spacing(4).align_y(Vertical::Center))
+        .padding(Padding::from([0, 16]))
+        .width(Length::Fill)
+        .into()
 }
 
 fn friend_request_entry<'a>(req: &FriendRequestPayload) -> Element<'a, FriendListMsg> {

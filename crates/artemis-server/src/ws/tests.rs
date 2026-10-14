@@ -741,6 +741,70 @@ async fn a_new_public_key_reaches_friends_only(pool: DbPool) {
     );
 }
 
+#[sqlx::test(migrator = "crate::db::MIGRATOR")]
+#[ignore = "needs DATABASE_URL"]
+async fn a_declined_request_can_be_sent_again_and_friends_can_part(pool: DbPool) {
+    seed(&pool).await;
+    let addr = serve(pool).await;
+    // They share no server, so neither hears the other come online.
+    let mut founder = sign_in(addr, "founder-token").await;
+    let mut stranger = sign_in(addr, "stranger-token").await;
+    let request = ClientEvent::SendFriendRequest {
+        target_username: "founder".to_string(),
+    };
+    let decline = ClientEvent::DeclineFriendRequest {
+        from_user_id: STRANGER,
+    };
+
+    send(&mut stranger, &request).await;
+    assert_eq!(recv(&mut founder).await["type"], "FriendRequestReceived");
+    // Asking again while the request is pending notifies nobody.
+    send(&mut stranger, &request).await;
+    assert_silent(&mut founder).await;
+
+    send(&mut founder, &decline).await;
+    assert_eq!(
+        recv(&mut stranger).await,
+        json!({"type": "FriendRequestDeclined", "data": {"by_user_id": FOUNDER}})
+    );
+    // Nothing is pending any more, so a second decline answers nobody.
+    send(&mut founder, &decline).await;
+    assert_silent(&mut stranger).await;
+
+    // Sent again after the decline, the request can be accepted.
+    send(&mut stranger, &request).await;
+    assert_eq!(recv(&mut founder).await["type"], "FriendRequestReceived");
+    let accept = ClientEvent::AcceptFriendRequest {
+        from_user_id: STRANGER,
+    };
+    send(&mut founder, &accept).await;
+    assert_eq!(recv(&mut stranger).await["type"], "FriendRequestAccepted");
+    assert_eq!(recv(&mut founder).await["type"], "FriendRequestAccepted");
+
+    let remove = ClientEvent::RemoveFriend { user_id: STRANGER };
+    send(&mut founder, &remove).await;
+    let removed = |user_id| json!({"type": "FriendRemoved", "data": {"user_id": user_id}});
+    assert_eq!(recv(&mut stranger).await, removed(FOUNDER));
+    assert_eq!(recv(&mut founder).await, removed(STRANGER));
+    let dm = ClientEvent::SendDirectMessage {
+        recipient_id: FOUNDER,
+        encrypted_content: "sealed".to_string(),
+        client_nonce: None,
+    };
+    assert_eq!(
+        call(&mut stranger, &dm).await,
+        json!({"type": "Error", "data": {"message": "Not friends with this user"}})
+    );
+    assert_eq!(
+        call(&mut founder, &remove).await,
+        json!({"type": "Error", "data": {"message": "Not friends with this user"}})
+    );
+
+    // Either side may ask again.
+    send(&mut stranger, &request).await;
+    assert_eq!(recv(&mut founder).await["type"], "FriendRequestReceived");
+}
+
 async fn member_status(pool: &DbPool) -> String {
     sqlx::query_scalar("SELECT status FROM users WHERE id = $1")
         .bind(MEMBER)
