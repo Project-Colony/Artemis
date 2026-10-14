@@ -1,0 +1,318 @@
+# Artemis release workflow, from templates/sign-and-publish-caller.yml of
+# Project-Colony-Resources.
+#
+# The desktop client's assets follow the Colony naming convention, so Colony
+# auto-detects which platforms it ships and colony.json only needs a name and
+# a category:
+#
+#   artemis-linux  artemis-windows.exe
+#   artemis-macos  artemis-macos-x86
+#
+# The relay ships in the same release as artemis-relay-linux, for whoever hosts
+# one. No platform convention matches that name, so Colony never installs it.
+#
+# On top of the template: the release-please job keeps Cargo.lock in step with
+# the version on the release pull request, and a fifth build leg builds the
+# relay.
+#
+# The build legs only build, check and upload artifacts; they never see a key.
+# Authenticode (SignPath, once approved), ed25519 signing, verification and
+# publishing all happen in .github/workflows/sign-and-publish.yml of
+# Project-Colony-Resources, in this same run. The signing key is only ever in
+# that workflow's own job, which checks out nothing and builds nothing. See
+# design/releases.md, section "Shared signing workflow".
+#
+# Action refs are pinned to commit SHAs on purpose: this workflow can publish
+# releases, and whoever can move a floating tag can change what it runs.
+
+name: Release
+
+on:
+  push:
+    branches: [main]
+  # Recovery path. release-please only ever emits `release_created` once per
+  # release, so once a tag exists "Re-run all jobs" makes release-please report
+  # nothing to do and every job below skip, while the run goes green. This
+  # input finishes an existing DRAFT release whose run failed. Start it from
+  # the tag ("Use workflow from: v0.3.0", or `gh workflow run release.yml
+  # --ref v0.3.0 -f tag=v0.3.0`): with SignPath on, sign-and-publish refuses a
+  # run whose commit is not the tag's, since SignPath records the run's commit
+  # as the source of what it signs.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing draft release to build, sign and publish (e.g. v0.3.0). Run from that same tag."
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Assembles a release PR from the conventional commits since the last
+  # release. Merging that PR is what creates the tag. Push only: on a recovery
+  # dispatch the tag already exists, and running release-please would open or
+  # update a release PR as a side effect of repairing an old release.
+  release-please:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      # No `release-type` input: when it is set, the action ignores both files.
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      # release-please publishes the release, and moves /releases/latest,
+      # before any binary exists. Held as a draft; sign-and-publish refuses
+      # anything else and publishes it last. `-R` is not optional: this job has
+      # no checkout, so `gh` has no git remote to infer the repository from,
+      # and a failure here used to publish the tag with no assets at all.
+      - name: Hold the release as a draft
+        if: ${{ steps.release.outputs.release_created }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag_name }}
+        run: gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --draft=true
+
+      # `release-type: simple` rewrites the version line of Cargo.toml and
+      # nothing else, but Cargo.lock pins every workspace member by version and
+      # the builds below use `--locked`. A release pull request that bumped the
+      # manifest alone would fail the moment it merged, so the lock is brought
+      # along.
+      #
+      # The condition is the branch existing, not an output of the action above:
+      # release-please leaves an unchanged pull request alone and reports
+      # nothing, so a sync that failed once would otherwise never be retried,
+      # and a step that skips looks exactly like a step that had nothing to do.
+      - name: Keep Cargo.lock in step with the version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          # Matched by prefix: the component suffix release-please adds is not
+          # ours to predict. One open release branch is the only case there is;
+          # more than one would be a release-please misconfiguration.
+          branch=$(git ls-remote --heads "$url" \
+                   "release-please--branches--${GITHUB_REF_NAME}*" \
+                   | sed 's#.*refs/heads/##')
+          if [ -z "$branch" ]; then
+            echo "no release branch open - nothing to sync"
+            exit 0
+          fi
+          if [ "$(printf '%s\n' "$branch" | wc -l)" -gt 1 ]; then
+            echo "more than one release branch open, refusing to guess:"
+            printf '  %s\n' $branch
+            exit 1
+          fi
+          dir=$(mktemp -d)
+          git clone --branch "$branch" --depth 1 "$url" "$dir"
+          cd "$dir"
+          # Rewrites the workspace members' versions in the lock and nothing
+          # else: no external dependency moves, and nothing is compiled.
+          cargo update --workspace
+          # The proof that the release will build `--locked`, made here because
+          # nowhere else makes it: a push with this job's token starts no
+          # workflow, so the release pull request's head gets no CI from it.
+          cargo metadata --locked --format-version 1 >/dev/null
+          if git diff --quiet Cargo.lock; then
+            echo "Cargo.lock already agrees with Cargo.toml"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: sync Cargo.lock with the release version" Cargo.lock
+          git push
+          echo "Cargo.lock synced onto $branch"
+
+  build:
+    name: build ${{ matrix.asset }}
+    needs: release-please
+    # Runs on a merge that created a release, or on a recovery dispatch (when
+    # release-please is skipped). NOT `always()`: that would also build after
+    # release-please FAILED.
+    if: ${{ !cancelled() && !failure() && (needs.release-please.outputs.release_created || github.event_name == 'workflow_dispatch') }}
+    # GitHub-hosted runners only: SignPath rejects a signing request if any
+    # job leading to it ran on a self-hosted runner.
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            package: artemis-client
+            bin: artemis
+            asset: artemis-linux
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            package: artemis-client
+            bin: artemis
+            asset: artemis-windows.exe
+          # "macos" is Apple Silicon, "macos-x86" is Intel. Colony picks between
+          # them at runtime; shipping only one is a choice, not a bug.
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            package: artemis-client
+            bin: artemis
+            asset: artemis-macos
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            package: artemis-client
+            bin: artemis
+            asset: artemis-macos-x86
+          # The relay, for whoever hosts one. Linux only: that is where relays
+          # run.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            package: artemis-server
+            bin: artemis-server
+            asset: artemis-relay-linux
+    steps:
+      # The tag, not the branch: a recovery dispatch must rebuild the tagged
+      # commit, since the .meta sidecar binds these bytes to that version.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name || inputs.tag }}
+          persist-credentials: false
+
+      # rustup is on every GitHub-hosted runner image, so there is no
+      # third-party toolchain action to pin. Adding the target is a no-op on
+      # the legs that build for their own host; the Intel macOS leg needs it.
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+
+      # No build cache here: SignPath forbids release builds that reuse
+      # outputs of earlier, unverified builds.
+
+      - name: Build
+        run: cargo build --release --locked -p ${{ matrix.package }} --bin ${{ matrix.bin }} --target ${{ matrix.target }}
+
+      - name: Name the artifact (Unix)
+        if: runner.os != 'Windows'
+        run: cp target/${{ matrix.target }}/release/${{ matrix.bin }} ${{ matrix.asset }}
+
+      - name: Name the artifact (Windows)
+        if: runner.os == 'Windows'
+        run: copy target\${{ matrix.target }}\release\${{ matrix.bin }}.exe ${{ matrix.asset }}
+
+      # A manifest can PARSE perfectly and still leave the program listed in
+      # Colony with no Download button, because none of its assets match a
+      # convention. `colony validate-manifest` given the asset names catches
+      # exactly that. The client's Linux leg only: one check per release is
+      # enough. The names are the same list as `assets` in the sign-and-publish
+      # job below.
+      #
+      # Nothing runs until it verifies, the way Colony checks its own updates:
+      # the signature over colony-linux, the signature over its .meta sidecar,
+      # and that sidecar naming colony-linux with these exact bytes.
+      - name: Validate colony.json
+        if: matrix.asset == 'artemis-linux'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Colony's ed25519 release public key: RELEASE_PUBLIC_KEYS in
+          # src/signing.rs of Project-Colony/Colony, as PEM. It is public.
+          # Change it here when Colony's releases are signed with a new key.
+          COLONY_RELEASE_PUB: |
+            -----BEGIN PUBLIC KEY-----
+            MCowBQYDK2VwAyEARNjg3Nn8H6/aBg1unwGjkUTcrdTxERNefVaqU8cFu0s=
+            -----END PUBLIC KEY-----
+        run: |
+          d=$(mktemp -d)
+          gh release download -R Project-Colony/Colony -D "$d" \
+            -p colony-linux -p colony-linux.sig -p colony-linux.meta -p colony-linux.meta.sig
+          printf '%s' "$COLONY_RELEASE_PUB" > "$d/release.pub"
+          openssl pkeyutl -verify -pubin -inkey "$d/release.pub" -rawin \
+            -in "$d/colony-linux" -sigfile "$d/colony-linux.sig"
+          openssl pkeyutl -verify -pubin -inkey "$d/release.pub" -rawin \
+            -in "$d/colony-linux.meta" -sigfile "$d/colony-linux.meta.sig"
+          digest=$(sha256sum "$d/colony-linux" | cut -d' ' -f1)
+          grep -qx 'asset=colony-linux' "$d/colony-linux.meta" \
+            && grep -qx "sha256=$digest" "$d/colony-linux.meta" \
+            || { echo "::error::colony-linux.meta does not describe the downloaded colony-linux"; exit 1; }
+          chmod +x "$d/colony-linux"
+          "$d/colony-linux" validate-manifest colony.json \
+            artemis-linux artemis-windows.exe artemis-macos artemis-macos-x86 artemis-relay-linux
+          rm -rf "$d"
+
+      # The signature proves provenance and says nothing about whether the
+      # binary RUNS. An artifact built for the wrong architecture, or one that
+      # aborts under the release profile's LTO, would otherwise be signed,
+      # published and installed with every check green. Both binaries answer
+      # `--version` and exit before the client opens a window or the relay
+      # reads its configuration, so this needs no display and no database.
+      - name: Smoke-test the artifact
+        if: matrix.target != 'x86_64-apple-darwin'
+        shell: bash
+        run: |
+          chmod +x "${{ matrix.asset }}" || true
+          "./${{ matrix.asset }}" --version
+
+      # The Intel macOS artifact is cross-compiled on an arm64 runner and
+      # cannot be executed there, so assert its architecture instead: that is
+      # the leg with the fewest users, where a regression survives longest.
+      - name: Check the cross-compiled artifact's architecture
+        if: matrix.target == 'x86_64-apple-darwin'
+        shell: bash
+        run: |
+          file "${{ matrix.asset }}"
+          file "${{ matrix.asset }}" | grep -q 'x86_64' \
+            || { echo "::error::${{ matrix.asset }} is not an x86_64 binary"; exit 1; }
+
+      # The file at the artifact root, under its release name, and never to
+      # the release from here: Authenticode rewrites the .exe, so nothing may
+      # reach the release before every byte is final. The name prefix is what
+      # `artifact-pattern` below matches.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 1
+
+  # In the same run as the builds, chained by `needs:` rather than
+  # `on: release`: a release created with the default GITHUB_TOKEN fires no
+  # release events, so a workflow written that way never runs. Pinned to the
+  # organisation's commit of the shared workflow; design/releases.md says when
+  # that pin moves.
+  sign-and-publish:
+    needs: [release-please, build]
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    # The ceiling for every job in the called workflow.
+    permissions:
+      actions: read
+      contents: write
+    uses: Project-Colony/Project-Colony-Resources/.github/workflows/sign-and-publish.yml@619460ff4dc0049f129955f0988d368427b9eedb # organisation pin
+    with:
+      tag: ${{ needs.release-please.outputs.tag_name || inputs.tag }}
+      assets: "artemis-linux artemis-windows.exe artemis-macos artemis-macos-x86 artemis-relay-linux"
+      artifact-pattern: build-*
+      # Uncomment once SignPath has approved this project and its project
+      # exists in the Project-Colony SignPath organisation:
+      # signpath-project-slug: "artemis"
+      # The default `code-signing-policy: true` links the release notes to
+      # README.md#code-signing-policy, which exists.
+    # Named, not `inherit`: the called workflow gets these two and nothing else.
+    secrets:
+      COLONY_SIGNING_KEY_PEM: ${{ secrets.COLONY_SIGNING_KEY_PEM }}
+      SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
