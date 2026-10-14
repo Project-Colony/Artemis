@@ -10,10 +10,12 @@ end-to-end encrypted direct messages, signed in with a GitHub account.
 Early prototype, not ready for use. What works and what does not:
 
 - The desktop client runs and has a demo mode with sample servers, channels and messages.
-- Signing in from the desktop client does not reach a working session yet. The relay
-  signs users in through GitHub's device flow and issues its own session tokens, but
-  the client still runs the device flow against GitHub itself and sends the GitHub
-  token, which the relay refuses.
+- The desktop client signs in through the relay's device flow and never holds a GitHub
+  token. It keeps the relay's session in memory only, so it signs in again at every
+  start.
+- When the connection to the relay drops, the client says so and reconnects on its own,
+  waiting from 1 to 30 seconds between attempts. A message the relay had not confirmed
+  before the drop is marked "Not sent", and is sent again only when you press Retry.
 - A session cannot be signed out or revoked yet, not even by revoking the app on
   GitHub, and a connected socket stays signed in after its session has expired.
 - The relay URL is fixed to `http://localhost:3000` (plain WebSocket, no TLS).
@@ -34,7 +36,7 @@ crates/
   artemis-client/    desktop client (iced), binary "artemis"
   artemis-server/    relay server (Axum + PostgreSQL), binary "artemis-server"
   artemis-core/      shared models and wire protocol
-  artemis-auth/      GitHub device flow sign-in
+  artemis-auth/      GitHub device flow sign-in, used by the relay
   artemis-p2p/       P2P networking and encryption (mostly unused)
 ```
 
@@ -46,7 +48,8 @@ Requires a stable [Rust](https://rustup.rs/) toolchain.
 cargo build --release --workspace
 ```
 
-The client runs on its own:
+The client signs in through the relay at `http://localhost:3000`. Its demo mode needs no
+relay:
 
 ```bash
 cargo run --bin artemis

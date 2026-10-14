@@ -195,6 +195,7 @@ fn member_events(own_message: Uuid) -> Vec<(ClientEvent, &'static str)> {
                 channel_id: CHANNEL_A,
                 content: "hi".to_string(),
                 reply_to_id: None,
+                client_nonce: None,
             },
             "MessageReceived",
         ),
@@ -203,6 +204,7 @@ fn member_events(own_message: Uuid) -> Vec<(ClientEvent, &'static str)> {
                 channel_id: CHANNEL_A,
                 content: "a reply".to_string(),
                 reply_to_id: Some(FOUNDER_MESSAGE),
+                client_nonce: None,
             },
             "MessageReceived",
         ),
@@ -329,6 +331,7 @@ async fn non_members_get_an_error_and_nothing_is_read_or_written(pool: DbPool) {
             channel_id: CHANNEL_B,
             content: "a reply".to_string(),
             reply_to_id: Some(MEMBER_MESSAGE),
+            client_nonce: None,
         },
         ClientEvent::StartTyping {
             channel_id: CHANNEL_A,
@@ -456,6 +459,7 @@ async fn server_events_reach_only_that_servers_members(pool: DbPool) {
                 channel_id: CHANNEL_A,
                 content: "hi".to_string(),
                 reply_to_id: None,
+                client_nonce: None,
             },
             "MessageReceived",
         ),
@@ -604,6 +608,7 @@ async fn member_left_reaches_the_leaver_and_the_remaining_members(pool: DbPool) 
         channel_id: CHANNEL_A,
         content: "still here".to_string(),
         reply_to_id: None,
+        client_nonce: None,
     };
     assert_eq!(call(&mut founder, &post).await["type"], "MessageReceived");
 
@@ -730,6 +735,7 @@ async fn a_user_goes_offline_when_their_last_socket_closes(pool: DbPool) {
         channel_id: CHANNEL_A,
         content: "still there?".to_string(),
         reply_to_id: None,
+        client_nonce: None,
     };
     assert_eq!(call(&mut founder, &post).await["type"], "MessageReceived");
     assert_eq!(recv(&mut desktop).await["type"], "MessageReceived");
@@ -825,6 +831,7 @@ async fn a_client_that_stops_reading_holds_up_nobody(pool: DbPool) {
         channel_id: CHANNEL_A,
         content: "x".repeat(artemis_core::limits::MAX_MESSAGE_CHARS),
         reply_to_id: None,
+        client_nonce: None,
     };
     let offline =
         json!({"type": "PresenceUpdate", "data": {"user_id": MEMBER, "status": "Offline"}});
@@ -1060,6 +1067,7 @@ fn a_message_at_the_character_cap_fits_in_a_frame() {
         channel_id: CHANNEL_A,
         content: "\u{1}".repeat(MAX_MESSAGE_CHARS),
         reply_to_id: Some(FOUNDER_MESSAGE),
+        client_nonce: Some(Uuid::max()),
     };
     let frame = serde_json::to_string(&event).unwrap();
     assert!(frame.len() < super::MAX_MESSAGE, "{} bytes", frame.len());
@@ -1071,6 +1079,7 @@ fn a_direct_message_at_the_ciphertext_cap_fits_in_a_frame() {
     let event = ClientEvent::SendDirectMessage {
         recipient_id: MEMBER,
         encrypted_content: "A".repeat(MAX_DM_CIPHERTEXT_BYTES),
+        client_nonce: Some(Uuid::max()),
     };
     let frame = serde_json::to_string(&event).unwrap();
     assert!(frame.len() < super::MAX_MESSAGE, "{} bytes", frame.len());
@@ -1235,6 +1244,7 @@ async fn a_second_authenticate_changes_nothing(pool: DbPool) {
         channel_id: CHANNEL_A,
         content: "who am I".to_string(),
         reply_to_id: None,
+        client_nonce: None,
     };
     let posted = call(&mut member, &post).await;
     assert_eq!(posted["data"]["message"]["author_id"], MEMBER.to_string());
@@ -1312,6 +1322,7 @@ async fn messages_over_the_character_cap_are_refused(pool: DbPool) {
         channel_id: CHANNEL_A,
         content,
         reply_to_id: None,
+        client_nonce: None,
     };
     let edit = ClientEvent::EditMessage {
         message_id: MEMBER_MESSAGE,
@@ -1326,6 +1337,46 @@ async fn messages_over_the_character_cap_are_refused(pool: DbPool) {
 
     let at_cap = post("\u{e9}".repeat(MAX_MESSAGE_CHARS));
     assert_eq!(call(&mut member, &at_cap).await["type"], "MessageReceived");
+}
+
+#[sqlx::test]
+#[ignore = "needs DATABASE_URL"]
+async fn the_sender_gets_its_client_nonce_back(pool: DbPool) {
+    seed(&pool).await;
+    sqlx::query("INSERT INTO friendships (user_a, user_b) VALUES ($1, $2)")
+        .bind(FOUNDER)
+        .bind(MEMBER)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let addr = serve(pool).await;
+    let mut founder = sign_in(addr, "founder-token").await;
+    let mut member = sign_in(addr, "member-token").await;
+    let nonce = Uuid::from_u128(0x40);
+
+    let post = ClientEvent::SendMessage {
+        channel_id: CHANNEL_A,
+        content: "hi".to_string(),
+        reply_to_id: None,
+        client_nonce: Some(nonce),
+    };
+    let echo = call(&mut founder, &post).await;
+    assert_eq!(echo["type"], "MessageReceived");
+    assert_eq!(echo["data"]["client_nonce"], nonce.to_string());
+    assert_eq!(recv(&mut member).await, echo);
+
+    let dm = ClientEvent::SendDirectMessage {
+        recipient_id: MEMBER,
+        encrypted_content: "sealed".to_string(),
+        client_nonce: Some(nonce),
+    };
+    let echo = call(&mut founder, &dm).await;
+    assert_eq!(echo["type"], "DirectMessageReceived");
+    assert_eq!(echo["data"]["client_nonce"], nonce.to_string());
+    // The recipient gets the same message without the sender's nonce.
+    let received = recv(&mut member).await;
+    assert_eq!(received["data"]["message_id"], echo["data"]["message_id"]);
+    assert!(received["data"].get("client_nonce").is_none(), "{received}");
 }
 
 /// Server A's name and icon, its channels, categories and emojis, and every
@@ -1416,10 +1467,12 @@ async fn texts_over_their_limits_are_refused_and_never_broadcast(pool: DbPool) {
             channel_id: CHANNEL_A,
             content: "a\0b".to_string(),
             reply_to_id: None,
+            client_nonce: None,
         },
         ClientEvent::SendDirectMessage {
             recipient_id: FOUNDER,
             encrypted_content: "A".repeat(MAX_DM_CIPHERTEXT_BYTES + 1),
+            client_nonce: None,
         },
     ];
     // Each refusal names the limit, not a permission or a database failure.
@@ -1531,6 +1584,7 @@ async fn a_name_mentioned_many_times_counts_once(pool: DbPool) {
         channel_id: CHANNEL_A,
         content: format!("@founder {}", "@lin ".repeat(500)),
         reply_to_id: None,
+        client_nonce: None,
     };
     assert_eq!(call(&mut founder, &post).await["type"], "MessageReceived");
 

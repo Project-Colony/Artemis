@@ -2,6 +2,7 @@ use iced::alignment::{Horizontal, Vertical};
 use iced::widget::{button, column, container, text, Space};
 use iced::{Border, Element, Length, Padding};
 
+use crate::net::GITHUB_DEVICE_PAGE;
 use crate::theme::{colors, icons};
 
 #[derive(Debug, Clone)]
@@ -13,10 +14,7 @@ pub enum LoginMsg {
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoginState {
     Idle,
-    WaitingForCode {
-        user_code: String,
-        verification_uri: String,
-    },
+    WaitingForCode { user_code: String },
     Polling,
     Initializing,
     Error(String),
@@ -28,7 +26,7 @@ pub fn view(state: &LoginState) -> Element<'_, LoginMsg> {
         .color(colors::ACCENT);
 
     let subtitle = text(format!(
-        "{} Peer-to-peer messaging via GitHub",
+        "{} Chat through an Artemis relay, signed in with GitHub",
         icons::GLOBE
     ))
     .size(14)
@@ -110,22 +108,9 @@ pub fn view(state: &LoginState) -> Element<'_, LoginMsg> {
             });
 
             form = form.push(mock_btn);
-
-            form = form.push(Space::new().height(20));
-            form = form.push(
-                text(format!(
-                    "{} No server needed \u{2014} connect directly with friends",
-                    icons::LOCK
-                ))
-                .size(11)
-                .color(colors::TEXT_TIMESTAMP),
-            );
         }
 
-        LoginState::WaitingForCode {
-            user_code,
-            verification_uri,
-        } => {
+        LoginState::WaitingForCode { user_code } => {
             form = form.push(
                 text("Enter this code on GitHub:")
                     .size(14)
@@ -153,7 +138,7 @@ pub fn view(state: &LoginState) -> Element<'_, LoginMsg> {
             );
             form = form.push(Space::new().height(12));
             form = form.push(
-                text(format!("{} Go to: {}", icons::GLOBE, verification_uri))
+                text(format!("{} Go to: {}", icons::GLOBE, GITHUB_DEVICE_PAGE))
                     .size(12)
                     .color(colors::ACCENT),
             );
@@ -173,7 +158,7 @@ pub fn view(state: &LoginState) -> Element<'_, LoginMsg> {
 
         LoginState::Polling => {
             form = form.push(
-                text("Verifying with GitHub...")
+                text("Asking the relay for a sign-in code...")
                     .size(14)
                     .color(colors::TEXT_MUTED),
             );
@@ -181,15 +166,9 @@ pub fn view(state: &LoginState) -> Element<'_, LoginMsg> {
 
         LoginState::Initializing => {
             form = form.push(
-                text(format!("{} Setting up P2P identity...", icons::LOCK))
+                text(format!("{} Connecting to the relay...", icons::LOCK))
                     .size(14)
                     .color(colors::ACCENT),
-            );
-            form = form.push(Space::new().height(8));
-            form = form.push(
-                text("Generating keys & configuring signaling")
-                    .size(12)
-                    .color(colors::TEXT_MUTED),
             );
         }
 

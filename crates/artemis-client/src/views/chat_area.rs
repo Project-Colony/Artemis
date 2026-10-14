@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use iced::alignment::Vertical;
 use iced::widget::{
     button, column, container, row, scrollable, text, text_input, Column, Row, Space,
@@ -8,7 +10,16 @@ use uuid::Uuid;
 use crate::theme::{colors, icons};
 use artemis_core::limits::{check_text, MAX_MESSAGE_CHARS};
 use artemis_core::models::message::ReactionCount;
-use artemis_core::protocol::ChannelPayload;
+use artemis_core::protocol::{ChannelPayload, ClientEvent};
+
+/// A message sent but not yet echoed by the relay.
+#[derive(Debug, Clone)]
+pub struct Outgoing {
+    /// The event that sent it. Retry sends it again as it is, nonce included.
+    pub event: ClientEvent,
+    /// The connection ended before the echo: shown as not sent, with Retry.
+    pub failed: bool,
+}
 
 #[derive(Debug, Clone)]
 pub enum ChatAreaMsg {
@@ -27,6 +38,10 @@ pub enum ChatAreaMsg {
     SearchInputChanged(String),
     /// Submit search query.
     SubmitSearch,
+    /// Send a message that was not sent again, by its client nonce.
+    Retry(Uuid),
+    /// Drop a message that was not sent, by its client nonce.
+    Discard(Uuid),
 }
 
 /// Common quick-reaction emojis.
@@ -40,6 +55,7 @@ pub fn view_with_payload<'a>(
     reply_to: Option<&'a artemis_core::Message>,
     search_query: &str,
     can_pin: bool,
+    outbox: &HashMap<Uuid, Outgoing>,
 ) -> Element<'a, ChatAreaMsg> {
     let channel_name = active_channel
         .map(|c| c.name.as_str())
@@ -140,6 +156,9 @@ pub fn view_with_payload<'a>(
             && msg.reply_to_id.is_none();
 
         let timestamp: String = msg.timestamp.format("%H:%M").to_string();
+        // A message the relay has not stored yet has no actions: they would
+        // name an id the relay does not know.
+        let sending = outbox.get(&msg.id).map(|out| delivery(msg.id, out.failed));
 
         // ── Reply context ──
         if let Some(reply_id) = msg.reply_to_id {
@@ -181,6 +200,9 @@ pub fn view_with_payload<'a>(
             // Reactions for continuation messages
             if !msg.reactions.is_empty() {
                 content_col = content_col.push(render_reactions(msg.id, &msg.reactions));
+            }
+            if let Some(sending) = sending {
+                content_col = content_col.push(sending);
             }
 
             let msg_row = row![Space::new().width(48), content_col,];
@@ -329,7 +351,10 @@ pub fn view_with_payload<'a>(
                 msg_content = msg_content.push(render_reactions(msg.id, &msg.reactions));
             }
 
-            msg_content = msg_content.push(actions);
+            msg_content = msg_content.push(match sending {
+                Some(sending) => sending,
+                None => actions.into(),
+            });
 
             let msg_row = row![avatar, Space::new().width(12), msg_content].align_y(Vertical::Top);
 
@@ -462,6 +487,42 @@ pub fn view_with_payload<'a>(
             ..container::Style::default()
         })
         .into()
+}
+
+/// "Sending..." under a message the relay has not echoed yet, or "Not sent"
+/// with Retry and Discard once its connection ended.
+fn delivery<'a>(nonce: Uuid, failed: bool) -> Element<'a, ChatAreaMsg> {
+    if !failed {
+        return text("Sending...")
+            .size(11)
+            .color(colors::TEXT_TIMESTAMP)
+            .into();
+    }
+    let action = |label, msg| {
+        button(text(label).size(11).color(colors::TEXT_PRIMARY))
+            .on_press(msg)
+            .padding(Padding::from([2, 6]))
+            .style(|_theme, status| button::Style {
+                background: Some(iced::Background::Color(match status {
+                    button::Status::Hovered | button::Status::Pressed => colors::BG_HOVER,
+                    _ => colors::BG_DARK,
+                })),
+                text_color: colors::TEXT_PRIMARY,
+                border: Border {
+                    radius: 3.0.into(),
+                    ..Border::default()
+                },
+                ..button::Style::default()
+            })
+    };
+    row![
+        text("Not sent").size(11).color(colors::DANGER),
+        action("Retry", ChatAreaMsg::Retry(nonce)),
+        action("Discard", ChatAreaMsg::Discard(nonce)),
+    ]
+    .spacing(6)
+    .align_y(Vertical::Center)
+    .into()
 }
 
 /// Render message content with @mention highlighting.

@@ -227,6 +227,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                         channel_id,
                         content,
                         reply_to_id,
+                        client_nonce,
                     } => {
                         let Some(uid) = user_id else { continue };
                         if refused(&sender, "A message", &content, MAX_MESSAGE_CHARS).await {
@@ -268,7 +269,12 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                                 broadcast_to_server(
                                     &state,
                                     server_id,
-                                    &ServerEvent::MessageReceived { message },
+                                    // The nonce is random, so the other members
+                                    // learn nothing from it.
+                                    &ServerEvent::MessageReceived {
+                                        message,
+                                        client_nonce,
+                                    },
                                 )
                                 .await;
                             }
@@ -1326,6 +1332,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                     ClientEvent::SendDirectMessage {
                         recipient_id,
                         encrypted_content,
+                        client_nonce,
                     } => {
                         let Some(uid) = user_id else { continue };
                         if refused(
@@ -1379,6 +1386,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                                         encrypted_content: encrypted_content.clone(),
                                         timestamp,
                                         message_id: msg_id,
+                                        client_nonce: None,
                                     },
                                 )
                                 .await;
@@ -1392,6 +1400,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, permit: OwnedSemaphor
                                         encrypted_content,
                                         timestamp,
                                         message_id: msg_id,
+                                        client_nonce,
                                     },
                                 )
                                 .await;

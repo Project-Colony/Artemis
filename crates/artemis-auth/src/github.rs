@@ -4,6 +4,8 @@ use reqwest::header::{ACCEPT, AUTHORIZATION};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use artemis_core::protocol::DeviceCode;
+
 /// GitHub user profile returned by the API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitHubUser {
@@ -11,18 +13,6 @@ pub struct GitHubUser {
     pub login: String,
     pub name: Option<String>,
     pub avatar_url: Option<String>,
-}
-
-/// GitHub's answer to a device code request: the user enters `user_code` at
-/// `verification_uri`, while `device_code` is polled every `interval` seconds
-/// for up to `expires_in` seconds.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeviceCodeResponse {
-    pub device_code: String,
-    pub user_code: String,
-    pub verification_uri: String,
-    pub expires_in: u64,
-    pub interval: u64,
 }
 
 /// Why a device flow request gave no answer to act on yet.
@@ -79,7 +69,8 @@ impl GitHub {
     }
 
     /// Asks for a code the user enters on GitHub to grant `read:user`.
-    pub async fn request_device_code(&self) -> Result<DeviceCodeResponse, DeviceFlowError> {
+    /// GitHub's answer is passed on to clients as it is.
+    pub async fn request_device_code(&self) -> Result<DeviceCode, DeviceFlowError> {
         self.post(
             "/login/device/code",
             &[("client_id", &self.client_id), ("scope", "read:user")],

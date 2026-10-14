@@ -1,3 +1,3 @@
 pub mod github;
 
-pub use github::{DeviceCodeResponse, DeviceFlowError, GitHub, GitHubUser};
+pub use github::{DeviceFlowError, GitHub, GitHubUser};
