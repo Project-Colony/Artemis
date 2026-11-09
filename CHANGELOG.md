@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/Project-Colony/Artemis/compare/v0.1.1...v0.1.2) (2026-11-09)
+
+
+### Fixes
+
+* **deps:** update dependencies and fix the open security advisories ([#32](https://github.com/Project-Colony/Artemis/issues/32)) ([86c8a9a](https://github.com/Project-Colony/Artemis/commit/86c8a9aca2baba79fe49abee9c8b57fbfd5ed6a9))
+
 ## [0.1.1](https://github.com/Project-Colony/Artemis/compare/v0.1.0...v0.1.1) (2026-10-14)
 
 
