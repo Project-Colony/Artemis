@@ -11,8 +11,8 @@ members = [
 [workspace.package]
 version = "0.1.1" # x-release-please-version
 edition = "2021"
-# The oldest Rust that builds Artemis. CI builds on exactly this toolchain (the msrv job).
-rust-version = "1.99"
+# The floor set by sqlx 0.9. CI builds on exactly this toolchain (the msrv job).
+rust-version = "1.94"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/Project-Colony/Artemis"
 
