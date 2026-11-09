@@ -45,7 +45,7 @@ crates/
 
 ## Build from source
 
-Requires [Rust](https://rustup.rs/) 1.94 or newer.
+Requires [Rust](https://rustup.rs/) 1.99 or newer.
 
 ```bash
 cargo build --release --workspace
