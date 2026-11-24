@@ -69,10 +69,23 @@ jobs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
+      # release-please writes the release pull request with the App token:
+      # one written with GITHUB_TOKEN gets CI runs that wait for approval.
+      - name: Get a colony-release-bot token
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.COLONY_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.COLONY_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+
       # No `release-type` input: when it is set, the action ignores both files.
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
         with:
+          token: ${{ steps.app.outputs.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
@@ -100,7 +113,7 @@ jobs:
       # and a step that skips looks exactly like a step that had nothing to do.
       - name: Keep Cargo.lock in step with the version
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
         run: |
           set -euo pipefail
           url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
@@ -125,9 +138,10 @@ jobs:
           # Rewrites the workspace members' versions in the lock and nothing
           # else: no external dependency moves, and nothing is compiled.
           cargo update --workspace
-          # The proof that the release will build `--locked`, made here because
-          # nowhere else makes it: a push with this job's token starts no
-          # workflow, so the release pull request's head gets no CI from it.
+          # The proof that the release will build `--locked`, made here before
+          # the push. The push uses the colony-release-bot token, so CI runs on
+          # the release pull request's new head; a push with GITHUB_TOKEN would
+          # start no workflow and leave that head with no checks.
           cargo metadata --locked --format-version 1 >/dev/null
           if git diff --quiet Cargo.lock; then
             echo "Cargo.lock already agrees with Cargo.toml"
